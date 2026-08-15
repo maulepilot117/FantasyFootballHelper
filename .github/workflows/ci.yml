@@ -7,11 +7,10 @@ on:
 
 permissions:
   contents: read
-  packages: write
 
 concurrency:
   group: ci-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   backend:
@@ -25,7 +24,7 @@ jobs:
           POSTGRES_DB: ffh_test
         ports: ["5432:5432"]
         options: >-
-          --health-cmd "pg_isready -U ffh -d ffh_test"
+          --health-cmd "pg_isready -h localhost -U ffh -d ffh_test"
           --health-interval 5s --health-timeout 3s --health-retries 10
     env:
       FFH_TEST_DATABASE_URL: postgresql+psycopg://ffh:ffh@localhost:5432/ffh_test
@@ -56,12 +55,16 @@ jobs:
           bun-version: 1.3.12
       - run: bun install --frozen-lockfile
       - run: bun test
+      - run: bun run lint
       - run: bun run build
 
   images:
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     needs: [backend, frontend]
     runs-on: ubuntu-24.04-arm
+    permissions:
+      contents: read
+      packages: write
     strategy:
       matrix:
         include:
