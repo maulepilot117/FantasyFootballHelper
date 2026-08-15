@@ -248,7 +248,7 @@ crosswalk tests) → `bun test` → build + push to GHCR → Argo reconciles.
 Images: `ghcr.io/maulepilot117/ffh-api` and `ghcr.io/maulepilot117/ffh-frontend`, tagged
 `sha-<short>` and `main`, built only on push to `main`. Actions are pinned to commit SHAs.
 
-**CI does not deploy.** It builds and pushes an image and updates the tag in `deploy/`.
+**CI does not deploy.** It builds and pushes an image and updates the tag in `deploy/` (Phase 3; not wired in Phase 0).
 ArgoCD does the rest.
 
 ---
