@@ -1,3 +1,4 @@
+import os
 from pathlib import Path
 
 from ffh.config import Settings, get_settings
@@ -13,9 +14,11 @@ def test_settings_read_env_with_prefix(monkeypatch):
     assert s.season == 2026
 
 
-def test_settings_defaults_are_local_dev():
+def test_settings_defaults_are_local_dev(monkeypatch):
+    for key in [k for k in os.environ if k.startswith("FFH_")]:
+        monkeypatch.delenv(key)
     s = Settings(_env_file=None)
-    assert s.database_url.startswith("postgresql+psycopg://ffh:ffh@localhost:5432/ffh")
+    assert s.database_url == "postgresql+psycopg://ffh:ffh@localhost:5432/ffh"
     assert s.test_database_url.endswith("/ffh_test")
     assert s.redis_url == "redis://localhost:6379/0"
     assert s.sleeper_base_url == "https://api.sleeper.app/v1"

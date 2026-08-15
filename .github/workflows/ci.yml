@@ -29,7 +29,6 @@ jobs:
           --health-interval 5s --health-timeout 3s --health-retries 10
     env:
       FFH_TEST_DATABASE_URL: postgresql+psycopg://ffh:ffh@localhost:5432/ffh_test
-      FFH_DATABASE_URL: postgresql+psycopg://ffh:ffh@localhost:5432/ffh_test
     defaults:
       run:
         working-directory: backend
