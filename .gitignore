@@ -1,0 +1,39 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+dist/
+build/
+*.egg-info/
+
+# Node / Bun
+node_modules/
+.vite/
+frontend/dist/
+
+# Env & secrets — NEVER commit
+.env
+.env.*
+*.pem
+*.key
+secrets.yaml
+
+# Data lake / local artifacts
+data/
+*.parquet
+*.duckdb
+*.sqlite
+*.db
+
+# Editors / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Scratch
+_to_delete/
