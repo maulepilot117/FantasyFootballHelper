@@ -64,3 +64,7 @@ markers = [
     "network: hits a live third-party API; never run in CI",
 ]
 addopts = "-m 'not network' --strict-markers"
+filterwarnings = [
+    # starlette 1.x nudges toward httpx2; we pin httpx 0.28 (respx has no httpx2 support yet).
+    "ignore:Using `httpx` with `starlette.testclient` is deprecated:UserWarning",
+]
