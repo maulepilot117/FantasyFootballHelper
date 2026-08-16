@@ -43,6 +43,25 @@ docs(data): correct nflverse stats_player_week asset path
 
 **Never commit to `main` directly.** Never force-push a shared branch.
 
+### Root checkout stays on `main`; feature work lives in worktrees
+
+The repo root (`FantasyFootballHelper/`) is the **read-only mirror of `main`**. Never check
+out a feature branch there. Every unit of work gets its own worktree under
+`.claude/worktrees/<branch>` (Claude Code's `EnterWorktree` does this automatically).
+
+After a PR merges, close the loop **from the root**:
+
+```
+git switch main && git pull --ff-only
+git worktree remove .claude/worktrees/<name>   # or let Claude Code clean it up on exit
+git branch -d <branch>
+```
+
+If the root ever shows a feature branch or is behind `origin/main`, that is a bug in the
+workflow — fix it with the commands above before starting new work. Symptom to watch for:
+"the code isn't in the root, it's only in `.claude/worktrees/`" — that means the root was
+never switched back to `main` after a merge.
+
 ---
 
 ## Definition of done
