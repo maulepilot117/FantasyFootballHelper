@@ -124,4 +124,6 @@ class Transaction(Base):
     faab_spent: Mapped[int | None] = mapped_column(Integer)
     payload: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False)
 
-    __table_args__ = (UniqueConstraint("league_id", "external_id"),)
+    __table_args__ = (
+        UniqueConstraint("league_id", "external_id", postgresql_nulls_not_distinct=True),
+    )

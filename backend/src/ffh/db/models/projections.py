@@ -52,7 +52,15 @@ class Projection(Base):
     )
 
     __table_args__ = (
-        UniqueConstraint("player_id", "season", "week", "league_id", "source", "model_version"),
+        UniqueConstraint(
+            "player_id",
+            "season",
+            "week",
+            "league_id",
+            "source",
+            "model_version",
+            postgresql_nulls_not_distinct=True,
+        ),
         Index("projections_lookup_idx", "season", "week", "source", "model_version"),
     )
 

@@ -37,6 +37,13 @@ def test_projections_carry_gamma_params_not_null():
         assert not t.c[col].nullable, col
 
 
+def test_projections_unique_treats_nulls_as_not_distinct():
+    t = Base.metadata.tables["projections"]
+    uniques = [c for c in t.constraints if c.__class__.__name__ == "UniqueConstraint"]
+    assert len(uniques) == 1
+    assert uniques[0].dialect_options["postgresql"]["nulls_not_distinct"] is True
+
+
 def test_projection_correlations_check_canonical_order():
     t = Base.metadata.tables["projection_correlations"]
     checks = [c for c in t.constraints if c.__class__.__name__ == "CheckConstraint"]
