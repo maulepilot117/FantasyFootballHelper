@@ -1,5 +1,6 @@
 import uuid
 from datetime import datetime
+from decimal import Decimal
 from typing import Any
 
 from sqlalchemy import (
@@ -72,7 +73,7 @@ class AiDebate(Base):
     consensus_score: Mapped[float] = mapped_column(REAL, nullable=False)
     disagreement_axis: Mapped[str | None] = mapped_column(Text)
     latency_ms: Mapped[int] = mapped_column(Integer, nullable=False)
-    cost_usd: Mapped[float | None] = mapped_column(Numeric(10, 6))
+    cost_usd: Mapped[Decimal | None] = mapped_column(Numeric(10, 6))
     tokens_in: Mapped[int | None] = mapped_column(Integer)
     tokens_out: Mapped[int | None] = mapped_column(Integer)
     cache_hit: Mapped[bool | None] = mapped_column(Boolean)

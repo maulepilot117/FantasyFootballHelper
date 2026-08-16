@@ -76,7 +76,7 @@ CREATE TABLE players (
 CREATE INDEX players_normalized_name_pos_idx ON players (normalized_name, position);
 ```
 
-`updated_at` is maintained by the ORM `onupdate` only; upserts via `INSERT ... ON CONFLICT` must set `updated_at = now()` explicitly in `SET`.
+`updated_at` (here and on `games.updated_at`) is maintained by the ORM `onupdate` only; upserts via `INSERT ... ON CONFLICT` must set `updated_at = now()` explicitly in `SET`.
 
 ```sql
 -- ★ THE CROSSWALK ★ — see §3. This is the highest-risk table in the system.

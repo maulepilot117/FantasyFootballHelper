@@ -1,5 +1,6 @@
 import subprocess
 import sys
+from pathlib import Path
 
 import pytest
 from sqlalchemy import text
@@ -7,6 +8,8 @@ from sqlalchemy.orm import Session
 
 from ffh.config import get_settings
 from ffh.db.engine import make_engine
+
+BACKEND_DIR = Path(__file__).resolve().parents[1]
 
 
 @pytest.fixture(autouse=True)
@@ -24,6 +27,7 @@ def migrated_engine():
         conn.execute(text("DROP SCHEMA public CASCADE; CREATE SCHEMA public;"))
     r = subprocess.run(
         [sys.executable, "-m", "alembic", "-x", f"url={url}", "upgrade", "head"],
+        cwd=BACKEND_DIR,
         capture_output=True,
         text=True,
         check=False,

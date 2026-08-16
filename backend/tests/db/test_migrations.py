@@ -1,5 +1,6 @@
 import subprocess
 import sys
+from pathlib import Path
 
 import pytest
 from sqlalchemy import inspect, text
@@ -9,11 +10,14 @@ from ffh.db.engine import make_engine
 
 pytestmark = pytest.mark.db
 
+BACKEND_DIR = Path(__file__).resolve().parents[2]
+
 
 def _alembic(*args: str) -> subprocess.CompletedProcess[str]:
     url = get_settings().test_database_url
     return subprocess.run(
         [sys.executable, "-m", "alembic", "-x", f"url={url}", *args],
+        cwd=BACKEND_DIR,
         capture_output=True,
         text=True,
         check=False,
