@@ -49,3 +49,42 @@ def test_transactions_unique_treats_nulls_as_not_distinct():
     uniques = [c for c in t.constraints if c.__class__.__name__ == "UniqueConstraint"]
     assert len(uniques) == 1
     assert uniques[0].dialect_options["postgresql"]["nulls_not_distinct"] is True
+
+
+def _fks(table: str) -> dict[tuple[str, ...], tuple[str, tuple[str, ...]]]:
+    """{local column names: (referred table, referred column names)}."""
+    t = Base.metadata.tables[table]
+    return {
+        tuple(c.name for c in fk.columns): (
+            fk.referred_table.name,
+            tuple(e.column.name for e in fk.elements),
+        )
+        for fk in t.foreign_key_constraints
+    }
+
+
+def test_league_teams_unique_on_league_id_league_team_id():
+    assert ("league_id", "league_team_id") in _uniques("league_teams")
+    assert ("league_id", "external_id") in _uniques("league_teams")
+
+
+def test_matchups_team_fks_are_composite_same_league():
+    fks = _fks("matchups")
+    target = ("league_teams", ("league_id", "league_team_id"))
+    assert fks[("league_id", "home_team_id")] == target
+    assert fks[("league_id", "away_team_id")] == target
+    assert fks[("league_id",)] == ("leagues", ("league_id",))
+    # No single-column FK on either team column may remain.
+    assert ("home_team_id",) not in fks
+    assert ("away_team_id",) not in fks
+
+
+def test_leagues_my_team_fk_is_composite_and_deferred_via_use_alter():
+    fks = _fks("leagues")
+    assert fks[("league_id", "my_team_id")] == ("league_teams", ("league_id", "league_team_id"))
+    fk = next(
+        c
+        for c in Base.metadata.tables["leagues"].foreign_key_constraints
+        if c.name == "leagues_my_team_fkey"
+    )
+    assert fk.use_alter is True

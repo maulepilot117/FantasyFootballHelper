@@ -6,6 +6,7 @@ from sqlalchemy import (
     Boolean,
     DateTime,
     ForeignKey,
+    ForeignKeyConstraint,
     Integer,
     SmallInteger,
     Text,
@@ -46,7 +47,17 @@ class League(Base):
         DateTime(timezone=True), nullable=False, server_default=func.now()
     )
 
-    __table_args__ = (UniqueConstraint("platform", "external_id", "season"),)
+    __table_args__ = (
+        UniqueConstraint("platform", "external_id", "season"),
+        # Composite FK so my_team_id can only name a team of THIS league (DATABASE.md §4).
+        # use_alter: leagues <-> league_teams is cyclic; emitted as ALTER TABLE after both exist.
+        ForeignKeyConstraint(
+            ["league_id", "my_team_id"],
+            ["league_teams.league_id", "league_teams.league_team_id"],
+            name="leagues_my_team_fkey",
+            use_alter=True,
+        ),
+    )
 
 
 class LeagueTeam(Base):
@@ -66,7 +77,13 @@ class LeagueTeam(Base):
     waiver_priority: Mapped[int | None] = mapped_column(SmallInteger)
     is_me: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default=text("false"))
 
-    __table_args__ = (UniqueConstraint("league_id", "external_id"),)
+    __table_args__ = (
+        UniqueConstraint("league_id", "external_id"),
+        # Target for the composite same-league FKs on matchups and leagues.my_team_id.
+        UniqueConstraint(
+            "league_id", "league_team_id", name="league_teams_league_id_league_team_id_key"
+        ),
+    )
 
 
 class RosterSlot(Base):
@@ -98,14 +115,25 @@ class Matchup(Base):
     )
     week: Mapped[int] = mapped_column(SmallInteger, primary_key=True)
     matchup_no: Mapped[int] = mapped_column(SmallInteger, primary_key=True)
-    home_team_id: Mapped[uuid.UUID] = mapped_column(
-        PG_UUID(as_uuid=True), ForeignKey("league_teams.league_team_id"), nullable=False
-    )
-    away_team_id: Mapped[uuid.UUID | None] = mapped_column(
-        PG_UUID(as_uuid=True), ForeignKey("league_teams.league_team_id")
-    )
+    home_team_id: Mapped[uuid.UUID] = mapped_column(PG_UUID(as_uuid=True), nullable=False)
+    away_team_id: Mapped[uuid.UUID | None] = mapped_column(PG_UUID(as_uuid=True))  # NULL = bye
     home_points: Mapped[float | None] = mapped_column(REAL)
     away_points: Mapped[float | None] = mapped_column(REAL)
+
+    # Composite FKs: both teams must belong to this matchup's league (DATABASE.md §4).
+    # A NULL away_team_id simply isn't enforced (MATCH SIMPLE), which is fine for byes.
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ["league_id", "home_team_id"],
+            ["league_teams.league_id", "league_teams.league_team_id"],
+            name="matchups_home_team_fkey",
+        ),
+        ForeignKeyConstraint(
+            ["league_id", "away_team_id"],
+            ["league_teams.league_id", "league_teams.league_team_id"],
+            name="matchups_away_team_fkey",
+        ),
+    )
 
 
 class Transaction(Base):

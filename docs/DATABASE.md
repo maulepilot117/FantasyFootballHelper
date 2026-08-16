@@ -235,7 +235,7 @@ CREATE TABLE leagues (
     playoff_teams    SMALLINT,
     playoff_start_wk SMALLINT,
     faab_budget      INTEGER,            -- NULL if waiver priority instead of FAAB
-    my_team_id       UUID,               -- FK set after league_teams load
+    my_team_id       UUID,               -- composite FK to league_teams, added below
     created_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
     UNIQUE (platform, external_id, season)
 );
@@ -250,8 +250,16 @@ CREATE TABLE league_teams (
     faab_remaining  INTEGER,
     waiver_priority SMALLINT,
     is_me           BOOLEAN NOT NULL DEFAULT FALSE,
-    UNIQUE (league_id, external_id)
+    UNIQUE (league_id, external_id),
+    -- Target for the composite same-league FKs on matchups and leagues.my_team_id.
+    CONSTRAINT league_teams_league_id_league_team_id_key UNIQUE (league_id, league_team_id)
 );
+
+-- Cyclic leagues <-> league_teams FK: added after both tables exist
+-- (SQLAlchemy use_alter=True; migration emits op.create_foreign_key after create_table,
+-- and drops it first in downgrade).
+ALTER TABLE leagues ADD CONSTRAINT leagues_my_team_fkey
+    FOREIGN KEY (league_id, my_team_id) REFERENCES league_teams (league_id, league_team_id);
 
 -- Roster snapshots. One row per player per team per week — keep the history,
 -- it's the input to "what did this manager need at the time".
@@ -269,11 +277,17 @@ CREATE TABLE matchups (
     league_id      UUID NOT NULL REFERENCES leagues(league_id) ON DELETE CASCADE,
     week           SMALLINT NOT NULL,
     matchup_no     SMALLINT NOT NULL,
-    home_team_id   UUID NOT NULL REFERENCES league_teams(league_team_id),
-    away_team_id   UUID REFERENCES league_teams(league_team_id),   -- NULL = bye
+    home_team_id   UUID NOT NULL,
+    away_team_id   UUID,                 -- NULL = bye
     home_points    REAL,
     away_points    REAL,
-    PRIMARY KEY (league_id, week, matchup_no)
+    PRIMARY KEY (league_id, week, matchup_no),
+    -- Composite FKs: both teams must belong to THIS league. A NULL away_team_id is
+    -- simply not enforced (MATCH SIMPLE), which is what a bye needs.
+    CONSTRAINT matchups_home_team_fkey FOREIGN KEY (league_id, home_team_id)
+        REFERENCES league_teams (league_id, league_team_id),
+    CONSTRAINT matchups_away_team_fkey FOREIGN KEY (league_id, away_team_id)
+        REFERENCES league_teams (league_id, league_team_id)
 );
 
 CREATE TABLE transactions (
@@ -288,6 +302,17 @@ CREATE TABLE transactions (
     UNIQUE NULLS NOT DISTINCT (league_id, external_id)   -- external_id nullable; upserts must still conflict
 );
 ```
+
+**Cross-league integrity.** `league_team_id` is globally unique, so a plain
+`REFERENCES league_teams(league_team_id)` would happily accept a team from a *different*
+league in `matchups.home_team_id`/`away_team_id` or `leagues.my_team_id` — a bug that
+would silently corrupt win-probability, playoff odds and "my roster" everywhere
+downstream. The `UNIQUE (league_id, league_team_id)` on `league_teams` exists purely as
+the target of composite FKs `(league_id, team_id) → league_teams(league_id, league_team_id)`,
+which make the same-league invariant a database guarantee rather than an ingest
+convention. `leagues ↔ league_teams` is cyclic, so `leagues_my_team_fkey` is added by a
+separate `ALTER TABLE` after both tables exist (and dropped first on downgrade).
+`draft_picks.league_team_id` is deliberately NOT covered — see §5.
 
 ---
 
@@ -319,6 +344,14 @@ CREATE TABLE draft_picks (
     PRIMARY KEY (draft_id, pick_no)
 );
 CREATE INDEX draft_picks_player_idx ON draft_picks (player_id);
+```
+
+Same-league invariant for `draft_picks.league_team_id` (must belong to `drafts.league_id`)
+is enforced by `ffh.ingest.platform_sync` with a test, not by the schema. A composite FK
+here would require denormalizing `league_id` onto `draft_picks`; §4's `matchups` and
+`leagues.my_team_id` already carry `league_id`, so they get the schema-level guarantee.
+
+```sql
 
 -- ADP by format. Multiple sources; the engine blends them.
 CREATE TABLE adp (
