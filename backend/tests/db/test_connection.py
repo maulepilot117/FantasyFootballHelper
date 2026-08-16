@@ -10,4 +10,6 @@ def test_test_database_is_reachable_and_is_postgres_17():
     engine = create_engine(get_settings().test_database_url)
     with engine.connect() as conn:
         version = conn.execute(text("SHOW server_version_num")).scalar_one()
-    assert int(version) >= 170000
+        database = conn.execute(text("SELECT current_database()")).scalar_one()
+    assert database == "ffh_test"
+    assert 170000 <= int(version) < 180000
