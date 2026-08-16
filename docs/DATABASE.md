@@ -275,7 +275,7 @@ CREATE TABLE transactions (
     executed_at    TIMESTAMPTZ,
     faab_spent     INTEGER,
     payload        JSONB NOT NULL,       -- normalized adds/drops/picks by player_id
-    UNIQUE (league_id, external_id)
+    UNIQUE NULLS NOT DISTINCT (league_id, external_id)   -- external_id nullable; upserts must still conflict
 );
 ```
 
@@ -351,7 +351,10 @@ CREATE TABLE projections (
     -- Provenance: what drove this number
     inputs        JSONB NOT NULL,        -- implied_total, usage shares, opp rank, wx, injury
     computed_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
-    UNIQUE (player_id, season, week, league_id, source, model_version)
+    CONSTRAINT projections_scope_key
+        UNIQUE NULLS NOT DISTINCT (player_id, season, week, league_id, source, model_version)
+        -- league_id nullable (league-agnostic rows); NULLS NOT DISTINCT so upserts conflict.
+        -- Explicit name: the convention-derived name exceeds Postgres' 63-char identifier limit.
 );
 CREATE INDEX projections_lookup_idx ON projections (season, week, source, model_version);
 

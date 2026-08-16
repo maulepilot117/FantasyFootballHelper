@@ -59,6 +59,7 @@ class Projection(Base):
             "league_id",
             "source",
             "model_version",
+            name="projections_scope_key",  # convention name exceeds Postgres' 63-char limit
             postgresql_nulls_not_distinct=True,
         ),
         Index("projections_lookup_idx", "season", "week", "source", "model_version"),
