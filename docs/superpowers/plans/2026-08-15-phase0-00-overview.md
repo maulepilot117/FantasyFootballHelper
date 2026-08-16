@@ -79,7 +79,17 @@ is fixed now** (below) so the shape cannot drift.
 - Create `backend/src/ffh/ingest/games.py` — `nfldata_games` job + `upsert_games(session,
   df, season)`; `backend/src/ffh/ingest/reference.py` — `seed_nfl_teams(session)` from
   `backend/src/ffh/data/nfl_teams.csv` (checked in), `seed_stadiums(session, df)` from
-  the greerreNFL CSV job `stadiums`.
+  the greerreNFL CSV job `stadiums`, `seed_generic_league(session)` (sentinel
+  `leagues` row per DATABASE.md §6: `league_id = GENERIC_LEAGUE_ID`
+  (`00000000-0000-0000-0000-000000000000`), `platform='ffh'`, `external_id='generic'`,
+  `season=0`, `name='Generic PPR'`, `num_teams=12`, `league_type='redraft'`,
+  `is_superflex=false`, `scoring_settings={"pass_yd":0.04,"pass_td":4,"pass_int":-2,
+  "rush_yd":0.1,"rush_td":6,"rec":1,"rec_yd":0.1,"rec_td":6,"fum_lost":-2,"two_pt":2}`
+  (canonical full-PPR reference, NOT a default for real leagues — those are always
+  platform-fetched), `roster_settings={"QB":1,"RB":2,"WR":2,"TE":1,"FLEX":1,"K":1,
+  "DST":1,"BN":6}`).
+- Ingest upserts must `SET updated_at = now()` explicitly (ORM `onupdate` does not fire
+  for `INSERT ... ON CONFLICT`).
 - Create `backend/src/ffh/features/duck.py` — `connect(lake_root, season) ->
   duckdb.DuckDBPyConnection` with views `stats_player_week`, `snap_counts`, `players`,
   `depth_charts`, `injuries`, `games`.
