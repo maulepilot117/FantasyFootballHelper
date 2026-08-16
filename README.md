@@ -37,7 +37,7 @@ ingress, nfs-synology for storage, and Vault + External Secrets Operator for cre
 docker compose up -d --wait            # postgres 17 (ffh + ffh_test) and redis 7
 cd backend && uv sync && uv run pytest # backend tests (db-marked tests need compose up)
 uv run uvicorn ffh.api.app:app --reload   # separate terminal
-cd ../frontend && bun install && bun run dev   # http://localhost:3000, proxies /api and /healthz → :8000
+cd ../frontend && bun install && bun run dev   # http://localhost:3000, proxies /api → :8000
 ```
 
 Copy `backend/.env.example` to `backend/.env` for local overrides (gitignored).
