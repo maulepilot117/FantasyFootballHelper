@@ -49,11 +49,11 @@ Tailwind v4 · Docker Compose · GitHub Actions (`ubuntu-24.04-arm`) · GHCR.
 
 | # | Branch | Plan file | Depends on | Status |
 |---|---|---|---|---|
-| ① | `chore/scaffold` | `2026-08-15-phase0-01-scaffold.md` | — | plan written |
-| ② | `feat/db-schema` | `2026-08-15-phase0-02-db-schema.md` | ① | plan written |
-| ③ | `feat/ingest-nflverse-games` | `…-03-ingest-nflverse-games.md` | ② | write after ② merges |
-| ④ | `feat/crosswalk` | `…-04-crosswalk.md` | ② | write after ② merges |
-| ⑤ | `feat/adapter-sleeper` | `…-05-adapter-sleeper.md` | ② (client), ④ (sync) | write after ② merges |
+| ① | `chore/scaffold` | `2026-08-15-phase0-01-scaffold.md` | — | merged |
+| ② | `feat/db-schema` | `2026-08-15-phase0-02-db-schema.md` | ① | merged |
+| ③ | `feat/ingest-nflverse-games` | `…-03-ingest-nflverse-games.md` | ② | plan written 2026-08-16 |
+| ④ | `feat/crosswalk` | `…-04-crosswalk.md` | ② | plan written 2026-08-16 |
+| ⑤ | `feat/adapter-sleeper` | `…-05-adapter-sleeper.md` | ② (client), ④ (sync) | plan written 2026-08-16 |
 | ⑥ | `feat/ingest-adp-ecr` | `…-06-ingest-adp-ecr.md` | ③ ④ | write after ④ merges |
 | ⑦ | `docs/phase0-complete` | `…-07-exit-run.md` | ③ ④ ⑤ ⑥ | write after ⑥ merges |
 
