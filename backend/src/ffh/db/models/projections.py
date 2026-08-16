@@ -36,8 +36,9 @@ class Projection(Base):
     )
     season: Mapped[int] = mapped_column(SmallInteger, nullable=False)
     week: Mapped[int] = mapped_column(SmallInteger, nullable=False)  # 0 = full season
-    league_id: Mapped[uuid.UUID | None] = mapped_column(
-        PG_UUID(as_uuid=True), ForeignKey("leagues.league_id")
+    # NOT NULL: generic-PPR (league-agnostic) rows use GENERIC_LEAGUE_ID, never NULL.
+    league_id: Mapped[uuid.UUID] = mapped_column(
+        PG_UUID(as_uuid=True), ForeignKey("leagues.league_id"), nullable=False
     )
     source: Mapped[str] = mapped_column(Text, nullable=False)
     model_version: Mapped[str] = mapped_column(Text, nullable=False)
@@ -60,7 +61,6 @@ class Projection(Base):
             "source",
             "model_version",
             name="projections_scope_key",  # convention name exceeds Postgres' 63-char limit
-            postgresql_nulls_not_distinct=True,
         ),
         Index("projections_lookup_idx", "season", "week", "source", "model_version"),
     )

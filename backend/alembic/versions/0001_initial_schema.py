@@ -2,7 +2,7 @@
 
 Revision ID: 0001
 Revises:
-Create Date: 2026-08-16 08:10:31.105822
+Create Date: 2026-08-16 08:28:43.789928
 
 """
 
@@ -382,7 +382,7 @@ def upgrade() -> None:
         sa.Column("player_id", sa.UUID(), nullable=False),
         sa.Column("season", sa.SmallInteger(), nullable=False),
         sa.Column("week", sa.SmallInteger(), nullable=False),
-        sa.Column("league_id", sa.UUID(), nullable=True),
+        sa.Column("league_id", sa.UUID(), nullable=False),
         sa.Column("source", sa.Text(), nullable=False),
         sa.Column("model_version", sa.Text(), nullable=False),
         sa.Column("mean_points", sa.REAL(), nullable=False),
@@ -411,8 +411,7 @@ def upgrade() -> None:
             "league_id",
             "source",
             "model_version",
-            name=op.f("projections_scope_key"),
-            postgresql_nulls_not_distinct=True,
+            name="projections_scope_key",
         ),
     )
     op.create_index(

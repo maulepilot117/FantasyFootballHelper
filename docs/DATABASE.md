@@ -349,7 +349,7 @@ CREATE TABLE projections (
     player_id     UUID NOT NULL REFERENCES players(player_id),
     season        SMALLINT NOT NULL,
     week          SMALLINT NOT NULL,     -- 0 = full-season projection
-    league_id     UUID REFERENCES leagues(league_id),  -- NULL = generic PPR
+    league_id     UUID NOT NULL REFERENCES leagues(league_id),  -- GENERIC_LEAGUE_ID for league-agnostic (generic PPR) rows
     source        TEXT NOT NULL,         -- ffh_engine|sleeper_rotowire|ecr_derived
     model_version TEXT NOT NULL,         -- ⚠️ required for backtest comparability
     -- Gamma parameters — see ENGINE.md §4
@@ -362,8 +362,8 @@ CREATE TABLE projections (
     inputs        JSONB NOT NULL,        -- implied_total, usage shares, opp rank, wx, injury
     computed_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
     CONSTRAINT projections_scope_key
-        UNIQUE NULLS NOT DISTINCT (player_id, season, week, league_id, source, model_version)
-        -- league_id nullable (league-agnostic rows); NULLS NOT DISTINCT so upserts conflict.
+        UNIQUE (player_id, season, week, league_id, source, model_version)
+        -- league_id is NOT NULL (sentinel for generic rows), so a plain UNIQUE conflicts on upsert.
         -- Explicit name: the convention-derived name exceeds Postgres' 63-char identifier limit.
 );
 CREATE INDEX projections_lookup_idx ON projections (season, week, source, model_version);
@@ -396,7 +396,24 @@ CREATE TABLE player_week_actuals (
 );
 ```
 
-`league_id` participates in the PK and is therefore NOT NULL. The generic-PPR row uses sentinel `00000000-0000-0000-0000-000000000000` (`ffh.db.models.GENERIC_LEAGUE_ID`). Because of the FK, a sentinel `leagues` row must exist: PR ③ seeds it (`league_id = 00000000-0000-0000-0000-000000000000`, `platform='ffh'`, `external_id='generic'`) via `seed_generic_league(session)` in `backend/src/ffh/ingest/reference.py`, `seed_nfl_teams`' companion.
+**Sentinel generic league.** `league_id` is NOT NULL in both `projections` and `player_week_actuals` (in the latter it is part of the PK). League-agnostic ("generic PPR") rows in either table use the sentinel `00000000-0000-0000-0000-000000000000` (`ffh.db.models.GENERIC_LEAGUE_ID`) — never NULL. Backtest joins `projections ⋈ player_week_actuals` on `(player_id, season, week, league_id)` directly — both use the sentinel; never COALESCE.
+
+Because of the FK, a sentinel `leagues` row must exist. PR ③ seeds it via `seed_generic_league(session)` in `backend/src/ffh/ingest/reference.py` (`seed_nfl_teams`' companion) with exactly this row:
+
+| column | value |
+|---|---|
+| `league_id` | `00000000-0000-0000-0000-000000000000` |
+| `platform` | `'ffh'` |
+| `external_id` | `'generic'` |
+| `season` | `0` |
+| `name` | `'Generic PPR'` |
+| `num_teams` | `12` |
+| `league_type` | `'redraft'` |
+| `is_superflex` | `false` |
+| `scoring_settings` | `{"pass_yd":0.04,"pass_td":4,"pass_int":-2,"rush_yd":0.1,"rush_td":6,"rec":1,"rec_yd":0.1,"rec_td":6,"fum_lost":-2,"two_pt":2}` — canonical full-PPR reference; **NOT** a default for real leagues, whose settings are always platform-fetched |
+| `roster_settings` | `{"QB":1,"RB":2,"WR":2,"TE":1,"FLEX":1,"K":1,"DST":1,"BN":6}` |
+
+All other `leagues` columns (`playoff_teams`, `playoff_start_wk`, `faab_budget`, `my_team_id`) are NULL; `created_at` takes its default.
 
 ```sql
 CREATE TABLE player_injury_status (

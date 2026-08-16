@@ -37,12 +37,14 @@ def test_projections_carry_gamma_params_not_null():
         assert not t.c[col].nullable, col
 
 
-def test_projections_unique_treats_nulls_as_not_distinct():
+def test_projections_league_id_not_null_and_scope_key_named():
     t = Base.metadata.tables["projections"]
+    # Generic-PPR rows use the GENERIC_LEAGUE_ID sentinel, never NULL (DATABASE.md §6).
+    assert not t.c["league_id"].nullable
     uniques = [c for c in t.constraints if c.__class__.__name__ == "UniqueConstraint"]
     assert len(uniques) == 1
     assert uniques[0].name == "projections_scope_key"  # explicit: convention name > 63 chars
-    assert uniques[0].dialect_options["postgresql"]["nulls_not_distinct"] is True
+    assert not uniques[0].dialect_options["postgresql"].get("nulls_not_distinct")
 
 
 def test_projection_correlations_check_canonical_order():
