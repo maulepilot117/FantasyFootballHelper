@@ -79,7 +79,8 @@ is fixed now** (below) so the shape cannot drift.
 - Create `backend/src/ffh/ingest/games.py` — `nfldata_games` job + `upsert_games(session,
   df, season)`; `backend/src/ffh/ingest/reference.py` — `seed_nfl_teams(session)` from
   `backend/src/ffh/data/nfl_teams.csv` (checked in), `seed_stadiums(session, df)` from
-  the greerreNFL CSV job `stadiums`.
+  the greerreNFL CSV job `stadiums`, `seed_generic_league(session)` (sentinel
+  `leagues` row `GENERIC_LEAGUE_ID`, `platform='ffh'`, `external_id='generic'`).
 - Create `backend/src/ffh/features/duck.py` — `connect(lake_root, season) ->
   duckdb.DuckDBPyConnection` with views `stats_player_week`, `snap_counts`, `players`,
   `depth_charts`, `injuries`, `games`.

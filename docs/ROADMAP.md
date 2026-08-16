@@ -30,7 +30,7 @@ Nothing works without this. No shortcuts here.
       React 19, Tailwind v4), `deploy/` (kustomize base + overlays)
 - [x] Dockerfiles — `python:3.13-slim-bookworm`, **not Alpine**
 - [x] CI on `ubuntu-24.04-arm`: lint → test → build → push GHCR. **No QEMU.**
-- [ ] Postgres schema + initial Alembic migration ([`DATABASE.md`](DATABASE.md))
+- [x] Postgres schema + initial Alembic migration ([`DATABASE.md`](DATABASE.md))
 - [ ] **★ Player ID crosswalk ★** — DynastyProcess ingest, resolution ladder, unmatched
       table, and the four mandatory coverage tests. **Highest-risk component; do it first.**
 - [ ] nflverse ingest → Parquet lake (players, stats_player_week, snap counts, depth
