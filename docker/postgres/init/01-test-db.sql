@@ -1,0 +1,1 @@
+CREATE DATABASE ffh_test OWNER ffh;

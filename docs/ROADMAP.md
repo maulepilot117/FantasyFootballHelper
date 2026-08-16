@@ -26,10 +26,10 @@ An ugly correct draft board beats a beautiful late one.
 
 Nothing works without this. No shortcuts here.
 
-- [ ] Repo scaffold — `backend/` (uv, FastAPI, ruff, pytest), `frontend/` (Bun, Vite,
+- [x] Repo scaffold — `backend/` (uv, FastAPI, ruff, pytest), `frontend/` (Bun, Vite,
       React 19, Tailwind v4), `deploy/` (kustomize base + overlays)
-- [ ] Dockerfiles — `python:3.13-slim-bookworm`, **not Alpine**
-- [ ] CI on `ubuntu-24.04-arm`: lint → test → build → push GHCR. **No QEMU.**
+- [x] Dockerfiles — `python:3.13-slim-bookworm`, **not Alpine**
+- [x] CI on `ubuntu-24.04-arm`: lint → test → build → push GHCR. **No QEMU.**
 - [ ] Postgres schema + initial Alembic migration ([`DATABASE.md`](DATABASE.md))
 - [ ] **★ Player ID crosswalk ★** — DynastyProcess ingest, resolution ladder, unmatched
       table, and the four mandatory coverage tests. **Highest-risk component; do it first.**
@@ -39,7 +39,7 @@ Nothing works without this. No shortcuts here.
 - [ ] Platform adapter interface + **Sleeper implementation** (no auth, no approval
       dependency — the one that can't block us)
 - [ ] ADP + ECR ingest with `adp_stdev` ⚠️ required for VONA
-- [ ] Engine purity test (no network/LLM imports in `ffh.engine`)
+- [x] Engine purity test (no network/LLM imports in `ffh.engine`)
 
 **Exit criteria:** a league loads from Sleeper, every rostered player resolves through the
 crosswalk with zero unmatched, and nflverse data queries from DuckDB.

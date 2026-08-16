@@ -31,6 +31,19 @@ Python 3.13 · FastAPI · Polars · DuckDB · Postgres 17 · Bun · React 19 · 
 Deploys to a Raspberry Pi 5 k3s cluster (arm64) via ArgoCD, with Cilium Gateway-API for
 ingress, nfs-synology for storage, and Vault + External Secrets Operator for credentials.
 
+## Local development
+
+```bash
+docker compose up -d --wait            # postgres 17 (ffh + ffh_test) and redis 7
+cd backend && uv sync && uv run pytest # backend tests (db-marked tests need compose up)
+uv run uvicorn ffh.api.app:app --reload   # separate terminal
+cd ../frontend && bun install && bun run dev   # http://localhost:3000, proxies /api → :8000
+```
+
+Copy `backend/.env.example` to `backend/.env` for local overrides (gitignored).
+The Postgres init script (`docker/postgres/init/`) creates `ffh_test` only on a fresh volume — run `docker compose down -v` to re-initialize.
+Frontend lint: `cd frontend && bun run lint` (oxlint).
+
 ## Docs
 
 Design and specs live in [`docs/`](docs/). Start with

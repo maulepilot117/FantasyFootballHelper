@@ -1,0 +1,7 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+namespace: ffh
+resources:
+  - namespace.yaml
+# Phase 3 adds: api deployment/service, frontend deployment/service, PVCs, ExternalSecrets,
+# HTTPRoute, CronJobs. See docs/DEPLOYMENT.md.

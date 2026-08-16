@@ -27,6 +27,7 @@ points as floats.
 
 ```
 GET  /healthz                    liveness — no dependency checks
+GET  /api/v1/healthz             same payload as /healthz, reachable through the /api Gateway route (used by the UI)
 GET  /readyz                     readiness — Postgres + Redis reachable
 GET  /api/v1/meta/state          current NFL season, week, season_type
 GET  /api/v1/meta/ingest         last successful run per source/asset + staleness flags
