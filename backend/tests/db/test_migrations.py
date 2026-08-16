@@ -7,6 +7,7 @@ from sqlalchemy import inspect, text
 
 from ffh.config import get_settings
 from ffh.db.engine import make_engine
+from tests.db._guard import assert_test_database
 
 pytestmark = pytest.mark.db
 
@@ -25,7 +26,7 @@ def _alembic(*args: str) -> subprocess.CompletedProcess[str]:
 
 
 def _reset_schema() -> None:
-    engine = make_engine(get_settings().test_database_url)
+    engine = make_engine(assert_test_database(get_settings().test_database_url))
     with engine.begin() as conn:
         conn.execute(text("DROP SCHEMA public CASCADE; CREATE SCHEMA public;"))
     engine.dispose()

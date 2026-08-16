@@ -8,6 +8,7 @@ from sqlalchemy.orm import Session
 
 from ffh.config import get_settings
 from ffh.db.engine import make_engine
+from tests.db._guard import assert_test_database
 
 BACKEND_DIR = Path(__file__).resolve().parents[1]
 
@@ -21,7 +22,7 @@ def _clear_settings_cache():
 
 @pytest.fixture(scope="session")
 def migrated_engine():
-    url = get_settings().test_database_url
+    url = assert_test_database(get_settings().test_database_url)
     engine = make_engine(url)
     with engine.begin() as conn:
         conn.execute(text("DROP SCHEMA public CASCADE; CREATE SCHEMA public;"))
