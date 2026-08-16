@@ -117,3 +117,14 @@ def test_retry_after_header_is_captured(monkeypatch):
     )
     with make_client() as client:
         assert isinstance(get_bytes(client, URL), Fetched)
+
+
+@respx.mock
+def test_malformed_last_modified_yields_mtime_none():
+    respx.get(URL).mock(
+        return_value=httpx.Response(200, content=b"ok", headers={"Last-Modified": "not a date"})
+    )
+    with make_client() as client:
+        result = get_bytes(client, URL)
+    assert isinstance(result, Fetched)
+    assert result.mtime is None

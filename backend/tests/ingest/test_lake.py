@@ -60,3 +60,32 @@ def test_write_parquet_leaves_no_temp_file_behind(tmp_path: Path):
     path = parquet_file(tmp_path, "nflverse", "players", scrape_date="2026-08-16")
     write_parquet(pl.DataFrame({"a": [1]}), path)
     assert sorted(p.name for p in path.parent.iterdir()) == ["players.parquet"]
+
+
+def test_write_parquet_uses_a_unique_tmp_per_call(tmp_path: Path, monkeypatch):
+    """Two writers of the same partition must never share a temp inode.
+
+    Writer A is caught mid-write (inside ``DataFrame.write_parquet``) while writer B lands
+    first; A then loses the ``os.link`` race, raises, unlinks only its own temp file, and
+    B's content survives untouched.
+    """
+    path = parquet_file(tmp_path, "nflverse", "players", scrape_date="2026-08-16")
+
+    seen_tmps: list[Path] = []
+    real_write = pl.DataFrame.write_parquet
+
+    def spying_write(self, file, *args, **kwargs):
+        seen_tmps.append(Path(file))
+        if len(seen_tmps) == 1:  # writer B lands while writer A is still writing its temp
+            write_parquet(pl.DataFrame({"a": [2]}), path)
+        return real_write(self, file, *args, **kwargs)
+
+    monkeypatch.setattr(pl.DataFrame, "write_parquet", spying_write)
+
+    with pytest.raises(PartitionExistsError):
+        write_parquet(pl.DataFrame({"a": [1]}), path)
+
+    assert len(seen_tmps) == 2 and seen_tmps[0] != seen_tmps[1]
+    assert all(t.name.startswith(".players.parquet.") and t.suffix == ".tmp" for t in seen_tmps)
+    assert pl.read_parquet(path)["a"].to_list() == [2]  # the winner's frame survives
+    assert sorted(p.name for p in path.parent.iterdir()) == ["players.parquet"]  # no tmp left

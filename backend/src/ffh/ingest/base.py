@@ -2,6 +2,10 @@
 
 ARCHITECTURE.md: ingest is idempotent and watermarked, and holds no business logic.
 DATABASE.md §7: every invocation writes exactly one ``ingest_runs`` row.
+
+Lifecycle order: fetch -> parse -> validate -> persist -> land (write_parquet). Persist runs
+before landing so that a same-day ``PartitionExistsError`` (-> ``skipped``) can never leave
+Postgres un-persisted; therefore persist implementations must be idempotent upserts.
 """
 
 import uuid
@@ -143,13 +147,14 @@ class IngestJob(ABC):
 
             df = self.parse(result.content)
             self.validate(df)
+            # persist BEFORE landing (see module docstring): a skipped partition still upserts.
+            self.persist(session, df)
 
             try:
                 rows = write_parquet(df, path)
             except PartitionExistsError as exc:
                 return self._finish(session, run, STATUS_SKIPPED, error=str(exc))
 
-            self.persist(session, df)
             return self._finish(
                 session,
                 run,
@@ -184,6 +189,9 @@ class IngestJob(ABC):
         run.error = error[:_MAX_ERROR_CHARS] if error else None
         run.source_etag = source_etag
         run.source_mtime = source_mtime
+        # capture before commit(): expire_on_commit would otherwise trigger a refresh SELECT
+        stored_error = run.error
+        run_id = run.run_id
         session.commit()
         log.info(
             "ingest.run.finished",
@@ -196,8 +204,8 @@ class IngestJob(ABC):
             status=status,
             rows_written=rows_written,
             output_path=output_path,
-            error=run.error,
-            run_id=run.run_id,
+            error=stored_error,
+            run_id=run_id,
         )
 
 
@@ -247,7 +255,7 @@ def last_successful_etag(
             IngestRun.status == STATUS_SUCCESS,
             IngestRun.source_etag.is_not(None),
         )
-        .order_by(IngestRun.started_at.desc())
+        .order_by(IngestRun.finished_at.desc().nulls_last(), IngestRun.started_at.desc())
         .limit(1)
     )
     return session.scalars(stmt).first()

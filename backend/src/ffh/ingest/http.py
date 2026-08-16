@@ -21,7 +21,7 @@ log = structlog.get_logger(__name__)
 RETRYABLE_STATUSES = frozenset({408, 425, 429, 500, 502, 503, 504})
 MAX_ATTEMPTS = 5
 
-# Multiplied into every computed wait; tests set it to 0.0 to keep the suite fast.
+# Upper bound (``min()``) on every computed wait; tests set it to 0.0 to keep the suite fast.
 _RETRY_WAIT_CAP = 30.0
 
 
@@ -80,6 +80,17 @@ def _retry_after_seconds(response: httpx.Response) -> float | None:
         return None
 
 
+def _last_modified(response: httpx.Response) -> datetime | None:
+    raw = response.headers.get("last-modified")
+    if not raw:
+        return None
+    try:
+        return parsedate_to_datetime(raw)
+    except (TypeError, ValueError):
+        log.warning("ingest.http.bad_last_modified", value=raw)
+        return None
+
+
 def _wait(state: RetryCallState) -> float:
     exc = state.outcome.exception() if state.outcome is not None else None
     if isinstance(exc, RetryableStatus) and exc.retry_after is not None:
@@ -118,7 +129,6 @@ def get_bytes(client: httpx.Client, url: str, etag: str | None = None) -> FetchR
         return NotFound(url=url)
     response.raise_for_status()
 
-    last_modified = response.headers.get("last-modified")
-    mtime = parsedate_to_datetime(last_modified) if last_modified else None
+    mtime = _last_modified(response)
     log.info("ingest.http.fetched", url=url, bytes=len(response.content))
     return Fetched(content=response.content, etag=response.headers.get("etag"), mtime=mtime)

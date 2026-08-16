@@ -50,7 +50,9 @@ class FakeJob(IngestJob):
 def _runs(session, source="fake"):
     return list(
         session.scalars(
-            select(IngestRun).where(IngestRun.source == source).order_by(IngestRun.started_at)
+            select(IngestRun)
+            .where(IngestRun.source == source)
+            .order_by(IngestRun.started_at, IngestRun.finished_at.nulls_last())
         )
     )
 
@@ -173,6 +175,42 @@ def test_validate_is_called_and_persist_receives_the_frame(db_session, tmp_path:
 
     Persisting(script=[Fetched(content=b"x", etag=None, mtime=None)]).run(db_session, tmp_path)
     assert len(seen) == 1 and seen[0].height == 1
+
+
+def test_persist_failure_is_failed_and_lands_nothing(db_session, tmp_path: Path):
+    class Exploding(FakeJob):
+        name = "exploding_persist"
+
+        def persist(self, session, df):
+            raise RuntimeError("upsert blew up")
+
+    result = Exploding(script=[Fetched(content=b"x", etag=None, mtime=None)]).run(
+        db_session, tmp_path
+    )
+    assert result.status == "failed"
+    assert "upsert blew up" in result.error
+    assert not list(tmp_path.rglob("*.parquet"))
+    (run,) = _runs(db_session)
+    assert run.status == "failed" and "upsert blew up" in run.error
+
+
+def test_persist_runs_before_landing_so_skipped_partition_still_persists(
+    db_session, tmp_path: Path
+):
+    calls: list[int] = []
+
+    class Counting(FakeJob):
+        name = "counting_persist"
+
+        def persist(self, session, df):
+            calls.append(df.height)
+
+    FakeJob(script=[Fetched(content=b"x", etag=None, mtime=None)]).run(db_session, tmp_path)
+    result = Counting(script=[Fetched(content=b"x", etag=None, mtime=None)]).run(
+        db_session, tmp_path
+    )
+    assert result.status == "skipped"
+    assert calls == [1]
 
 
 def test_ingest_validation_error_is_a_value_error():
