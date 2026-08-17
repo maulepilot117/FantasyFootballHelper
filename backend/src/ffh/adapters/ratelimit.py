@@ -43,7 +43,11 @@ class TokenBucket:
 
     @property
     def tokens(self) -> float:
-        """Current allowance, refilled to `now`. Capped at `burst`."""
+        """Current allowance, refilled to `now`. Capped at `burst`.
+
+        Single-event-loop only: `asyncio.Lock` serialises concurrent tasks on the same
+        loop, but gives no cross-thread protection.
+        """
         self._refill()
         return self._tokens
 

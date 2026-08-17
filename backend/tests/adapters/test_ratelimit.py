@@ -1,3 +1,5 @@
+import asyncio
+
 import pytest
 
 from ffh.adapters.ratelimit import TokenBucket
@@ -85,3 +87,59 @@ def test_rejects_nonsense_construction():
         TokenBucket(rate_per_min=300, burst=0)
     with pytest.raises(ValueError):
         TokenBucket(rate_per_min=0, burst=30)
+
+
+class VirtualClock:
+    """Shared virtual timeline for real-concurrency tests (multiple live asyncio tasks).
+
+    `FakeClock` above only advances inside a single synchronous caller and never lets
+    tasks interleave, so it cannot exercise `TokenBucket`'s internal lock. `VirtualClock`
+    instead lets many tasks call `sleep` "at once": each call registers a deadline on a
+    shared timeline and cooperatively yields with a bare `await asyncio.sleep(0)` so any
+    sibling task gets a turn to run (and register its own deadline, or resume past its
+    own). Once a round passes where the set of pending deadlines did not grow — i.e.
+    every live task is now blocked on a deadline rather than doing more synchronous work
+    — the clock jumps `now` forward to the earliest pending deadline, waking whichever
+    sleeper(s) that satisfies. No real wall time ever elapses.
+    """
+
+    def __init__(self) -> None:
+        self._now = 1000.0
+        self._deadlines: list[float] = []
+
+    def now(self) -> float:
+        return self._now
+
+    async def sleep(self, seconds: float) -> None:
+        assert seconds >= 0
+        deadline = self._now + seconds
+        self._deadlines.append(deadline)
+        stable_rounds = 0
+        while self._now < deadline:
+            before = len(self._deadlines)
+            await asyncio.sleep(0)
+            if self._now >= deadline:
+                break
+            if len(self._deadlines) == before:
+                stable_rounds += 1
+            else:
+                stable_rounds = 0
+            if stable_rounds >= 1:
+                self._now = max(self._now, min(self._deadlines))
+        self._deadlines.remove(deadline)
+
+
+async def test_lock_serialises_concurrent_acquires():
+    """90 concurrent acquire() calls must never let two tasks double-spend the budget.
+
+    Without the internal lock, concurrent tasks all observe the same stale `tokens` and
+    each independently compute a 0.2s wait — so the mutant races through in ~0.2s total.
+    With the lock, the 60 calls beyond the initial burst of 30 are strictly serialised,
+    each waiting for its own token to refill at 5/s: 60 tokens / 5 per s = 12.0s.
+    """
+    vc = VirtualClock()
+    bucket = TokenBucket(rate_per_min=300, burst=30, clock=vc.now, sleep=vc.sleep)
+    start = vc.now()
+    await asyncio.gather(*(bucket.acquire() for _ in range(90)))
+    elapsed = vc.now() - start
+    assert elapsed == pytest.approx(12.0)
