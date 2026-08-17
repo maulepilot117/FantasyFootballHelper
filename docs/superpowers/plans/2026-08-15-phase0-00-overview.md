@@ -2,8 +2,12 @@
 
 > **For agentic workers:** This is the index. Each PR has (or will have) its own
 > step-level plan file next to this one. Execute PR plans with
-> superpowers:subagent-driven-development, one PR at a time (parallel PRs in separate
-> worktrees). Steps use checkbox (`- [ ]`) syntax for tracking.
+> superpowers:subagent-driven-development, one PR at a time. Steps use checkbox (`- [ ]`)
+> syntax for tracking.
+>
+> **Amendment 2026-08-17:** no worktrees (`docs/WORKFLOW.md` → "One checkout, no worktrees").
+> Where this file or a PR plan says "isolated worktree" / "parallel tracks", read: a feature
+> branch in the repo root, PRs ③ → ④ → ⑤ sequentially. ③ is merged (#5).
 
 **Goal:** Ship every Phase 0 checklist item in `docs/ROADMAP.md` by 2026-08-22 so that a
 Sleeper mock league loads with zero unmatched rostered players and nflverse data queries

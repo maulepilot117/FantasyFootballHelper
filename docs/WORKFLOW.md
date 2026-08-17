@@ -43,24 +43,27 @@ docs(data): correct nflverse stats_player_week asset path
 
 **Never commit to `main` directly.** Never force-push a shared branch.
 
-### Root checkout stays on `main`; feature work lives in worktrees
+### One checkout, no worktrees
 
-The repo root (`FantasyFootballHelper/`) is the **read-only mirror of `main`**. Never check
-out a feature branch there. Every unit of work gets its own worktree under
-`.claude/worktrees/<branch>` (Claude Code's `EnterWorktree` does this automatically).
-
-After a PR merges, close the loop **from the root**:
+All work happens in the repo root (`FantasyFootballHelper/`) on a feature branch:
 
 ```
 git switch main && git pull --ff-only
-git worktree remove .claude/worktrees/<name>   # or let Claude Code clean it up on exit
-git branch -d <branch>
+git switch -c feat/<area>-<short>
+# ... commits, push, PR, Codex gate, merge ...
+git switch main && git pull --ff-only
+git branch -d feat/<area>-<short>
 ```
 
-If the root ever shows a feature branch or is behind `origin/main`, that is a bug in the
-workflow — fix it with the commands above before starting new work. Symptom to watch for:
-"the code isn't in the root, it's only in `.claude/worktrees/`" — that means the root was
-never switched back to `main` after a merge.
+**Do not use git worktrees** (`git worktree add`, Claude Code's `EnterWorktree`,
+superpowers' `using-git-worktrees`). Decided 2026-08-17: a worktree-isolated Claude Code
+session cannot run git against the root checkout, which broke the post-merge close-out
+(root left on a stale branch, code "hidden" under `.claude/worktrees/`). One developer,
+one checkout, one branch at a time is enough. If a second parallel unit of work is ever
+truly needed, clone the repo a second time instead.
+
+If the root is ever behind `origin/main` or on a merged branch, run the last two lines
+above before starting anything new.
 
 ---
 
