@@ -97,7 +97,12 @@ def sleeper_mock():
 @pytest.fixture
 async def sleeper_client(sleeper_mock):
     """A SleeperClient bound to the fixture router; closed on teardown so no
-    httpx.AsyncClient leaks out of a test."""
+    httpx.AsyncClient leaks out of a test.
+
+    Retries use the REAL asyncio.sleep: a test that mocks 429/5xx on this client will
+    sleep for real. Such tests should build their own client with an injected
+    `retry_sleep` instead (see tests/adapters/sleeper/test_client.py).
+    """
     client = SleeperClient(base_url=get_settings().sleeper_base_url)
     try:
         yield client

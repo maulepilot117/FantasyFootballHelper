@@ -165,6 +165,30 @@ async def test_other_4xx_raises_platform_error_without_retry():
 
 
 @respx.mock
+async def test_non_json_200_body_raises_platform_error():
+    route = respx.get(f"{BASE}/state/nfl").mock(
+        return_value=httpx.Response(200, text="<html>maintenance</html>")
+    )
+    async with _client() as client:
+        with pytest.raises(PlatformError) as exc_info:
+            await client.get_json("/state/nfl")
+    assert route.call_count == 1
+    assert exc_info.type is PlatformError
+    assert "non-JSON" in str(exc_info.value)
+
+
+@respx.mock
+async def test_get_user_null_body_raises_platform_not_found():
+    # Sleeper returns HTTP 200 with body `null` for an unknown username.
+    respx.get(f"{BASE}/user/nobody").mock(
+        return_value=httpx.Response(200, text="null", headers={"content-type": "application/json"})
+    )
+    async with _client() as client:
+        with pytest.raises(PlatformNotFound):
+            await client.get_user("nobody")
+
+
+@respx.mock
 async def test_every_request_spends_a_rate_limit_token():
     respx.get(f"{BASE}/state/nfl").mock(return_value=httpx.Response(200, json={}))
     bucket = TokenBucket(rate_per_min=300, burst=30)
@@ -181,12 +205,14 @@ async def test_default_rate_is_300_per_minute_burst_30():
         # Drain the burst; nothing sleeps until the bucket is empty.
         for _ in range(30):
             await bucket.acquire()
-        assert bucket.tokens == pytest.approx(0.0, abs=0.05)
-        # 300/min == 5 tokens/s: the 31st acquire must really wait ~0.2s.
+        assert bucket.tokens < 1.0
+        # 300/min == 5 tokens/s: the 31st acquire must wait for the remaining deficit,
+        # i.e. (1 - tokens) / 5 seconds (~0.2s), whatever the drain loop cost.
+        t = bucket.tokens
         t0 = time.monotonic()
         await bucket.acquire()
         elapsed = time.monotonic() - t0
-    assert 0.15 <= elapsed <= 1.5
+    assert elapsed == pytest.approx((1 - t) / 5.0, abs=0.1)
 
 
 async def test_context_manager_closes_owned_http():

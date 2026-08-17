@@ -101,7 +101,11 @@ class SleeperClient:
             raise _Retryable(f"sleeper {code} for {path}", retry_after=_parse_retry_after(resp))
         if code >= 400:
             raise PlatformError(f"sleeper {code} for {path}")
-        return resp.json()
+        try:
+            return resp.json()
+        except ValueError as exc:
+            # CDN/maintenance HTML, or a 3xx body (httpx does not follow redirects).
+            raise PlatformError(f"sleeper: non-JSON body for {path}") from exc
 
     def _wait(self, retry_state: RetryCallState) -> float:
         """Honour a numeric Retry-After when the server sent one; else exponential jitter."""
@@ -137,7 +141,11 @@ class SleeperClient:
         return RawState.model_validate(await self.get_json("/state/nfl"))
 
     async def get_user(self, username_or_id: str) -> RawUser:
-        return RawUser.model_validate(await self.get_json(f"/user/{username_or_id}"))
+        # Sleeper answers an unknown user with HTTP 200 and a literal `null` body.
+        payload = await self.get_json(f"/user/{username_or_id}")
+        if payload is None:
+            raise PlatformNotFound(f"sleeper user not found: {username_or_id}")
+        return RawUser.model_validate(payload)
 
     async def get_user_leagues(self, user_id: str, season: int) -> list[RawLeague]:
         payload = await self.get_json(f"/user/{user_id}/leagues/nfl/{season}")
