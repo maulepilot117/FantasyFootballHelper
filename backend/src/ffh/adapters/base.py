@@ -144,6 +144,9 @@ class PlayerRef(_Frozen):
     name: str
     position: str
     team: str | None
+    # NFL GSIS id when the platform publishes one (Sleeper: null for DEF and ~2/3 of the
+    # blob). Whitespace-stripped; never "". The crosswalk's strongest join key.
+    gsis_id: str | None = None
 
 
 class Draft(_Frozen):

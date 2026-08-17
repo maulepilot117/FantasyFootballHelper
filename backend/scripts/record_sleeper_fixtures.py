@@ -2,7 +2,11 @@
 
   FFH_SLEEPER_MOCK_LEAGUE_ID=<id> uv run python scripts/record_sleeper_fixtures.py
 
-Rewrites backend/tests/fixtures/sleeper/. This is the **only** code in this repo that
+Writes backend/tests/fixtures/sleeper_live/ (the LIVE recording, consumed later by a
+coverage test). The unit-test corpus in backend/tests/fixtures/sleeper/ is a hand-written
+SYNTHETIC corpus bound to `tests/conftest.py`'s FIXTURE_LEAGUE_ID/FIXTURE_DRAFT_ID and to
+every assertion in the Sleeper suite — never re-point the unit tests at the live directory
+and never record over the synthetic one. This is the **only** code in this repo that
 talks to the live Sleeper API — every test drives `respx` instead, and this script is
 never imported except by `tests/adapters/sleeper/test_record_fixtures.py`, which mocks
 it with the `sleeper_mock` fixture. It has no pytest-level network test of its own: unlike
@@ -38,7 +42,8 @@ from pathlib import Path
 from ffh.adapters.sleeper.client import SleeperClient
 from ffh.config import get_settings
 
-FIXTURES = Path(__file__).resolve().parents[1] / "tests" / "fixtures" / "sleeper"
+#: Live recording target. Deliberately NOT tests/fixtures/sleeper (the synthetic corpus).
+FIXTURES = Path(__file__).resolve().parents[1] / "tests" / "fixtures" / "sleeper_live"
 EXTRA_FREE_AGENTS = 5
 
 #: Single source of truth for both EXPECTED_FILES (what `record()` must write) and the
@@ -59,10 +64,11 @@ EXPECTED_FILES: tuple[tuple[str, str], ...] = (
     ),
 )
 
-README = """# Sleeper fixtures
+README = """# Sleeper live fixtures
 
-Recorded responses from `https://api.sleeper.app/v1`. **CI never touches the network** —
-every test drives these through `respx` mounted on `settings.sleeper_base_url`.
+Recorded responses from `https://api.sleeper.app/v1`. **CI never touches the network.**
+This directory is the LIVE recording; the unit tests are bound to the hand-written
+synthetic corpus in `tests/fixtures/sleeper/` and must not be re-pointed here.
 
 Source league: `{league_id}` (draft `{draft_id}`), recorded {recorded_on}.
 Re-record from `backend/`:
@@ -185,7 +191,8 @@ async def _main() -> int:
         print("set FFH_SLEEPER_MOCK_LEAGUE_ID in backend/.env first", file=sys.stderr)
         return 2
     allow_empty = "--allow-empty" in sys.argv[1:]
-    async with SleeperClient() as client:
+    # /players/nfl is a 14.6 MB blob; the client's 10 s default is too tight for it.
+    async with SleeperClient(timeout=60.0) as client:
         written = await record(league_id, FIXTURES, client, allow_empty=allow_empty)
     for stem, size in sorted(written.items()):
         print(f"{stem}.json  {size:>9,} bytes")

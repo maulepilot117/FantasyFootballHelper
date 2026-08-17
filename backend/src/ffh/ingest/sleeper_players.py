@@ -87,7 +87,9 @@ def _row(raw: RawPlayer) -> dict[str, str | None]:
         "status": raw.status,
         "active": _s(raw.active),
         "injury_status": raw.injury_status,
-        "gsis_id": raw.gsis_id,
+        # Normalized by player_ref (stray leading space stripped, "" -> None) so the lake
+        # value and the catalog's PlayerRef.gsis_id agree.
+        "gsis_id": ref.gsis_id,
         "espn_id": _s(raw.espn_id),
         "yahoo_id": _s(raw.yahoo_id),
         "rotowire_id": _s(raw.rotowire_id),

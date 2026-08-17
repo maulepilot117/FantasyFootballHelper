@@ -130,6 +130,23 @@ async def test_non_numeric_retry_after_falls_back_to_backoff():
     assert 0.5 <= sleeper.calls[0] <= 1.5
 
 
+@pytest.mark.parametrize("header", ["nan", "inf", "-inf"])
+@respx.mock
+async def test_non_finite_retry_after_falls_back_to_backoff(header):
+    # float("nan") parses; it must not become the sleep duration.
+    respx.get(f"{BASE}/state/nfl").mock(
+        side_effect=[
+            httpx.Response(429, headers={"Retry-After": header}),
+            httpx.Response(200, json={"ok": True}),
+        ]
+    )
+    sleeper = SleepRecorder()
+    async with _client(retry_sleep=sleeper) as client:
+        assert await client.get_json("/state/nfl") == {"ok": True}
+    assert len(sleeper.calls) == 1
+    assert 0.5 <= sleeper.calls[0] <= 1.5
+
+
 @respx.mock
 async def test_gives_up_after_five_attempts_and_raises_platform_error():
     route = respx.get(f"{BASE}/state/nfl").mock(return_value=httpx.Response(503))

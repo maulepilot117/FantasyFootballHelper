@@ -3,13 +3,13 @@
 Recorded responses from `https://api.sleeper.app/v1`. **CI never touches the network** —
 every test drives these through `respx` mounted on `settings.sleeper_base_url`.
 
-Source league: hand-written placeholder (`league_id=1000000000000000001`,
+Source league: hand-written SYNTHETIC corpus (`league_id=1000000000000000001`,
 `draft_id=2000000000000000001`), authored 2026-08-16 to match live-verified shapes.
-Replace with a real recording by running, from `backend/`:
+The unit tests are bound to this corpus (ids, counts, names) — do not record over it and
+do not re-point the tests elsewhere. A live recording is a separate directory,
+`tests/fixtures/sleeper_live/`, written from `backend/` by:
 
     FFH_SLEEPER_MOCK_LEAGUE_ID=<id> uv run python scripts/record_sleeper_fixtures.py
-
-That script rewrites every file here and updates the "Source league" line above.
 
 Sleeper data is licensed for **non-commercial use only**. These fixtures exist solely to
 test this self-hosted personal project.

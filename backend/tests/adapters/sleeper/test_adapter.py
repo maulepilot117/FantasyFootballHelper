@@ -125,6 +125,26 @@ async def test_starter_length_mismatch_raises(adapter, sleeper_mock, sleeper_fix
         await adapter.get_rosters(LEAGUE, 1)
 
 
+async def test_null_starters_means_every_slot_is_empty_and_everyone_sits_on_the_bench(
+    adapter, sleeper_mock, sleeper_fixture
+):
+    # Sleeper sends `starters: null` for a roster that never set a lineup. Not ambiguous:
+    # every starting slot is empty, so all of `players` land on BN (IR/TAXI still win).
+    rosters = sleeper_fixture("rosters")
+    rosters[1]["starters"] = None
+    rosters[1]["reserve"] = None
+    rosters[1]["taxi"] = None
+    sleeper_mock.get(f"/league/{LEAGUE}/rosters").mock(
+        return_value=httpx.Response(200, json=rosters)
+    )
+    by_team = {r.team_external_id: r for r in await adapter.get_rosters(LEAGUE, 1)}
+    theirs = by_team["2"].players
+    assert {e.player_external_id for e in theirs} == set(rosters[1]["players"])
+    assert all(e.slot == "BN" and e.is_starter is False for e in theirs)
+    # Roster 1 (untouched) still maps its starters.
+    assert any(e.is_starter for e in by_team["1"].players)
+
+
 async def test_get_matchups_pairs_by_matchup_id(adapter):
     matchups = await adapter.get_matchups(LEAGUE, 1)
     assert len(matchups) == 1
@@ -207,6 +227,28 @@ async def test_get_draft_maps_slot_and_epoch_ms(adapter):
     assert d.started_at == datetime.fromtimestamp(1756074607722 / 1000, tz=UTC)
 
 
+async def test_get_draft_raises_when_the_wire_has_no_league_id(
+    adapter, sleeper_mock, sleeper_fixture
+):
+    raw = sleeper_fixture("draft")
+    raw["league_id"] = None
+    sleeper_mock.get(f"/draft/{DRAFT}").mock(return_value=httpx.Response(200, json=raw))
+    with pytest.raises(PlatformError, match="no league_id"):
+        await adapter.get_draft(DRAFT)
+
+
+async def test_get_league_drafts_maps_every_row_without_slot_to_roster_id(adapter, sleeper_fixture):
+    # /league/{id}/drafts rows carry no slot_to_roster_id; the mapping must not need it.
+    raws = sleeper_fixture("league_drafts")
+    assert all("slot_to_roster_id" not in r for r in raws)
+    drafts = await adapter.get_league_drafts(LEAGUE)
+    assert len(drafts) == len(raws) == 1
+    (d,) = drafts
+    assert d.external_id == DRAFT and d.league_external_id == LEAGUE
+    assert d.draft_type == "snake" and d.rounds == 13 and d.status == "complete"
+    assert d.my_slot == 1 and d.last_picked_ms == 1756083970192
+
+
 async def test_get_draft_picks_maps_roster_keeper_and_auction_amount(adapter):
     picks = {p.pick_no: p for p in await adapter.get_draft_picks(DRAFT)}
     assert picks[1].team_external_id == "1" and picks[1].player_external_id == "1"
@@ -256,6 +298,24 @@ def test_player_ref_maps_a_defense_to_dst_named_by_team_abbreviation():
     assert ref.position == "DST"
     assert ref.name == "KC"  # the one form the crosswalk's normalize_dst canonicalizes
     assert ref.team == "KC"
+    assert ref.gsis_id is None  # DEF entries carry no gsis_id
+
+
+def test_player_ref_strips_sleepers_stray_leading_space_from_gsis_id():
+    raw = RawPlayer(
+        player_id="4046",
+        full_name="Patrick Mahomes",
+        position="QB",
+        team="KC",
+        gsis_id=" 00-0033873",
+    )
+    assert player_ref(raw).gsis_id == "00-0033873"
+
+
+@pytest.mark.parametrize("gsis", [None, "", "   "])
+def test_player_ref_never_emits_an_empty_gsis_id(gsis):
+    raw = RawPlayer(player_id="1", full_name="X Y", position="QB", team=None, gsis_id=gsis)
+    assert player_ref(raw).gsis_id is None
 
 
 def test_player_ref_builds_a_human_name_from_first_and_last_when_full_name_is_missing():
@@ -291,6 +351,26 @@ async def test_lake_player_catalog_reads_the_newest_partition(tmp_path):
         ).write_parquet(d / "players.parquet")
     refs = await LakePlayerCatalog(tmp_path).all_players()
     assert refs["1"].name == "Fresh Player"
+    # A partition without a gsis_id column (older lake) still loads, with gsis_id=None.
+    assert refs["1"].gsis_id is None
+
+
+async def test_lake_player_catalog_round_trips_gsis_id(tmp_path):
+    part = tmp_path / "raw" / "sleeper" / "players" / "scrape_date=2026-08-15"
+    part.mkdir(parents=True)
+    pl.DataFrame(
+        {
+            "player_id": ["1", "2", "KC"],
+            "name": ["A", "B", "KC"],
+            "position": ["QB", "RB", "DST"],
+            "team": ["KC", None, "KC"],
+            "gsis_id": ["00-0033873", " 00-0099999", None],
+        }
+    ).write_parquet(part / "players.parquet")
+    refs = await LakePlayerCatalog(tmp_path).all_players()
+    assert refs["1"].gsis_id == "00-0033873"
+    assert refs["2"].gsis_id == "00-0099999"  # same strip rule as player_ref
+    assert refs["KC"].gsis_id is None
 
 
 async def test_lake_player_catalog_translates_a_null_name_row_into_platform_error(tmp_path):

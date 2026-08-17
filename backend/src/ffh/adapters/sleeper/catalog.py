@@ -13,11 +13,15 @@ import polars as pl
 from pydantic import ValidationError
 
 from ffh.adapters.base import PlatformError, PlayerRef
+from ffh.adapters.sleeper.gsis import normalize_gsis_id
 
 PLAYERS_LAKE_GLOB = "raw/sleeper/players/scrape_date=*"
 # The ONE definition of the player-partition column contract. The `sleeper_players`
 # IngestJob imports this to write exactly these columns.
 REQUIRED_COLUMNS = ("player_id", "name", "position", "team")
+# Carried into PlayerRef when the partition has it (every job-written partition does);
+# an older partition without it still loads, with gsis_id=None.
+OPTIONAL_COLUMNS = ("gsis_id",)
 
 
 class LakePlayerCatalog:
@@ -44,6 +48,7 @@ class LakePlayerCatalog:
         missing = [c for c in REQUIRED_COLUMNS if c not in df.columns]
         if missing:
             raise PlatformError(f"{partition} is missing columns {missing}")
+        columns = [*REQUIRED_COLUMNS, *(c for c in OPTIONAL_COLUMNS if c in df.columns)]
         try:
             refs = {
                 row["player_id"]: PlayerRef(
@@ -51,8 +56,9 @@ class LakePlayerCatalog:
                     name=row["name"],
                     position=row["position"],
                     team=row["team"],
+                    gsis_id=normalize_gsis_id(row.get("gsis_id")),
                 )
-                for row in df.select(REQUIRED_COLUMNS).iter_rows(named=True)
+                for row in df.select(columns).iter_rows(named=True)
             }
         except ValidationError as exc:
             raise PlatformError(

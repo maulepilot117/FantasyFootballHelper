@@ -9,6 +9,7 @@ GET /players/nfl is deliberately NOT exposed here: it is 14.6 MB and belongs to 
 
 from __future__ import annotations
 
+import math
 from collections.abc import Awaitable, Callable
 from typing import Any
 
@@ -49,7 +50,8 @@ class _Retryable(PlatformError):
 
 
 def _parse_retry_after(resp: httpx.Response) -> float | None:
-    """Numeric `Retry-After` seconds, capped; None if absent or HTTP-date form."""
+    """Numeric `Retry-After` seconds, capped; None if absent, HTTP-date form, negative or
+    non-finite ("nan"/"inf" parse as floats but are not a wait)."""
     raw = resp.headers.get("Retry-After")
     if raw is None:
         return None
@@ -57,7 +59,7 @@ def _parse_retry_after(resp: httpx.Response) -> float | None:
         seconds = float(raw.strip())
     except ValueError:
         return None
-    if seconds < 0:
+    if not math.isfinite(seconds) or seconds < 0:
         return None
     return min(seconds, MAX_RETRY_AFTER_SECONDS)
 

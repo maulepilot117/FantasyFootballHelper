@@ -29,6 +29,7 @@ from ffh.adapters.base import (
     Transaction,
 )
 from ffh.adapters.sleeper.client import SleeperClient
+from ffh.adapters.sleeper.gsis import normalize_gsis_id
 from ffh.adapters.sleeper.models import (
     RawDraft,
     RawDraftPick,
@@ -83,6 +84,7 @@ def player_ref(raw: RawPlayer) -> PlayerRef:
             name=raw.player_id,
             position="DST",
             team=raw.team or raw.player_id,
+            gsis_id=None,
         )
     name = raw.full_name or f"{raw.first_name or ''} {raw.last_name or ''}".strip()
     return PlayerRef(
@@ -90,6 +92,7 @@ def player_ref(raw: RawPlayer) -> PlayerRef:
         name=name,
         position=raw.position or "",
         team=raw.team,
+        gsis_id=normalize_gsis_id(raw.gsis_id),
     )
 
 
@@ -109,7 +112,9 @@ def to_roster_settings(raw: RawLeague) -> RosterSettings:
         raise PlatformError(f"unknown flex slot(s) {unknown_flex} in league {raw.league_id}")
     # IR / taxi capacity is a league setting, not a roster_positions token (verified live:
     # reserve_slots=1 with no "IR" token). The settings ints are authoritative; an
-    # explicit 0 there is a real 0.
+    # explicit 0 there is a real 0. A fallback to counting "IR"/"TAXI" tokens was
+    # deliberately omitted: RawLeagueSettings.reserve_slots / taxi_slots are non-optional
+    # ints (Sleeper always sends them), so there is no "absent" case to fall back from.
     return RosterSettings(
         starters=starters,
         bench=tokens.count("BN"),
@@ -240,14 +245,19 @@ class SleeperAdapter:
     def _roster(
         self, raw: RawRoster, starter_slots: list[str], week: int, league_id: str
     ) -> Roster:
-        if len(raw.starters) != len(starter_slots):
+        # Sleeper sends `starters: null` (-> []) for a roster that has never set a lineup.
+        # That is unambiguous — every starting slot is empty — so treat it as
+        # [EMPTY_SLOT] * len(starter_slots) and let everyone fall to BN. Only a NON-empty
+        # list whose length disagrees with the league's starter tokens is ambiguous.
+        starters = raw.starters or [EMPTY_SLOT] * len(starter_slots)
+        if len(starters) != len(starter_slots):
             raise PlatformError(
-                f"league {league_id} roster {raw.roster_id}: {len(raw.starters)} starters "
+                f"league {league_id} roster {raw.roster_id}: {len(starters)} starters "
                 f"but {len(starter_slots)} starting slots — refusing to guess the alignment"
             )
         entries: list[RosterEntry] = []
         seen: set[str] = set()
-        for slot, pid in zip(starter_slots, raw.starters, strict=True):
+        for slot, pid in zip(starter_slots, starters, strict=True):
             if pid == EMPTY_SLOT or not pid:
                 continue
             entries.append(RosterEntry(player_external_id=pid, slot=slot, is_starter=True))
@@ -370,15 +380,29 @@ class SleeperAdapter:
     async def get_draft(self, draft_id: str) -> Draft:
         return self._draft(await self._client.get_draft(draft_id))
 
+    async def get_league_drafts(self, league_id: str) -> list[Draft]:
+        """Every draft attached to a league (GET /league/{id}/drafts).
+
+        Those rows carry no `slot_to_roster_id` (only GET /draft/{id} does); `_draft` never
+        reads it, so the mapping is identical.
+        """
+        raws = await self._client.get_league_drafts(league_id)
+        drafts = [self._draft(raw) for raw in raws]
+        if len(drafts) != len(raws):
+            raise PlatformError(f"league {league_id}: dropped drafts while mapping")
+        return drafts
+
     def _draft(self, raw: RawDraft) -> Draft:
         if raw.type not in DRAFT_TYPES:
             raise PlatformError(f"draft {raw.draft_id}: unrecognised type {raw.type!r}")
         if raw.status not in DRAFT_STATUSES:
             raise PlatformError(f"draft {raw.draft_id}: unrecognised status {raw.status!r}")
+        if not raw.league_id:
+            raise PlatformError(f"draft {raw.draft_id}: no league_id on the wire")
         my_slot = raw.draft_order.get(self._my_user_id) if self._my_user_id else None
         return Draft(
             external_id=raw.draft_id,
-            league_external_id=raw.league_id or "",
+            league_external_id=raw.league_id,
             draft_type=raw.type,  # type: ignore[arg-type]
             rounds=raw.settings.rounds,
             status=raw.status,  # type: ignore[arg-type]
