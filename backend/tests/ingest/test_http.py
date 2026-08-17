@@ -107,16 +107,34 @@ def test_get_bytes_raises_on_unexpected_4xx():
 
 
 @respx.mock
-def test_retry_after_header_is_captured(monkeypatch):
-    monkeypatch.setattr("ffh.ingest.http._RETRY_WAIT_CAP", 0.0)
+def test_retry_after_is_honoured_exactly(monkeypatch):
+    slept: list[float] = []
+    monkeypatch.setattr("ffh.ingest.http._sleep", slept.append)
     respx.get(URL).mock(
         side_effect=[
-            httpx.Response(429, headers={"Retry-After": "2"}),
+            httpx.Response(429, headers={"Retry-After": "45"}),  # above the 30 s backoff cap
             httpx.Response(200, content=b"ok"),
         ]
     )
     with make_client() as client:
         assert isinstance(get_bytes(client, URL), Fetched)
+    assert slept == [45.0], "a server Retry-After must not be shortened by the backoff cap"
+
+
+@respx.mock
+def test_retry_after_beyond_the_max_stops_retrying_instead_of_firing_early(monkeypatch):
+    slept: list[float] = []
+    monkeypatch.setattr("ffh.ingest.http._sleep", slept.append)
+    route = respx.get(URL).mock(
+        side_effect=[
+            httpx.Response(429, headers={"Retry-After": "600"}),
+            httpx.Response(200, content=b"never reached"),
+        ]
+    )
+    with make_client() as client, pytest.raises(RetryableStatus) as excinfo:
+        get_bytes(client, URL)
+    assert excinfo.value.retry_after == 600.0
+    assert slept == [] and route.call_count == 1
 
 
 @respx.mock

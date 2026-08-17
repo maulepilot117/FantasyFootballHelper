@@ -567,7 +567,7 @@ CREATE TABLE ingest_runs (
     week         SMALLINT,
     started_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
     finished_at  TIMESTAMPTZ,
-    status       TEXT NOT NULL,          -- running|success|failed|skipped_not_modified
+    status       TEXT NOT NULL,          -- running|success|failed|skipped_not_modified|skipped
     rows_written INTEGER,
     source_etag  TEXT,                   -- for If-None-Match / 304 handling
     source_mtime TIMESTAMPTZ,
@@ -577,6 +577,9 @@ CREATE TABLE ingest_runs (
 CREATE INDEX ingest_runs_source_idx ON ingest_runs (source, asset, started_at);
 -- DESC omitted — btree scans backward; keeps autogenerate drift-free.
 ```
+
+`status` vocabulary: `running` (row created, lifecycle in flight) · `success` (landed a new partition; `source_etag` becomes the watermark) · `skipped_not_modified` (304 against the watermark) · `skipped` (either a 404 on a `skip_on_404` seasonal asset — not published yet — or the day's partition already existed; `error` says which) · `failed` (any exception; `error` holds the repr). Only `success` rows advance the ETag watermark.
+
 
 ---
 

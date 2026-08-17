@@ -79,7 +79,8 @@ are here to be the check, not the rubber stamp.
 ## When implementing
 
 - Match existing patterns in the module you're touching. Read neighbors first.
-- Polars, not pandas. `nflreadpy`, not `nfl_data_py`.
+- Polars, not pandas. Neither `nflreadpy` nor `nfl_data_py` — nflverse is read directly from
+  release URLs via `ffh.ingest.nflverse` (both imports are ruff-banned).
 - Type hints everywhere. Pydantic v2 for anything crossing a boundary.
 - Tests alongside the code. For engine math, test against a hand-computed worked example —
   `docs/ENGINE.md` contains several with expected values.

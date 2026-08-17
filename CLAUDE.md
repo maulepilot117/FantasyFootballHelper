@@ -16,7 +16,9 @@ homelab via ArgoCD.
 2. **Projections are distributions, not point estimates.** Every projection carries Gamma
    params. Downstream code that needs only the mean still receives the distribution.
 3. **Never `import pandas` in new code.** This project is Polars-native. `nfl_data_py` is
-   archived — use `nflreadpy`.
+   archived and `nflreadpy` is deliberately **not** a dependency: nflverse assets are read
+   straight from their release Parquet/CSV URLs with httpx + Polars (`ffh.ingest.nflverse`,
+   `DATA_SOURCES.md` §1). Both imports are banned by ruff.
 4. **Never use Alpine base images for Python services.** No musl aarch64 wheels for
    scikit-learn / xgboost / lightgbm / duckdb. Use `python:3.13-slim-bookworm`.
 5. **Never put a SQLite or `.duckdb` file on NFS.** Postgres is the system of record;

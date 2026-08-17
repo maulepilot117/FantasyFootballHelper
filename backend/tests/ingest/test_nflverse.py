@@ -83,8 +83,12 @@ def test_parse_reads_parquet_bytes():
     assert df["gsis_id"].to_list() == ["00-0034796"]
 
 
-def _frame(cls) -> pl.DataFrame:
-    return pl.DataFrame({c: ["x"] for c in sorted(cls.REQUIRED_COLUMNS)})
+def _frame(cls, season: int = 2026) -> pl.DataFrame:
+    """One row with every required column; `season` (when required) is the requested one."""
+    cols = {c: ["x"] for c in sorted(cls.REQUIRED_COLUMNS)}
+    if "season" in cols:
+        cols["season"] = [season]
+    return pl.DataFrame(cols)
 
 
 @pytest.mark.parametrize(
@@ -136,3 +140,26 @@ def test_players_job_uses_nflverse_field_names_not_table_names():
     required = NflversePlayersJob.REQUIRED_COLUMNS
     assert {"display_name", "college_name", "rookie_season", "height", "weight"} <= required
     assert not ({"full_name", "college", "rookie_year", "height_in", "weight_lb"} & required)
+
+
+@pytest.mark.parametrize(
+    "cls",
+    [NflverseStatsPlayerWeekJob, NflverseSnapCountsJob, NflverseInjuriesJob, NflversePbpJob],
+)
+def test_seasonal_validate_rejects_a_payload_from_another_season(cls):
+    df = _frame(cls).with_columns(pl.lit(2025).alias("season"))
+    with pytest.raises(IngestValidationError, match="requested season 2026"):
+        cls(season=2026).validate(df)
+
+
+@pytest.mark.parametrize(
+    "cls",
+    [NflverseStatsPlayerWeekJob, NflverseSnapCountsJob, NflverseInjuriesJob, NflversePbpJob],
+)
+def test_seasonal_validate_accepts_the_requested_season(cls):
+    cls(season=2026).validate(_frame(cls).with_columns(pl.lit(2026).alias("season")))
+
+
+def test_depth_charts_has_no_season_column_and_is_exempt():
+    assert "season" not in NflverseDepthChartsJob.REQUIRED_COLUMNS
+    NflverseDepthChartsJob(season=2026).validate(_frame(NflverseDepthChartsJob))

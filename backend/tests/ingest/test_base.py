@@ -2,7 +2,7 @@ from pathlib import Path
 
 import polars as pl
 import pytest
-from sqlalchemy import select
+from sqlalchemy import select, text
 
 from ffh.db.models import IngestRun
 from ffh.ingest.base import (
@@ -215,3 +215,61 @@ def test_persist_runs_before_landing_so_skipped_partition_still_persists(
 
 def test_ingest_validation_error_is_a_value_error():
     assert issubclass(IngestValidationError, ValueError)
+
+
+def test_run_holds_a_per_asset_advisory_lock_for_the_whole_lifecycle(
+    db_session, migrated_engine, tmp_path: Path
+):
+    """A second connection must NOT be able to take the (source, asset, season) lock while
+    run() is inside persist(); it must be able to immediately after run() returns."""
+    probes: list[bool] = []
+    key = FakeJob().lock_key()
+
+    class Probing(FakeJob):
+        name = "probing_lock"
+
+        def persist(self, session, df):
+            with migrated_engine.connect() as other:
+                got = other.execute(
+                    text("SELECT pg_try_advisory_lock(hashtext(:k))"), {"k": key}
+                ).scalar()
+                if got:  # should not happen; release so we don't poison later tests
+                    other.execute(text("SELECT pg_advisory_unlock(hashtext(:k))"), {"k": key})
+                probes.append(bool(got))
+
+    result = Probing(script=[Fetched(content=b"x", etag=None, mtime=None)]).run(
+        db_session, tmp_path
+    )
+    assert result.status == "success"
+    assert probes == [False], "another connection acquired the lock mid-lifecycle"
+
+    # released after run(): a fresh connection can take it now
+    with migrated_engine.connect() as other:
+        assert other.execute(text("SELECT pg_try_advisory_lock(hashtext(:k))"), {"k": key}).scalar()
+        other.execute(text("SELECT pg_advisory_unlock(hashtext(:k))"), {"k": key})
+
+
+def test_lock_is_released_even_when_the_run_fails(db_session, migrated_engine, tmp_path: Path):
+    class Exploding(FakeJob):
+        name = "exploding_for_lock"
+
+        def persist(self, session, df):
+            raise RuntimeError("boom")
+
+    job = Exploding(script=[Fetched(content=b"x", etag=None, mtime=None)])
+    assert job.run(db_session, tmp_path).status == "failed"
+    with migrated_engine.connect() as other:
+        assert other.execute(
+            text("SELECT pg_try_advisory_lock(hashtext(:k))"), {"k": job.lock_key()}
+        ).scalar()
+        other.execute(text("SELECT pg_advisory_unlock(hashtext(:k))"), {"k": job.lock_key()})
+
+
+def test_lock_key_is_scoped_to_source_asset_and_season():
+    class Seasonal(FakeJob):
+        name = "seasonal_lock"
+        seasonal = True
+
+    assert FakeJob().lock_key() != Seasonal(season=2026).lock_key()
+    assert Seasonal(season=2025).lock_key() != Seasonal(season=2026).lock_key()
+    assert Seasonal(season=2026).lock_key() == Seasonal(season=2026).lock_key()

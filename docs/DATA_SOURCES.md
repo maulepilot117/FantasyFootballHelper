@@ -11,8 +11,9 @@ priors, and re-verify before assuming a source is broken.
 1. **`nfl_data_py` is ARCHIVED** (read-only since 2025-09-25). Its README: *"nfl_data_py
    has been deprecated in favour of nflreadpy. All future development will occur in
    nflreadpy and users are encouraged to switch immediately."* Nearly every tutorial and
-   blog post still references the dead package. **Use `nflreadpy` — it is Polars-native,
-   not pandas.**
+   blog post still references the dead package. **This project uses neither:** the nflverse
+   release Parquet/CSV URLs are read directly with httpx + Polars (`ffh.ingest.nflverse`);
+   `nflreadpy` is a thin loader we chose not to depend on. Both imports are ruff-banned.
 
 2. **The nflverse player-stats asset was renamed.** `player_stats/player_stats.parquet` is
    frozen at 2025-05-07 and silently serves year-old data. The live path is
@@ -86,9 +87,9 @@ https://github.com/nflverse/nflverse-data/releases/download/{asset}/{file}.parqu
 **License:** package code MIT. Data CC-BY 4.0 — **except FTN charting, which is
 CC-BY-SA 4.0 (share-alike).** If we build on FTN charting that obligation is real.
 
-**Library:** `nflreadpy` (PyPI, MIT, Polars-native). Note v0.1.5 dates to 2025-11-19 with
-no 2026 release; the loader is thin, so falling back to reading the Parquet URLs directly
-is entirely reasonable and removes a dependency.
+**Library:** none. `nflreadpy` (PyPI, MIT, Polars-native) exists but v0.1.5 dates to
+2025-11-19 with no 2026 release; the loader is thin, so PR ③ reads the release Parquet URLs
+directly (`ffh.ingest.nflverse`) and `nflreadpy` is **not** a dependency — decided 2026-08-16.
 
 ---
 

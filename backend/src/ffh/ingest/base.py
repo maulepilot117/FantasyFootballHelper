@@ -17,7 +17,7 @@ from typing import ClassVar
 
 import polars as pl
 import structlog
-from sqlalchemy import select
+from sqlalchemy import select, text
 from sqlalchemy.orm import Session
 
 from ffh.db.models import IngestRun
@@ -45,9 +45,12 @@ __all__ = [
     "IngestValidationError",
     "NotFound",
     "NotModified",
+    "acquire_lock",
     "get_job",
     "last_successful_etag",
     "register",
+    "release_lock",
+    "try_lock",
 ]
 
 log = structlog.get_logger(__name__)
@@ -120,11 +123,29 @@ class IngestJob(ABC):
 
     # --- lifecycle ------------------------------------------------------------------
 
+    def lock_key(self) -> str:
+        """Advisory-lock key: one lifecycle at a time per (source, asset, season)."""
+        cls = type(self)
+        return f"ffh.ingest/{cls.source}/{cls.asset}/{self.season}"
+
     def run(self, session: Session, lake_root: Path) -> IngestRunResult:
         cls = type(self)
         if cls.seasonal and self.season is None:
             raise ValueError(f"{cls.name} is seasonal and requires --season")
 
+        # Serialize the whole lifecycle per (source, asset, season). Without this, a stalled
+        # run A (holding v1) can persist AFTER a faster run B landed v2 and recorded ETag v2,
+        # leaving Postgres on v1 while every later conditional GET 304s against v2. A
+        # session-level advisory lock survives the commits inside the lifecycle and is
+        # released in `finally` (or by Postgres when the connection dies).
+        acquire_lock(session, self.lock_key())
+        try:
+            return self._run_locked(session, lake_root)
+        finally:
+            release_lock(session, self.lock_key())
+
+    def _run_locked(self, session: Session, lake_root: Path) -> IngestRunResult:
+        cls = type(self)
         path = parquet_file(lake_root, cls.source, cls.asset, **self.partition())
         run = IngestRun(
             source=cls.source, asset=cls.asset, season=self.season, status=STATUS_RUNNING
@@ -240,6 +261,31 @@ def get_job(name: str) -> type[IngestJob]:
         return JOBS[name]
     except KeyError as exc:
         raise KeyError(f"unknown ingest job {name!r}; known: {sorted(JOBS)}") from exc
+
+
+def acquire_lock(session: Session, key: str) -> None:
+    """Block until the session-level advisory lock for ``key`` is held by this connection.
+
+    ``hashtext`` maps the key to an int4; collisions across unrelated keys only cost
+    unnecessary serialization, never correctness.
+    """
+    session.execute(text("SELECT pg_advisory_lock(hashtext(:key))"), {"key": key})
+    session.commit()
+
+
+def release_lock(session: Session, key: str) -> None:
+    """Release the session-level lock. Never raises: a dead connection drops it anyway."""
+    try:
+        session.execute(text("SELECT pg_advisory_unlock(hashtext(:key))"), {"key": key})
+        session.commit()
+    except Exception:  # pragma: no cover - only reachable with a broken connection
+        session.rollback()
+        log.warning("ingest.lock.release_failed", key=key)
+
+
+def try_lock(session: Session, key: str) -> bool:
+    """Non-blocking probe: True if this connection now holds the lock (caller must release)."""
+    return bool(session.scalar(text("SELECT pg_try_advisory_lock(hashtext(:key))"), {"key": key}))
 
 
 def last_successful_etag(

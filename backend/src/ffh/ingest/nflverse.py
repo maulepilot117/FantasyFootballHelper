@@ -15,7 +15,7 @@ from typing import ClassVar
 
 import polars as pl
 
-from ffh.ingest.base import HttpIngestJob, register
+from ffh.ingest.base import HttpIngestJob, IngestValidationError, register
 from ffh.ingest.lake import scrape_date
 
 NFLVERSE_RELEASE_BASE = "https://github.com/nflverse/nflverse-data/releases/download"
@@ -47,6 +47,22 @@ class SeasonalNflverseJob(NflverseParquetJob):
     seasonal: ClassVar[bool] = True
     season_scoped: ClassVar[bool] = True
     skip_on_404: ClassVar[bool] = True
+
+    def validate(self, df: pl.DataFrame) -> None:
+        """Required columns + non-empty, then: every `season` value must be the requested one.
+
+        The payload lands under `season=<requested>`; a wrong-season payload (a bad filename
+        template, an upstream mislabel) must never be filed as the requested season.
+        depth_charts carries no `season` column and is exempt.
+        """
+        super().validate(df)
+        if "season" in df.columns:
+            found = sorted(df["season"].drop_nulls().unique().to_list())
+            if found != [self.season]:
+                raise IngestValidationError(
+                    f"{type(self).name}: requested season {self.season} but payload has "
+                    f"season values {found}"
+                )
 
 
 @register

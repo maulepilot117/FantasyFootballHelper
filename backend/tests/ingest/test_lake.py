@@ -62,6 +62,24 @@ def test_write_parquet_leaves_no_temp_file_behind(tmp_path: Path):
     assert sorted(p.name for p in path.parent.iterdir()) == ["players.parquet"]
 
 
+def test_write_parquet_cleans_up_a_partial_tmp_when_serialization_fails(
+    tmp_path: Path, monkeypatch
+):
+    """A failing ``DataFrame.write_parquet`` that already created its temp file must not
+    leak it, and must not create the real partition file."""
+    path = parquet_file(tmp_path, "nflverse", "players", scrape_date="2026-08-16")
+
+    def failing_write(self, file, *args, **kwargs):
+        Path(file).write_bytes(b"partial")  # the file exists before the failure
+        raise OSError("disk full mid-write")
+
+    monkeypatch.setattr(pl.DataFrame, "write_parquet", failing_write)
+    with pytest.raises(OSError, match="disk full"):
+        write_parquet(pl.DataFrame({"a": [1]}), path)
+    assert not path.exists()
+    assert list(path.parent.iterdir()) == [], "partial temp file leaked"
+
+
 def test_write_parquet_uses_a_unique_tmp_per_call(tmp_path: Path, monkeypatch):
     """Two writers of the same partition must never share a temp inode.
 
