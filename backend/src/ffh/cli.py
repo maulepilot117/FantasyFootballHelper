@@ -1,6 +1,8 @@
 import json
 from collections.abc import Iterator
 from contextlib import contextmanager
+from pathlib import Path
+from typing import Annotated
 
 import typer
 from sqlalchemy.orm import Session
@@ -116,7 +118,111 @@ def league_platforms() -> None:
     typer.echo("sleeper")
 
 
+def _coverage_report_for_cli():
+    """Indirection so tests can monkeypatch the report without a database."""
+    from ffh.crosswalk.report import coverage_report
+
+    with _session_scope() as session:
+        return coverage_report(session)
+
+
 @crosswalk_app.command("report")
-def crosswalk_report() -> None:
-    """Crosswalk coverage report (implemented in PR ④)."""
-    typer.echo("crosswalk not yet implemented")
+def crosswalk_report(
+    json_out: bool = typer.Option(False, "--json", help="Machine-readable output."),
+) -> None:
+    """Crosswalk coverage report. Exit 1 if anything is unmatched or awaiting review."""
+    rep = _coverage_report_for_cli()
+    typer.echo(json.dumps(rep.to_dict(), indent=2, default=str) if json_out else rep.render())
+    raise typer.Exit(code=0 if rep.ok else 1)
+
+
+@crosswalk_app.command("seed")
+def crosswalk_seed(
+    players: Annotated[
+        Path | None,
+        typer.Option(
+            "--players",
+            exists=True,
+            help="nflverse players.parquet. Default: the newest raw/nflverse/players partition in "
+            "FFH_LAKE_ROOT (landed by `ffh ingest run nflverse_players`, PR ③).",
+        ),
+    ] = None,
+    playerids: Annotated[
+        Path | None,
+        typer.Option(
+            "--playerids", exists=True, help="DynastyProcess db_playerids (.csv or .parquet)"
+        ),
+    ] = None,
+) -> None:
+    """Seed the players registry (and DSTs) from nflverse; optionally apply DynastyProcess ids."""
+    # Lazy imports: keep CLI start-up fast (the draft pick clock is 90 seconds) — in
+    # particular ffh.features.duck pulls in duckdb, which must not load on every command.
+    import polars as pl
+
+    from ffh.crosswalk.dynastyprocess import (
+        CrosswalkConflictError,
+        apply_playerids,
+        read_playerids_csv,
+    )
+    from ffh.crosswalk.registry import seed_players
+
+    if players is None:
+        from ffh.features.duck import latest_partition
+
+        # ③'s ffh.features.duck.latest_partition — the same "newest scrape_date" rule the
+        # DuckDB views use; returns None when nothing has landed yet.
+        players = latest_partition(get_settings().lake_root, "nflverse", "players")
+        if players is None:
+            typer.echo(
+                "no nflverse players partition in the lake; run `ffh ingest run "
+                "nflverse_players` first or pass --players",
+                err=True,
+            )
+            raise typer.Exit(code=1)
+
+    with _session_scope() as session:
+        n = seed_players(session, pl.read_parquet(players))
+        typer.echo(f"players upserted (incl. 32 DST): {n}")
+        if playerids is not None:
+            frame = (
+                read_playerids_csv(playerids.read_bytes())
+                if playerids.suffix == ".csv"
+                else pl.read_parquet(playerids)
+            )
+            try:
+                report = apply_playerids(session, frame)
+            except CrosswalkConflictError as exc:
+                # Exit 2: conflicts need a human (`ffh crosswalk verify --reject`); the
+                # session is closed without commit so nothing partial lands. Exit 1 is
+                # reserved for the report's "unmatched or unverified rows exist" signal.
+                typer.echo(str(exc), err=True)
+                raise typer.Exit(code=2) from exc
+            typer.echo(json.dumps(report.__dict__, indent=2))
+        session.commit()
+
+
+@crosswalk_app.command("verify")
+def crosswalk_verify(
+    source: str = typer.Argument(
+        ..., help="sleeper|espn|yahoo|pfr|fantasypros|sportradar|rotowire"
+    ),
+    external_id: str = typer.Argument(...),
+    reject: bool = typer.Option(
+        False, "--reject", help="Delete the mapping instead of verifying it."
+    ),
+) -> None:
+    """Human review of a crosswalk row: mark verified (default) or reject."""
+    from ffh.crosswalk.review import mark_unmatched_resolved, reject_mapping, verify_mapping
+
+    with _session_scope() as session:
+        ok = (reject_mapping if reject else verify_mapping)(session, source, external_id)
+        if ok:
+            # The Task-5 conflict path leaves the same key in BOTH player_external_ids
+            # and crosswalk_unmatched. Either human decision closes the queue entry —
+            # otherwise `ffh crosswalk report` exits 1 forever on a stale unmatched row.
+            mark_unmatched_resolved(session, source, external_id)
+            session.commit()
+    if not ok:
+        typer.echo(f"no crosswalk row for {source}:{external_id}", err=True)
+        raise typer.Exit(code=1)
+    typer.echo(("rejected " if reject else "verified ") + f"{source}:{external_id}")
