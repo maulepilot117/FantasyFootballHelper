@@ -17,6 +17,12 @@ class Settings(BaseSettings):
     redis_url: str = "redis://localhost:6379/0"
     lake_root: Path = Path("data/lake")
     sleeper_base_url: str = "https://api.sleeper.app/v1"
+    # Chris's mock-draft league; used by the fixture recorder and manual smoke runs.
+    # Not a secret, but it is personal — .env only, never committed.
+    sleeper_mock_league_id: str | None = None
+    # Identifies "my" team on a Sleeper league. Either is enough; user_id wins.
+    sleeper_user_id: str | None = None
+    sleeper_username: str | None = None
     log_level: str = "INFO"
     season: int = 2026
 
