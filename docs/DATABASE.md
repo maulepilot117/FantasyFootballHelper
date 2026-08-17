@@ -90,11 +90,18 @@ CREATE TABLE players (
     weight_lb       SMALLINT,
     college         TEXT,
     status          TEXT,                     -- Active, IR, PUP, Retired, ...
+    team_abbr       TEXT,                     -- Phase 0: nflverse latest_team; crosswalk rung-3 tie-breaker ONLY, never roster truth
     created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at      TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 CREATE INDEX players_normalized_name_pos_idx ON players (normalized_name, position);
 ```
+
+*Phase 0 note (PR ④):* `team_abbr` was added because §3 rung 3 matches on
+`(normalized_name, position, team)` and the table had no team column. It is refreshed
+from nflverse `latest_team` by `seed_players` (and set from the DynastyProcess `team` for
+rows created there); it is used only inside `ffh.crosswalk.resolve` to break ties and is
+**not** a roster field. Migration `0002_players_team_abbr`.
 
 `updated_at` (here and on `games.updated_at`) is maintained by the ORM `onupdate` only; upserts via `INSERT ... ON CONFLICT` must set `updated_at = now()` explicitly in `SET`.
 
@@ -111,7 +118,19 @@ CREATE TABLE player_external_ids (
     PRIMARY KEY (source, external_id)
 );
 CREATE INDEX player_external_ids_player_idx ON player_external_ids (player_id);
+CREATE UNIQUE INDEX player_external_ids_source_player_uidx ON player_external_ids (source, player_id);
+```
 
+*Phase 0 note (PR ④, migration `0002_players_team_abbr`):* `player_external_ids_source_player_uidx`
+enforces the `test_crosswalk_no_duplicate_player_ids` invariant below at the DB level — one
+external id per source per player. It was added late: a preflight check found the plan's
+original claim that this was "enforced by construction" was false, since `resolve._persist`
+and `apply_playerids` can each attempt to insert a second id for a source against a player
+that already holds one. Both writers MUST pre-check `(source, player_id)` before insert and
+route the loser to `crosswalk_unmatched` / the ambiguity report — this index is a backstop,
+not their conflict policy; they must not rely on catching the resulting `IntegrityError`.
+
+```sql
 CREATE TABLE nfl_teams (
     team_abbr    TEXT PRIMARY KEY,      -- nflverse convention: KC, LA, LAC, ...
     espn_id      INTEGER UNIQUE,

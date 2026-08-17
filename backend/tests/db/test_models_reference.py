@@ -16,12 +16,27 @@ def test_players_table_shape():
     assert not c["normalized_name"].nullable
     assert not c["position"].nullable
     assert "created_at" in c and "updated_at" in c
+    assert c["team_abbr"].nullable  # crosswalk rung-3 tie-breaker; DATABASE.md §2 Phase 0 note
 
 
 def test_player_external_ids_pk_is_source_external_id():
     t = Base.metadata.tables["player_external_ids"]
     assert [c.name for c in t.primary_key.columns] == ["source", "external_id"]
     assert not _cols("player_external_ids")["match_method"].nullable
+
+
+def test_player_external_ids_source_player_unique_index():
+    """One external id per source per player_id — makes the crosswalk invariant real.
+
+    DATABASE.md §3 mandates test_crosswalk_no_duplicate_player_ids; without a DB
+    constraint, resolve._persist / apply_playerids could each insert a second id
+    for a source against a player that already holds one.
+    """
+    t = Base.metadata.tables["player_external_ids"]
+    uniques = [i for i in t.indexes if i.unique]
+    matches = [i for i in uniques if [c.name for c in i.columns] == ["source", "player_id"]]
+    assert matches, [(i.name, [c.name for c in i.columns]) for i in t.indexes]
+    assert matches[0].name == "player_external_ids_source_player_uidx"
 
 
 def test_games_has_brin_index_on_kickoff():

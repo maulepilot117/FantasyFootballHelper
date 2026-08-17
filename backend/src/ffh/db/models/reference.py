@@ -41,6 +41,9 @@ class Player(Base):
     weight_lb: Mapped[int | None] = mapped_column(SmallInteger)
     college: Mapped[str | None] = mapped_column(Text)
     status: Mapped[str | None] = mapped_column(Text)
+    # Phase 0 addition (DATABASE.md §2 note): nflverse latest_team, refreshed by
+    # ffh.crosswalk.registry.seed_players. Crosswalk rung-3 tie-breaker ONLY — never roster truth.
+    team_abbr: Mapped[str | None] = mapped_column(Text)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
     )
@@ -70,7 +73,14 @@ class PlayerExternalId(Base):
         DateTime(timezone=True), nullable=False, server_default=func.now()
     )
 
-    __table_args__ = (Index("player_external_ids_player_idx", "player_id"),)
+    __table_args__ = (
+        Index("player_external_ids_player_idx", "player_id"),
+        # One external id per source per player_id (DATABASE.md §3 invariant, made real —
+        # see migration 0002 docstring: resolve._persist / apply_playerids must pre-check
+        # (source, player_id) and route the loser to crosswalk_unmatched / the ambiguity
+        # report rather than relying on an IntegrityError).
+        Index("player_external_ids_source_player_uidx", "source", "player_id", unique=True),
+    )
 
 
 class NflTeam(Base):
