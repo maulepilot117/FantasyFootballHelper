@@ -80,6 +80,12 @@ def prepare_players_frame(players_df: pl.DataFrame) -> tuple[pl.DataFrame, dict[
         str(row["position"]): int(row["len"])
         for row in dropped.group_by("position").len().sort("position").iter_rows(named=True)
     }
+    if kept.height == 0:
+        # A truncated/corrupt lake partition must never report a successful seed.
+        raise RegistryError(
+            f"no fantasy-position rows in players frame ({n_in} input rows, "
+            f"dropped_by_position={dropped_by_position})"
+        )
 
     if kept["gsis_id"].null_count():
         raise RegistryError(f"{kept['gsis_id'].null_count()} fantasy rows have null gsis_id")
@@ -109,15 +115,17 @@ def prepare_players_frame(players_df: pl.DataFrame) -> tuple[pl.DataFrame, dict[
         pl.col("status"),
         pl.col("latest_team").map_elements(normalize_team, return_dtype=pl.Utf8).alias("team_abbr"),
     )
-    empty_names = out.filter(pl.col("normalized_name") == "").height
+    # is_null() too: map_elements passes nulls through, so a null display_name would
+    # otherwise sail past an ``== ""`` check and die later as a bare NOT NULL violation.
+    empty_names = out.filter(
+        pl.col("normalized_name").is_null() | (pl.col("normalized_name") == "")
+    ).height
     if empty_names:
-        raise RegistryError(f"{empty_names} rows normalize to an empty name")
+        raise RegistryError(f"{empty_names} rows normalize to a null or empty name")
     unparsed = kept["birth_date"].drop_nulls().len() - out["birth_date"].drop_nulls().len()
     if unparsed:
         log.warning("crosswalk.seed_players.unparsed_birth_dates", count=unparsed)
-    unknown_team = out.filter(
-        pl.col("team_abbr").is_null() & pl.col("gsis_id").is_not_null()
-    ).height
+    unknown_team = out.filter(pl.col("team_abbr").is_null()).height
     log.info(
         "crosswalk.seed_players.prepared",
         input=n_in,
@@ -128,22 +136,6 @@ def prepare_players_frame(players_df: pl.DataFrame) -> tuple[pl.DataFrame, dict[
     return out, dropped_by_position
 
 
-_UPDATE_COLUMNS: tuple[str, ...] = (
-    "full_name",
-    "first_name",
-    "last_name",
-    "normalized_name",
-    "position",
-    "birth_date",
-    "rookie_year",
-    "height_in",
-    "weight_lb",
-    "college",
-    "status",
-    "team_abbr",
-)
-
-
 def seed_players(session: Session, players_df: pl.DataFrame) -> int:
     """Upsert ``players`` on ``gsis_id`` from the nflverse frame, then ensure 32 DST rows.
 
@@ -152,15 +144,16 @@ def seed_players(session: Session, players_df: pl.DataFrame) -> int:
     """
     frame, _dropped = prepare_players_frame(players_df)
     rows = frame.to_dicts()
+    assert len(rows) == frame.height, "row loss converting the frame to records"
     for chunk in _chunks(rows, _UPSERT_CHUNK):
         stmt = insert(Player).values(chunk)
+        # Update set derived from the frame itself (games.py pattern): a column added to
+        # prepare_players_frame can never silently go stale on re-seed.
+        updatable = {c: getattr(stmt.excluded, c) for c in frame.columns if c != "gsis_id"}
         stmt = stmt.on_conflict_do_update(
             index_elements=[Player.gsis_id],
             # ORM onupdate does not fire for INSERT ... ON CONFLICT (DATABASE.md §2).
-            set_={
-                **{c: getattr(stmt.excluded, c) for c in _UPDATE_COLUMNS},
-                "updated_at": func.now(),
-            },
+            set_={**updatable, "updated_at": func.now()},
         )
         session.execute(stmt)
     created_dst = seed_dst_players(session)
