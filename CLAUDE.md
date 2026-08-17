@@ -83,9 +83,10 @@ docs/           see index below
 **Claude Code is the primary builder. Codex writes code and performs adversarial review.**
 
 - Branch per unit of work. Never commit to `main` directly.
-- **Root checkout stays on `main`.** Feature branches live only in worktrees under
-  `.claude/worktrees/`. After a PR merges: from the root, `git switch main && git pull --ff-only`,
-  then remove the worktree and delete the branch. Never `git switch <feature>` in the root.
+- **No git worktrees.** Work on feature branches directly in the repo root
+  (`git switch -c feat/...`). Never use `EnterWorktree` / `git worktree add` — the
+  worktree-isolation guard blocks post-merge cleanup and buys nothing for a solo repo.
+  After a PR merges: `git switch main && git pull --ff-only && git branch -d <branch>`.
 - Every PR needs a Codex adversarial review pass before merge — see `docs/WORKFLOW.md`.
 - Push to GitHub. ArgoCD reconciles `deploy/` to the homelab; never `kubectl apply` by hand.
 - Definition of done: tests pass, `ruff check` clean, docs updated, Codex review addressed.
