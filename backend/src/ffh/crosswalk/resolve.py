@@ -18,7 +18,7 @@ from typing import Literal
 import structlog
 from rapidfuzz import process
 from rapidfuzz.distance import JaroWinkler
-from sqlalchemy import func, select
+from sqlalchemy import Select, func, select
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.orm import Session
 
@@ -106,7 +106,13 @@ def resolve(
 
 def resolve_many(session: Session, rows: Iterable[ResolveInput]) -> ResolveManyReport:
     report = ResolveManyReport()
-    for inp in rows:
+    # gsis-bearing inputs first (order within each group is immaterial): rungs 3-4
+    # persist, so a name-based guess earlier in the batch would otherwise claim a player
+    # and force a later rung-2 certainty for that same player into crosswalk_unmatched.
+    batch = list(rows)
+    ordered = [r for r in batch if r.gsis_id is not None or r.source == "gsis"]
+    ordered += [r for r in batch if r.gsis_id is None and r.source != "gsis"]
+    for inp in ordered:
         res, outcome = _resolve(session, inp)
         if res is not None:
             report.resolved[inp.key] = res
@@ -173,9 +179,9 @@ def _resolve(session: Session, inp: ResolveInput) -> tuple[Resolution | None, Ou
     row = session.get(PlayerExternalId, (inp.source, inp.external_id))
     if row is not None:
         if inp.gsis_id is not None and float(row.confidence) < 1.0 - CONFIDENCE_EPSILON:
-            upgraded = _upgrade_from_gsis(session, inp, row)
-            if upgraded is not None:
-                return upgraded, "resolved"
+            handled = _upgrade_from_gsis(session, inp, row)
+            if handled is not None:
+                return handled
         if is_usable(float(row.confidence), row.verified_at):
             return Resolution(row.player_id, row.match_method, float(row.confidence)), "resolved"
         log.info("crosswalk.resolve.pending_review", source=inp.source, external_id=inp.external_id)
@@ -230,12 +236,27 @@ def _resolve(session: Session, inp: ResolveInput) -> tuple[Resolution | None, Ou
 
 def _upgrade_from_gsis(
     session: Session, inp: ResolveInput, row: PlayerExternalId
-) -> Resolution | None:
+) -> tuple[Resolution | None, Outcome] | None:
     """Rung-1 upgrade path: the caller now supplies a gsis_id worth 1.0 for a stored
     sub-1.0 row. Same player → upgrade method/confidence; different player → the gsis
-    fact wins and the stored row is corrected. Returns None when gsis can't decide."""
+    fact wins and the stored row is corrected. Human decisions (verified rows, manual
+    mappings) are never overwritten. A bare ``None`` means "no ruling" — the caller
+    falls through to normal rung-1 handling."""
     pid = session.scalar(select(Player.player_id).where(Player.gsis_id == inp.gsis_id))
     if pid is None:
+        return None
+    if row.verified_at is not None or row.match_method == "manual":
+        # A human owns this mapping; a sync's gsis_id must not rewrite it.
+        if pid != row.player_id:
+            log.warning(
+                "crosswalk.resolve.human_decision_conflict",
+                source=inp.source,
+                external_id=inp.external_id,
+                gsis_id=inp.gsis_id,
+                match_method=row.match_method,
+                stored_player_id=str(row.player_id),
+                gsis_player_id=str(pid),
+            )
         return None
     if pid != row.player_id:
         incumbent = session.scalar(
@@ -246,19 +267,28 @@ def _upgrade_from_gsis(
         )
         if incumbent is not None:
             # Correcting would give the player two ids for this source (unique index
-            # player_external_ids_source_player_uidx). Leave the row for human review.
+            # player_external_ids_source_player_uidx) — but returning the stored row
+            # would hand the caller a mapping the 1.0 gsis fact just contradicted.
+            # Route this id to crosswalk_unmatched; the disputed row stays in place
+            # for `ffh crosswalk verify --reject` (the report exits 1 on unmatched).
             log.warning(
                 "crosswalk.resolve.upgrade_conflict",
                 source=inp.source,
                 external_id=inp.external_id,
                 gsis_id=inp.gsis_id,
                 incumbent_external_id=incumbent,
+                stored_player_id=str(row.player_id),
+                gsis_player_id=str(pid),
             )
-            return None
+            _record_unmatched(session, inp, reason="upgrade_conflict")
+            return None, "unmatched"
     old_pid, old_method, old_confidence = row.player_id, row.match_method, float(row.confidence)
     row.player_id = pid
     row.match_method = "gsis"
     row.confidence = 1.0
+    # A repoint invalidates any prior verification. Defensive: verified rows are locked
+    # above and never reach here, so this only pins the invariant for future edits.
+    row.verified_at = None
     session.flush()
     log.info(
         "crosswalk.resolve.upgraded",
@@ -268,7 +298,7 @@ def _upgrade_from_gsis(
         old_confidence=round(old_confidence, 4),
         corrected=old_pid != pid,
     )
-    return Resolution(pid, "gsis", 1.0)
+    return Resolution(pid, "gsis", 1.0), "resolved"
 
 
 def _canonical_name(inp: ResolveInput, position: str | None) -> str | None:
@@ -281,7 +311,7 @@ def _canonical_name(inp: ResolveInput, position: str | None) -> str | None:
     return normalize_name(inp.raw_name) if inp.raw_name else None
 
 
-def _mapped_for_source(source: str):
+def _mapped_for_source(source: str) -> Select[tuple[uuid.UUID]]:
     return select(PlayerExternalId.player_id).where(PlayerExternalId.source == source)
 
 
@@ -325,19 +355,32 @@ def _fuzzy(
     survivors = [(pid, float(score)) for _choice, score, pid in hits]
     if not survivors:
         return None
-    # DATABASE.md §3: "disambiguated by birth date or college where available" — POSITIVE
-    # disambiguation: a supplied birth_date/college narrows to the candidates it actually
-    # confirms; when it confirms none it says nothing and every candidate stays.
+    # DATABASE.md §3: "disambiguated by birth date or college where available" — two legs:
+    # NEGATIVE first (a stored non-NULL value that contradicts the input rules the
+    # candidate out), then POSITIVE (if the input confirms at least one survivor, keep
+    # only those). A candidate set contradicted by everything falls to rung 5 rather
+    # than persisting a fuzzy guess at a demonstrably different player.
     if inp.birth_date is not None:
+        survivors = [
+            (p, s) for p, s in survivors if meta[p][0] is None or meta[p][0] == inp.birth_date
+        ]
         confirmed = [(p, s) for p, s in survivors if meta[p][0] == inp.birth_date]
         if confirmed:
             survivors = confirmed
-    if inp.college:
+    if inp.college and (needle := inp.college.strip().lower()):
         # Substring, case-insensitive: nflverse stores "Michigan State; Wake Forest".
-        needle = inp.college.strip().lower()
-        confirmed = [(p, s) for p, s in survivors if meta[p][1] and needle in meta[p][1].lower()]
+        # The walrus guard matters: a whitespace-only college must be "no evidence",
+        # not an empty needle that substring-confirms every non-NULL college.
+        survivors = [
+            (p, s) for p, s in survivors if meta[p][1] is None or needle in meta[p][1].lower()
+        ]
+        confirmed = [
+            (p, s) for p, s in survivors if meta[p][1] is not None and needle in meta[p][1].lower()
+        ]
         if confirmed:
             survivors = confirmed
+    if not survivors:
+        return None
     survivors.sort(key=lambda t: t[1], reverse=True)
     if len(survivors) > 1 and survivors[0][1] - survivors[1][1] < FUZZY_TIE_MARGIN:
         log.info(

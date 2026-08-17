@@ -369,3 +369,135 @@ def test_resolve_many_report(db_session, seeded_registry):
     assert rep.unmatched == [("sleeper", "99999")]
     assert rep.by_method == {"exact_name": 2, "gsis": 1, "fuzzy_pending": 1, "unmatched": 1}
     assert db_session.scalar(select(func.count()).select_from(CrosswalkUnmatched)) == 1
+
+
+def test_rung1_upgrade_conflict_routes_to_unmatched_not_stale_mapping(db_session, seeded_registry):
+    # (sleeper, E1) → Mahomes @ exact_name 0.95 (stale guess); (sleeper, E2) → Chase @ 1.0.
+    # A sync now says E1's gsis is Chase — the guess is proven wrong, but Chase already
+    # holds a sleeper id. The contradicted mapping must NOT be returned.
+    mahomes, chase = seeded_registry["00-0033873"], seeded_registry["00-0036900"]
+    db_session.add(
+        PlayerExternalId(
+            player_id=mahomes,
+            source="sleeper",
+            external_id="E1",
+            confidence=0.95,
+            match_method="exact_name",
+        )
+    )
+    db_session.add(
+        PlayerExternalId(
+            player_id=chase,
+            source="sleeper",
+            external_id="E2",
+            confidence=1.0,
+            match_method="dynastyprocess",
+        )
+    )
+    db_session.flush()
+    with structlog.testing.capture_logs() as logs:
+        res = resolve(db_session, "sleeper", "E1", gsis_id="00-0036900")
+    assert res is None  # never Resolution(mahomes, ...) — that mapping was just contradicted
+    row = db_session.get(PlayerExternalId, ("sleeper", "E1"))
+    # Disputed row stays in place for `ffh crosswalk verify --reject`.
+    assert row.player_id == mahomes and row.match_method == "exact_name"
+    assert [(u.source, u.external_id) for u in _unmatched(db_session)] == [("sleeper", "E1")]
+    (conflict,) = [e for e in logs if e["event"] == "crosswalk.resolve.upgrade_conflict"]
+    assert conflict["log_level"] == "warning"
+    assert conflict["stored_player_id"] == str(mahomes)
+    assert conflict["gsis_player_id"] == str(chase)
+
+
+def test_rung1_verified_row_is_never_overwritten_by_gsis(db_session, seeded_registry):
+    mahomes, chase = seeded_registry["00-0033873"], seeded_registry["00-0036900"]
+    verified = datetime.now(UTC)
+    db_session.add(
+        PlayerExternalId(
+            player_id=chase,
+            source="sleeper",
+            external_id="4046",
+            confidence=0.89,
+            match_method="fuzzy",
+            verified_at=verified,
+        )
+    )
+    db_session.flush()
+    with structlog.testing.capture_logs() as logs:
+        res = resolve(db_session, "sleeper", "4046", gsis_id="00-0033873")
+    # The human-verified mapping stands, even against a contradicting gsis fact.
+    assert res is not None and res.player_id == chase and res.method == "fuzzy"
+    row = db_session.get(PlayerExternalId, ("sleeper", "4046"))
+    assert row.player_id == chase and row.player_id != mahomes
+    assert row.match_method == "fuzzy" and row.verified_at is not None
+    assert any(e["event"] == "crosswalk.resolve.human_decision_conflict" for e in logs)
+    assert not any(e["event"] == "crosswalk.resolve.upgraded" for e in logs)
+
+
+def test_rung1_manual_row_is_never_overwritten_by_gsis(db_session, seeded_registry):
+    mahomes, chase = seeded_registry["00-0033873"], seeded_registry["00-0036900"]
+    db_session.add(
+        PlayerExternalId(
+            player_id=chase,
+            source="sleeper",
+            external_id="4046",
+            confidence=0.95,
+            match_method="manual",
+        )
+    )
+    db_session.flush()
+    with structlog.testing.capture_logs() as logs:
+        res = resolve(db_session, "sleeper", "4046", gsis_id="00-0033873")
+    assert res is not None and res.player_id == chase and res.method == "manual"
+    row = db_session.get(PlayerExternalId, ("sleeper", "4046"))
+    assert row.player_id == chase and row.player_id != mahomes and row.match_method == "manual"
+    assert any(e["event"] == "crosswalk.resolve.human_decision_conflict" for e in logs)
+    assert not any(e["event"] == "crosswalk.resolve.upgraded" for e in logs)
+
+
+def test_rung4_contradicting_birth_date_eliminates_candidate(db_session, seeded_registry):
+    # Lone fuzzy candidate (Lamar Jackson QB, born 1997-01-07) but the input says a
+    # demonstrably different date → the candidate is ruled out, no fuzzy row persists,
+    # and the id falls to rung 5 instead of becoming a rubber-stamp review suggestion.
+    res = resolve(
+        db_session, "sleeper", "4881", "Lamarr Jackson", "QB", "BAL", birth_date=date(1994, 1, 1)
+    )
+    assert res is None
+    assert db_session.get(PlayerExternalId, ("sleeper", "4881")) is None
+    assert [(u.source, u.external_id) for u in _unmatched(db_session)] == [("sleeper", "4881")]
+
+
+def test_rung4_contradicting_college_eliminates_candidate(db_session, seeded_registry):
+    # Same shape for the college leg: stored "Louisville" does not contain "Ohio State".
+    res = resolve(
+        db_session, "sleeper", "4881", "Lamarr Jackson", "QB", "BAL", college="Ohio State"
+    )
+    assert res is None
+    assert db_session.get(PlayerExternalId, ("sleeper", "4881")) is None
+    assert [(u.source, u.external_id) for u in _unmatched(db_session)] == [("sleeper", "4881")]
+
+
+def test_rung4_whitespace_college_is_no_evidence(db_session, seeded_registry):
+    # A whitespace-only college must not substring-confirm every non-NULL college (and
+    # thereby drop the NULL-college fake): the Waddle tie must survive → unmatched.
+    _add_fake_player(db_session, "Jaylon Waddle", "WR", "DEN", "FAKE-JW")
+    res = resolve(db_session, "sleeper", "7526", "Jaylin Waddle", "WR", "DEN", college="   ")
+    assert res is None
+    assert _ids(db_session) == []
+    (u,) = _unmatched(db_session)
+    assert (u.source, u.external_id) == ("sleeper", "7526")
+
+
+def test_resolve_many_processes_gsis_bearing_inputs_first(db_session, seeded_registry):
+    # A rung-3 guess earlier in the batch must not steal the player from a rung-2
+    # certainty later in the batch: gsis-bearing inputs are resolved first.
+    allen = seeded_registry["00-0034857"]
+    rows = [
+        ResolveInput("sleeper", "A1", "Josh Allen", "QB", "BUF"),  # name guess, listed first
+        ResolveInput("sleeper", "B1", "Joshua Allen", "QB", "BUF", gsis_id="00-0034857"),
+    ]
+    rep = resolve_many(db_session, rows)
+    assert rep.resolved == {("sleeper", "B1"): Resolution(allen, "gsis", 1.0)}
+    assert rep.unmatched == [("sleeper", "A1")]
+    row = db_session.get(PlayerExternalId, ("sleeper", "B1"))
+    assert row.player_id == allen and row.match_method == "gsis"
+    assert db_session.get(PlayerExternalId, ("sleeper", "A1")) is None
