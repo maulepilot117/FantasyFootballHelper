@@ -13,6 +13,7 @@ import pytest
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from ffh.crosswalk.dynastyprocess import read_playerids_csv
 from ffh.db.models import Player
 
 # backend/tests/fixtures/ — Task 4 adds dynastyprocess CSVs here.
@@ -93,6 +94,4 @@ def seeded_registry(db_session: Session) -> dict[str, uuid.UUID]:
 @pytest.fixture
 def dp_frame() -> pl.DataFrame:
     """The 13-row DynastyProcess sample parsed exactly as apply_playerids receives it."""
-    from ffh.crosswalk.dynastyprocess import read_playerids_csv
-
     return read_playerids_csv(DP_SAMPLE_CSV.read_bytes())

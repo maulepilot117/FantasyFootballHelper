@@ -88,7 +88,9 @@ class CrosswalkApplyReport:
 
 def read_playerids_csv(raw: bytes) -> pl.DataFrame:
     """Parse the CSV with every id column as text and ``NA`` as null."""
-    header = raw.split(b"\n", 1)[0].decode("utf-8").strip().split(",")
+    # utf-8-sig: a UTF-8 BOM would otherwise hide inside the first column name and
+    # surface as a bogus "mfl_id missing" error.
+    header = raw.split(b"\n", 1)[0].decode("utf-8-sig").strip().split(",")
     missing = DP_REQUIRED_COLUMNS - set(header)
     if missing:
         raise DynastyProcessError(f"db_playerids.csv missing columns: {sorted(missing)}")
@@ -104,8 +106,26 @@ def _validate(df: pl.DataFrame) -> pl.DataFrame:
     missing = DP_REQUIRED_COLUMNS - set(df.columns)
     if missing:
         raise DynastyProcessError(f"DynastyProcess frame missing columns: {sorted(missing)}")
-    # Defensive: a Parquet round-trip could have typed ids numerically. Store as text.
-    return df.with_columns([pl.col(c).cast(pl.Utf8) for c in DP_TEXT_COLUMNS])
+    # Defensive: a Parquet round-trip could have typed ids numerically. A blind
+    # Float -> Utf8 cast would mangle 4046.0 into "4046.0", so integral floats are
+    # routed back through Int64; a non-integral (or non-finite) value means the ids
+    # are corrupt and the frame is rejected outright.
+    casts: list[pl.Expr] = []
+    for c in sorted(DP_TEXT_COLUMNS):
+        if df.schema[c].is_float():
+            n_bad = df.filter(
+                pl.col(c).is_not_null()
+                & (~pl.col(c).is_finite() | (pl.col(c) != pl.col(c).round(0)))
+            ).height
+            if n_bad:
+                raise DynastyProcessError(
+                    f"id column {c!r} is {df.schema[c]} with {n_bad} non-integral value(s); "
+                    "ids must never pass through floats"
+                )
+            casts.append(pl.col(c).cast(pl.Int64).cast(pl.Utf8))
+        else:
+            casts.append(pl.col(c).cast(pl.Utf8))
+    return df.with_columns(casts)
 
 
 def _split_name(name: str) -> tuple[str | None, str | None]:
@@ -215,7 +235,14 @@ def apply_playerids(session: Session, df: pl.DataFrame) -> CrosswalkApplyReport:
     assert mapped.height + skipped_dst == with_ids.height, "row loss in player assignment"
 
     # 4. unpivot + ambiguity (one id per (source, player); one player per (source, id))
-    long = (
+    # n_cells is counted straight off the wide frame so the unpivot chain is tied back
+    # to its input in id-cell space (kept + dropped == input, Global Constraints).
+    n_cells = int(
+        mapped.select(
+            pl.sum_horizontal([pl.col(c).is_not_null() for c in DP_ID_COLUMNS]).sum().fill_null(0)
+        ).item()
+    )
+    cells = (
         mapped.select(["mfl_id", "player_key", *DP_ID_COLUMNS])
         .unpivot(
             on=list(DP_ID_COLUMNS),
@@ -226,9 +253,16 @@ def apply_playerids(session: Session, df: pl.DataFrame) -> CrosswalkApplyReport:
         .drop_nulls("external_id")
         .with_columns(pl.col("col").replace_strict(DP_ID_COLUMNS).alias("source"))
         .select(["source", "external_id", "player_key"])
-        .unique()
     )
+    assert cells.height == n_cells, "row loss in unpivot"
+    long = cells.unique()
     n_long = long.height
+    n_deduped = n_cells - n_long
+    assert n_long + n_deduped == n_cells, "row loss in dedupe"
+    if n_deduped:
+        # Identical (source, external_id, player_key) triples collapsing into one —
+        # e.g. a glitch pair sharing every id. Not a drop, but counted and logged.
+        log.info("crosswalk.dynastyprocess.deduped_id_cells", count=n_deduped)
     many_players = (
         long.group_by(["source", "external_id"])
         .agg(pl.col("player_key").n_unique().alias("n"))
@@ -325,10 +359,15 @@ def apply_playerids(session: Session, df: pl.DataFrame) -> CrosswalkApplyReport:
         held = held_by_player.get((r["source"], pid))
         if held is not None:
             # The player already holds a different id from this source (unique index
-            # player_external_ids_source_player_uidx forbids a second). The holder wins:
-            # a DB row wins because DP must never displace an existing mapping, and
-            # within the batch the lexicographically smallest external_id wins (clean is
-            # sorted by (source, external_id)). The loser is reported, never raised.
+            # player_external_ids_source_player_uidx forbids a second). The holder — a
+            # pre-existing DB row — wins, because DP must never displace an existing
+            # mapping; the loser is reported, never raised. A *batch-internal* collision
+            # is defence-in-depth only and cannot currently fire: the many_ids ambiguity
+            # pass already dropped every (source, player_key) holding two ids, and two
+            # distinct player_keys never resolve to one player_id (uuid keys are the
+            # pid; placeholder keys map to freshly created, distinct players). If that
+            # ever regresses, clean's (source, external_id) sort still makes the
+            # lexicographically smallest external_id win deterministically.
             db_ambiguous.append((r["source"], r["external_id"]))
             log.warning(
                 "crosswalk.dynastyprocess.duplicate_source_for_player",

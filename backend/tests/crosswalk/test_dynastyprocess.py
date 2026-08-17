@@ -20,6 +20,7 @@ from ffh.crosswalk.dynastyprocess import (
     read_playerids_csv,
 )
 from ffh.db.models import Player, PlayerExternalId
+from tests.crosswalk.conftest import DP_SAMPLE_CSV
 
 pytestmark = pytest.mark.db
 
@@ -42,6 +43,12 @@ def test_read_csv_keeps_ids_as_text_and_na_as_null(dp_frame):
     pavia = dp_frame.filter(pl.col("mfl_id") == "17471").row(0, named=True)
     assert pavia["gsis_id"] is None and pavia["yahoo_id"] is None and pavia["pfr_id"] is None
     assert dp_frame.height == 13
+
+
+def test_read_csv_tolerates_utf8_bom():
+    bom = bytes([0xEF, 0xBB, 0xBF])
+    df = read_playerids_csv(bom + DP_SAMPLE_CSV.read_bytes())
+    assert df.height == 13 and df.columns[0] == "mfl_id"
 
 
 def test_read_csv_rejects_missing_required_columns():
@@ -196,6 +203,23 @@ def test_apply_never_creates_a_player_for_an_unmapped_dst_row(
     assert report.created_players == 2  # Pavia + the glitch pair; never a DST placeholder
     assert _count_players(db_session) == 14 + 32 + 2
     assert db_session.get(PlayerExternalId, ("sleeper", "KC")) is None
+
+
+def test_apply_coerces_integral_float_ids_without_mangling(db_session, seeded_registry, dp_frame):
+    # A Parquet round-trip can type a numeric id column as Float64. Integral floats
+    # must come back as clean digit strings — never "30123.0".
+    floaty = dp_frame.with_columns(pl.col("yahoo_id").cast(pl.Float64))
+    report = apply_playerids(db_session, floaty)
+    assert report.inserted == 61
+    mahomes = seeded_registry["00-0033873"]
+    assert db_session.get(PlayerExternalId, ("yahoo", "30123")).player_id == mahomes
+    assert db_session.get(PlayerExternalId, ("yahoo", "30123.0")) is None
+
+
+def test_apply_rejects_non_integral_float_ids(db_session, dp_frame):
+    bad = dp_frame.with_columns((pl.col("yahoo_id").cast(pl.Float64) + 0.5).alias("yahoo_id"))
+    with pytest.raises(DynastyProcessError, match="yahoo_id"):
+        apply_playerids(db_session, bad)
 
 
 def test_apply_rejects_frame_missing_columns(db_session, dp_frame):
