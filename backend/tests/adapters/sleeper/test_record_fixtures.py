@@ -1,5 +1,9 @@
 import json
 
+import httpx
+import pytest
+
+from tests.conftest import FIXTURE_DRAFT_ID as DRAFT
 from tests.conftest import FIXTURE_LEAGUE_ID as LEAGUE
 
 
@@ -41,3 +45,21 @@ async def test_players_slice_is_restricted_to_rostered_players_plus_extras(
     assert len(sliced) == 25
     assert rostered_ids <= sliced.keys()
     assert all(isinstance(v, dict) for v in sliced.values())
+
+
+async def test_record_refuses_empty_payloads_unless_allowed(tmp_path, sleeper_client, sleeper_mock):
+    """A pre-draft/pre-season league answers picks/matchups/transactions with `[]`.
+
+    Recording against one must not silently blank out the committed fixtures.
+    """
+    from scripts.record_sleeper_fixtures import record
+
+    sleeper_mock.get(f"/draft/{DRAFT}/picks").mock(return_value=httpx.Response(200, json=[]))
+
+    with pytest.raises(SystemExit, match="draft_picks"):
+        await record(LEAGUE, tmp_path, sleeper_client)
+    assert list(tmp_path.iterdir()) == []
+
+    written = await record(LEAGUE, tmp_path, sleeper_client, allow_empty=True)
+    assert written["draft_picks"] > 0
+    assert json.loads((tmp_path / "draft_picks.json").read_text(encoding="utf-8")) == []

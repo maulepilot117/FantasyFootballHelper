@@ -10,8 +10,18 @@ the `network`-marked tests elsewhere in this suite (`pyproject.toml`'s `network`
 excluded from CI via `-m 'not network'`), this script *is* the manual invocation those
 tests would otherwise describe — run it directly by hand, never via `pytest -m network`.
 
+Never run in CI. Re-run when a Sleeper response shape changes and a test fails, then
+review the diff: a key that disappeared upstream is a real incident, not a fixture to
+rubber-stamp.
+
 /players/nfl is 14.6 MB; only the rostered players plus a few free agents are kept, so the
 committed fixture stays small.
+
+A pre-draft/pre-season mock league answers `/draft/{id}/picks`, `/league/{id}/matchups/1`
+and `/league/{id}/transactions/1` with `[]` — recording against one of those would
+silently blank out the committed fixtures and make the whole Sleeper suite vacuous.
+`record()` refuses to write anything if any list-typed payload came back empty, unless
+`allow_empty=True` (or `--allow-empty` on the CLI) is passed explicitly.
 
 Sleeper data is licensed for **non-commercial use only** — these fixtures exist solely to
 test this self-hosted personal project.
@@ -75,38 +85,56 @@ def _render_table() -> str:
 def _dump(out_dir: Path, stem: str, payload: object) -> int:
     path = out_dir / f"{stem}.json"
     text = json.dumps(payload, indent=1, sort_keys=True) + "\n"
-    path.write_text(text, encoding="utf-8")
+    path.write_text(text, encoding="utf-8", newline="\n")
     return len(text)
 
 
-async def record(league_id: str, out_dir: Path, client: SleeperClient) -> dict[str, int]:
-    out_dir.mkdir(parents=True, exist_ok=True)
-    written: dict[str, int] = {}
+async def record(
+    league_id: str,
+    out_dir: Path,
+    client: SleeperClient,
+    *,
+    allow_empty: bool = False,
+) -> dict[str, int]:
+    """Fetch every fixture payload, validate, and only then write the corpus.
 
-    written["state_nfl"] = _dump(out_dir, "state_nfl", await client.get_json("/state/nfl"))
+    Every payload is buffered in memory first: nothing is written to `out_dir` until
+    every fetch (and the empty-payload check below) has succeeded, so a failure partway
+    through never leaves a half-overwritten fixture corpus on disk.
+    """
+    payloads: dict[str, object] = {}
+
+    payloads["state_nfl"] = await client.get_json("/state/nfl")
     league = await client.get_json(f"/league/{league_id}")
-    written["league"] = _dump(out_dir, "league", league)
+    payloads["league"] = league
     rosters = await client.get_json(f"/league/{league_id}/rosters")
-    written["rosters"] = _dump(out_dir, "rosters", rosters)
-    written["users"] = _dump(out_dir, "users", await client.get_json(f"/league/{league_id}/users"))
+    payloads["rosters"] = rosters
+    payloads["users"] = await client.get_json(f"/league/{league_id}/users")
     drafts = await client.get_json(f"/league/{league_id}/drafts")
-    written["league_drafts"] = _dump(out_dir, "league_drafts", drafts)
+    payloads["league_drafts"] = drafts
 
     draft_id = league.get("draft_id") or (drafts[0]["draft_id"] if drafts else None)
     if draft_id is None:
         raise SystemExit(f"league {league_id} has no draft")
-    written["draft"] = _dump(out_dir, "draft", await client.get_json(f"/draft/{draft_id}"))
-    written["draft_picks"] = _dump(
-        out_dir, "draft_picks", await client.get_json(f"/draft/{draft_id}/picks")
-    )
-    written["matchups_week1"] = _dump(
-        out_dir, "matchups_week1", await client.get_json(f"/league/{league_id}/matchups/1")
-    )
-    written["transactions_week1"] = _dump(
-        out_dir,
-        "transactions_week1",
-        await client.get_json(f"/league/{league_id}/transactions/1"),
-    )
+    payloads["draft"] = await client.get_json(f"/draft/{draft_id}")
+    payloads["draft_picks"] = await client.get_json(f"/draft/{draft_id}/picks")
+    payloads["matchups_week1"] = await client.get_json(f"/league/{league_id}/matchups/1")
+    payloads["transactions_week1"] = await client.get_json(f"/league/{league_id}/transactions/1")
+
+    if not allow_empty:
+        empty = sorted(
+            stem
+            for stem, payload in payloads.items()
+            if isinstance(payload, list) and len(payload) == 0
+        )
+        if empty:
+            raise SystemExit(
+                f"empty payload(s) for: {', '.join(empty)} — league {league_id} is "
+                "probably pre-draft/pre-season (Sleeper answers picks/matchups/"
+                "transactions with [] before the draft happens). Recording now would "
+                "silently blank out the committed fixtures. Pass allow_empty=True "
+                "(or --allow-empty on the CLI) to record anyway."
+            )
 
     rostered = {
         pid
@@ -131,8 +159,12 @@ async def record(league_id: str, out_dir: Path, client: SleeperClient) -> dict[s
     missing = rostered - set(sliced)
     if missing:
         raise SystemExit(f"/players/nfl is missing rostered ids {sorted(missing)}")
-    written["players_slice"] = _dump(out_dir, "players_slice", sliced)
+    payloads["players_slice"] = sliced
 
+    out_dir.mkdir(parents=True, exist_ok=True)
+    written: dict[str, int] = {
+        stem: _dump(out_dir, stem, payload) for stem, payload in payloads.items()
+    }
     (out_dir / "README.md").write_text(
         README.format(
             league_id=league_id,
@@ -141,6 +173,7 @@ async def record(league_id: str, out_dir: Path, client: SleeperClient) -> dict[s
             table_rows=_render_table(),
         ),
         encoding="utf-8",
+        newline="\n",
     )
     return written
 
@@ -151,8 +184,9 @@ async def _main() -> int:
     if not league_id:
         print("set FFH_SLEEPER_MOCK_LEAGUE_ID in backend/.env first", file=sys.stderr)
         return 2
+    allow_empty = "--allow-empty" in sys.argv[1:]
     async with SleeperClient() as client:
-        written = await record(league_id, FIXTURES, client)
+        written = await record(league_id, FIXTURES, client, allow_empty=allow_empty)
     for stem, size in sorted(written.items()):
         print(f"{stem}.json  {size:>9,} bytes")
     return 0
