@@ -14,6 +14,7 @@ from collections.abc import Awaitable, Callable
 from typing import Any
 
 import httpx
+from pydantic import BaseModel, ValidationError
 from tenacity import (
     AsyncRetrying,
     RetryCallState,
@@ -39,6 +40,30 @@ from ffh.config import get_settings
 MAX_ATTEMPTS = 5
 # Never trust a server to park us for longer than this, whatever Retry-After says.
 MAX_RETRY_AFTER_SECONDS = 60.0
+
+
+def _parse[M: BaseModel](model: type[M], payload: Any, path: str) -> M:
+    """`model.model_validate(payload)` with wire-shape failures translated to PlatformError.
+
+    Pydantic's ValidationError (and a `null` body where an object was expected) must not
+    escape the client: callers see one exception family for "Sleeper misbehaved".
+    """
+    if payload is None:
+        raise PlatformError(f"sleeper: unexpected shape for {path}: null body")
+    try:
+        return model.model_validate(payload)
+    except ValidationError as exc:
+        raise PlatformError(f"sleeper: unexpected shape for {path}: {exc}") from exc
+
+
+def _parse_list[M: BaseModel](model: type[M], payload: Any, path: str) -> list[M]:
+    """A JSON array of `model`; a `null` or non-list body is a PlatformError, not a TypeError."""
+    if not isinstance(payload, list):
+        raise PlatformError(
+            f"sleeper: unexpected shape for {path}: expected a list, got "
+            f"{'null' if payload is None else type(payload).__name__}"
+        )
+    return [_parse(model, item, path) for item in payload]
 
 
 class _Retryable(PlatformError):
@@ -140,45 +165,49 @@ class SleeperClient:
 
     # --- endpoints -------------------------------------------------------------
     async def get_state(self) -> RawState:
-        return RawState.model_validate(await self.get_json("/state/nfl"))
+        path = "/state/nfl"
+        return _parse(RawState, await self.get_json(path), path)
 
     async def get_user(self, username_or_id: str) -> RawUser:
         # Sleeper answers an unknown user with HTTP 200 and a literal `null` body.
-        payload = await self.get_json(f"/user/{username_or_id}")
+        path = f"/user/{username_or_id}"
+        payload = await self.get_json(path)
         if payload is None:
             raise PlatformNotFound(f"sleeper user not found: {username_or_id}")
-        return RawUser.model_validate(payload)
+        return _parse(RawUser, payload, path)
 
     async def get_user_leagues(self, user_id: str, season: int) -> list[RawLeague]:
-        payload = await self.get_json(f"/user/{user_id}/leagues/nfl/{season}")
-        return [RawLeague.model_validate(x) for x in payload]
+        path = f"/user/{user_id}/leagues/nfl/{season}"
+        return _parse_list(RawLeague, await self.get_json(path), path)
 
     async def get_league(self, league_id: str) -> RawLeague:
-        return RawLeague.model_validate(await self.get_json(f"/league/{league_id}"))
+        path = f"/league/{league_id}"
+        return _parse(RawLeague, await self.get_json(path), path)
 
     async def get_rosters(self, league_id: str) -> list[RawRoster]:
-        payload = await self.get_json(f"/league/{league_id}/rosters")
-        return [RawRoster.model_validate(x) for x in payload]
+        path = f"/league/{league_id}/rosters"
+        return _parse_list(RawRoster, await self.get_json(path), path)
 
     async def get_users(self, league_id: str) -> list[RawUser]:
-        payload = await self.get_json(f"/league/{league_id}/users")
-        return [RawUser.model_validate(x) for x in payload]
+        path = f"/league/{league_id}/users"
+        return _parse_list(RawUser, await self.get_json(path), path)
 
     async def get_matchups(self, league_id: str, week: int) -> list[RawMatchup]:
-        payload = await self.get_json(f"/league/{league_id}/matchups/{week}")
-        return [RawMatchup.model_validate(x) for x in payload]
+        path = f"/league/{league_id}/matchups/{week}"
+        return _parse_list(RawMatchup, await self.get_json(path), path)
 
     async def get_transactions(self, league_id: str, week: int) -> list[RawTransaction]:
-        payload = await self.get_json(f"/league/{league_id}/transactions/{week}")
-        return [RawTransaction.model_validate(x) for x in payload]
+        path = f"/league/{league_id}/transactions/{week}"
+        return _parse_list(RawTransaction, await self.get_json(path), path)
 
     async def get_league_drafts(self, league_id: str) -> list[RawDraft]:
-        payload = await self.get_json(f"/league/{league_id}/drafts")
-        return [RawDraft.model_validate(x) for x in payload]
+        path = f"/league/{league_id}/drafts"
+        return _parse_list(RawDraft, await self.get_json(path), path)
 
     async def get_draft(self, draft_id: str) -> RawDraft:
-        return RawDraft.model_validate(await self.get_json(f"/draft/{draft_id}"))
+        path = f"/draft/{draft_id}"
+        return _parse(RawDraft, await self.get_json(path), path)
 
     async def get_draft_picks(self, draft_id: str) -> list[RawDraftPick]:
-        payload = await self.get_json(f"/draft/{draft_id}/picks")
-        return [RawDraftPick.model_validate(x) for x in payload]
+        path = f"/draft/{draft_id}/picks"
+        return _parse_list(RawDraftPick, await self.get_json(path), path)

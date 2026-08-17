@@ -79,8 +79,10 @@ class RawLeagueSettings(_Raw):
     waiver_type: int | None = None
     # 0 = redraft, 1 = keeper, 2 = dynasty
     type: int | None = None
-    taxi_slots: int = 0
-    reserve_slots: int = 0
+    # Verified present on every live league; None means Sleeper omitted or nulled the key,
+    # and the adapter refuses to invent a 0 for it.
+    taxi_slots: int | None = None
+    reserve_slots: int | None = None
     draft_rounds: int | None = None
     max_keepers: int | None = None
     start_week: int | None = None
@@ -113,7 +115,9 @@ class RawRosterSettings(_Raw):
     ties: int | None = None
     fpts: int | None = None
     fpts_decimal: int | None = None
-    waiver_budget_used: int = 0
+    # None means Sleeper omitted or nulled the key (e.g. `settings: null` on a brand-new
+    # roster). Never a made-up 0: the adapter decides what "unknown" means per league.
+    waiver_budget_used: int | None = None
     waiver_position: int | None = None
     total_moves: int | None = None
 
@@ -210,7 +214,7 @@ class RawTransactionSettings(_Raw):
 
 class RawTransaction(_Raw):
     transaction_id: str
-    # "free_agent" | "waiver" | "trade"
+    # "free_agent" | "waiver" | "trade" | "commissioner"
     type: str
     status: str | None = None
     # leg == week

@@ -43,6 +43,18 @@ async def test_get_roster_settings_maps_tokens_and_capacity(adapter):
     assert r.is_superflex is True
 
 
+@pytest.mark.parametrize("field", ["reserve_slots", "taxi_slots"])
+async def test_get_roster_settings_raises_when_ir_or_taxi_capacity_is_missing(
+    adapter, sleeper_mock, sleeper_fixture, field
+):
+    # No made-up 0: a league whose settings lack the field is a hard error naming it.
+    raw = sleeper_fixture("league")
+    raw["settings"][field] = None
+    sleeper_mock.get(f"/league/{LEAGUE}").mock(return_value=httpx.Response(200, json=raw))
+    with pytest.raises(PlatformError, match=field):
+        await adapter.get_roster_settings(LEAGUE)
+
+
 async def test_get_league_derives_type_faab_and_superflex(adapter):
     lg = await adapter.get_league(LEAGUE)
     assert lg.platform == "sleeper" and lg.external_id == LEAGUE and lg.season == 2026
@@ -85,6 +97,36 @@ async def test_get_teams_maps_names_faab_and_is_me(adapter):
     # No metadata.team_name -> fall back to the manager's display name.
     assert teams["2"].display_name == "opponent"
     assert teams["2"].is_me is False
+
+
+async def test_get_teams_faab_remaining_raises_when_budget_used_is_missing_in_a_faab_league(
+    adapter, sleeper_mock, sleeper_fixture
+):
+    rosters = sleeper_fixture("rosters")
+    rosters[0]["settings"]["waiver_budget_used"] = None
+    sleeper_mock.get(f"/league/{LEAGUE}/rosters").mock(
+        return_value=httpx.Response(200, json=rosters)
+    )
+    with pytest.raises(PlatformError, match="waiver_budget_used"):
+        await adapter.get_teams(LEAGUE)
+
+
+async def test_get_teams_faab_remaining_is_none_when_the_league_is_not_faab(
+    adapter, sleeper_mock, sleeper_fixture
+):
+    # Priority waivers (waiver_type 0): waiver_budget is meaningless and a missing
+    # waiver_budget_used is not an error — faab_remaining is simply None.
+    league = sleeper_fixture("league")
+    league["settings"]["waiver_type"] = 0
+    sleeper_mock.get(f"/league/{LEAGUE}").mock(return_value=httpx.Response(200, json=league))
+    rosters = sleeper_fixture("rosters")
+    rosters[0]["settings"]["waiver_budget_used"] = None
+    sleeper_mock.get(f"/league/{LEAGUE}/rosters").mock(
+        return_value=httpx.Response(200, json=rosters)
+    )
+    teams = {t.external_id: t for t in await adapter.get_teams(LEAGUE)}
+    assert teams["1"].faab_remaining is None and teams["2"].faab_remaining is None
+    assert teams["1"].waiver_priority == 1
 
 
 async def test_get_teams_raises_when_two_draft_slots_map_to_one_roster(
@@ -195,6 +237,47 @@ async def test_get_transactions_normalizes_type_faab_and_epoch_ms(adapter):
     assert txns["TXN2"].type == "drop" and txns["TXN2"].faab_spent is None
 
 
+async def test_failed_waiver_claim_spent_no_faab(adapter, sleeper_mock, sleeper_fixture):
+    raw = sleeper_fixture("transactions_week1")
+    raw[0]["status"] = "failed"  # TXN1 keeps settings.waiver_bid == 25
+    sleeper_mock.get(f"/league/{LEAGUE}/transactions/1").mock(
+        return_value=httpx.Response(200, json=raw)
+    )
+    txns = {t.external_id: t for t in await adapter.get_transactions(LEAGUE, 1)}
+    assert txns["TXN1"].type == "waiver" and txns["TXN1"].status == "failed"
+    assert txns["TXN1"].faab_spent is None
+
+
+async def test_commissioner_transaction_maps_to_its_own_type(
+    adapter, sleeper_mock, sleeper_fixture
+):
+    raw = sleeper_fixture("transactions_week1")
+    raw.append(
+        {
+            "transaction_id": "TXN3",
+            "type": "commissioner",
+            "status": "complete",
+            "leg": 1,
+            "created": 1758684254016,
+            "status_updated": 1758684254016,
+            "creator": "USER_ME",
+            "adds": {"91": 2},
+            "drops": {"20": 2},
+            "roster_ids": [2],
+            "consenter_ids": [2],
+            "settings": None,
+            "metadata": None,
+        }
+    )
+    sleeper_mock.get(f"/league/{LEAGUE}/transactions/1").mock(
+        return_value=httpx.Response(200, json=raw)
+    )
+    txns = {t.external_id: t for t in await adapter.get_transactions(LEAGUE, 1)}
+    assert txns["TXN3"].type == "commissioner"
+    assert txns["TXN3"].adds == {"91": "2"} and txns["TXN3"].drops == {"20": "2"}
+    assert txns["TXN3"].faab_spent is None
+
+
 async def test_get_free_agents_is_the_catalog_minus_everyone_rostered(sleeper_client):
     catalog = StubCatalog(
         {
@@ -206,11 +289,13 @@ async def test_get_free_agents_is_the_catalog_minus_everyone_rostered(sleeper_cl
                 external_id="91", name="Fixture Freeagentqb", position="QB", team="DET"
             ),
             "KC": PlayerRef(external_id="KC", name="KC", position="DST", team="KC"),
+            "92": PlayerRef(external_id="92", name="No Position", position=None, team=None),
         }
     )
     adapter = SleeperAdapter(sleeper_client, my_user_id="USER_ME", catalog=catalog)
     free = await adapter.get_free_agents(LEAGUE)
-    assert [p.external_id for p in free] == ["90", "91"]
+    assert [p.external_id for p in free] == ["90", "91", "92"]
+    assert free[2].position is None
 
 
 async def test_get_free_agents_without_a_catalog_raises_rather_than_returning_empty(adapter):
@@ -261,27 +346,54 @@ async def test_get_draft_picks_maps_roster_keeper_and_auction_amount(adapter):
 
 @pytest.mark.parametrize(
     ("cursor", "expected_changed"),
-    [(None, True), ("1756083970192", False), ("1756083970191", True), ("1756083970193", True)],
+    [
+        (None, True),
+        ("1756083970192:complete", False),
+        ("1756083970191:complete", True),
+        ("1756083970193:complete", True),
+        # Same pick timestamp, different status: a status-only transition is a change.
+        ("1756083970192:drafting", True),
+        ("1756083970192:paused", True),
+        # Legacy bare-numeric cursors compare on the epoch-ms part only.
+        ("1756083970192", False),
+        ("1756083970191", True),
+        ("garbage", True),
+    ],
 )
-async def test_draft_changed_since_compares_epoch_ms_exactly_in_both_directions(
-    adapter, cursor, expected_changed
-):
+async def test_draft_changed_since_compares_epoch_ms_and_status(adapter, cursor, expected_changed):
     changed, new_cursor = await adapter.draft_changed_since(DRAFT, cursor)
     assert changed is expected_changed
-    assert new_cursor == "1756083970192"
+    assert new_cursor == "1756083970192:complete"
 
 
-async def test_draft_changed_since_handles_a_predraft_null_last_picked(
+async def test_draft_changed_since_sees_status_only_transitions(
     adapter, sleeper_mock, sleeper_fixture
 ):
     raw = sleeper_fixture("draft")
     raw["last_picked"] = None
     raw["status"] = "pre_draft"
-    sleeper_mock.get(f"/draft/{DRAFT}").mock(return_value=httpx.Response(200, json=raw))
+    route = sleeper_mock.get(f"/draft/{DRAFT}").mock(return_value=httpx.Response(200, json=raw))
     changed, cursor = await adapter.draft_changed_since(DRAFT, None)
-    assert changed is True and cursor == "0"
-    changed, cursor = await adapter.draft_changed_since(DRAFT, "0")
-    assert changed is False and cursor == "0"
+    assert changed is True and cursor == "0:pre_draft"
+    changed, cursor = await adapter.draft_changed_since(DRAFT, cursor)
+    assert changed is False and cursor == "0:pre_draft"
+    # The draft opens: no pick yet (last_picked still null) but status flipped.
+    raw["status"] = "drafting"
+    route.mock(return_value=httpx.Response(200, json=raw))
+    changed, cursor = await adapter.draft_changed_since(DRAFT, cursor)
+    assert changed is True and cursor == "0:drafting"
+    # First pick lands.
+    raw["last_picked"] = 1756083970100
+    route.mock(return_value=httpx.Response(200, json=raw))
+    changed, cursor = await adapter.draft_changed_since(DRAFT, cursor)
+    assert changed is True and cursor == "1756083970100:drafting"
+    # Commissioner pauses: same last_picked, new status.
+    raw["status"] = "paused"
+    route.mock(return_value=httpx.Response(200, json=raw))
+    changed, cursor = await adapter.draft_changed_since(DRAFT, cursor)
+    assert changed is True and cursor == "1756083970100:paused"
+    changed, cursor = await adapter.draft_changed_since(DRAFT, cursor)
+    assert changed is False
 
 
 def test_player_ref_maps_a_defense_to_dst_named_by_team_abbreviation():
@@ -328,6 +440,27 @@ def test_player_ref_builds_a_human_name_from_first_and_last_when_full_name_is_mi
     assert ref.position == "QB" and ref.team == "KC"
 
 
+@pytest.mark.parametrize(
+    "names",
+    [
+        {},
+        {"full_name": None, "first_name": None, "last_name": None},
+        {"full_name": "", "first_name": "", "last_name": ""},
+        {"full_name": None, "first_name": " ", "last_name": ""},
+    ],
+)
+def test_player_ref_raises_when_a_non_def_entry_has_no_name_at_all(names):
+    raw = RawPlayer(player_id="424242", position="WR", team=None, **names)
+    with pytest.raises(PlatformError, match="sleeper player 424242: no name on the wire"):
+        player_ref(raw)
+
+
+def test_player_ref_passes_a_null_position_through_as_none_never_empty_string():
+    raw = RawPlayer(player_id="7", full_name="Retired Guy", position=None, team=None)
+    ref = player_ref(raw)
+    assert ref.position is None and ref.name == "Retired Guy"
+
+
 def test_player_ref_prefers_full_name_when_present():
     raw = RawPlayer(
         player_id="1",
@@ -371,6 +504,22 @@ async def test_lake_player_catalog_round_trips_gsis_id(tmp_path):
     assert refs["1"].gsis_id == "00-0033873"
     assert refs["2"].gsis_id == "00-0099999"  # same strip rule as player_ref
     assert refs["KC"].gsis_id is None
+
+
+async def test_lake_player_catalog_round_trips_a_null_position(tmp_path):
+    part = tmp_path / "raw" / "sleeper" / "players" / "scrape_date=2026-08-15"
+    part.mkdir(parents=True)
+    pl.DataFrame(
+        {
+            "player_id": ["1", "2"],
+            "name": ["Has Position", "No Position"],
+            "position": ["QB", None],
+            "team": ["KC", None],
+        }
+    ).write_parquet(part / "players.parquet")
+    refs = await LakePlayerCatalog(tmp_path).all_players()
+    assert refs["1"].position == "QB"
+    assert refs["2"].position is None and refs["2"].name == "No Position"
 
 
 async def test_lake_player_catalog_translates_a_null_name_row_into_platform_error(tmp_path):

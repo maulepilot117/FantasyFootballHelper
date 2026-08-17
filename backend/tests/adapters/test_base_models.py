@@ -1,3 +1,5 @@
+from typing import get_args
+
 import pytest
 from pydantic import ValidationError
 
@@ -10,8 +12,10 @@ from ffh.adapters.base import (
     PlatformAuthError,
     PlatformError,
     PlatformNotFound,
+    PlayerRef,
     RosterSettings,
     ScoringSettings,
+    TransactionType,
 )
 
 
@@ -36,8 +40,35 @@ def test_scoring_format_is_derived_from_rec(rec, expected):
     assert ScoringSettings(points={"rec": rec, "rush_yd": 0.1}).format == expected
 
 
-def test_scoring_format_is_standard_when_rec_absent():
-    assert ScoringSettings(points={"rush_yd": 0.1}).format == "standard"
+def test_scoring_format_is_custom_when_rec_absent():
+    # No `rec` key means we do not know what a reception is worth: never assume standard.
+    assert ScoringSettings(points={"rush_yd": 0.1}).format == "custom"
+
+
+@pytest.mark.parametrize(
+    ("points", "expected"),
+    [
+        ({"rec": 1.0, "rec_td": 6.0, "pass_yd": 0.04}, "ppr"),
+        ({"rec": 0.5, "rec_td": 6.0, "bonus_rec_te": 0.0}, "half_ppr"),
+        ({"rec": 0.0, "rec_td": 6.0, "pts_allow_14_20": 1.0}, "standard"),
+        ({"rec": 0.25, "rec_td": 6.0}, "custom"),
+    ],
+)
+def test_scoring_format_for_sleeper_shaped_settings(points, expected):
+    # Sleeper always publishes `rec` (verified live: 132-key scoring_settings), so the
+    # explicit-rec branches are unchanged by the "absent -> custom" rule.
+    assert ScoringSettings(points=points).format == expected
+
+
+def test_player_ref_position_is_optional_and_name_is_not():
+    ref = PlayerRef(external_id="1", name="No Position", team=None)
+    assert ref.position is None
+    with pytest.raises(ValidationError):
+        PlayerRef(external_id="1", position="QB", team=None)  # type: ignore[call-arg]
+
+
+def test_transaction_type_includes_commissioner():
+    assert "commissioner" in get_args(TransactionType)
 
 
 def test_scoring_settings_keep_every_platform_key_verbatim():

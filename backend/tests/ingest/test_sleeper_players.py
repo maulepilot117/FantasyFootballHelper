@@ -43,7 +43,7 @@ def test_player_columns_start_with_the_catalog_contract():
 
 
 def test_frame_is_all_utf8_with_normalized_name_and_position(sleeper_fixture):
-    df = players_to_frame(sleeper_fixture("players_slice"))
+    df = players_to_frame(sleeper_fixture("players_slice")).df
     assert df.columns == list(PLAYER_COLUMNS)
     assert set(df.schema.values()) == {pl.Utf8}
     assert df.height == 25
@@ -62,9 +62,41 @@ def test_frame_rejects_an_empty_payload():
         players_to_frame({})
 
 
+def test_frame_excludes_and_counts_entries_with_no_name_on_the_wire(sleeper_fixture):
+    # player_ref raises PlatformError for a non-DEF entry with full/first/last all null;
+    # the job drops it (never lands a fabricated ""), counts it, and the row-count
+    # invariant is checked against len(payload) - excluded.
+    payload = sleeper_fixture("players_slice")
+    payload["999001"] = {"player_id": "999001", "position": "WR", "team": None}
+    payload["999002"] = {"player_id": "999002", "full_name": "", "first_name": "", "last_name": ""}
+    out = players_to_frame(payload)
+    assert out.excluded == 2
+    assert out.df.height == len(payload) - out.excluded == 25
+    assert set(out.df["player_id"].to_list()).isdisjoint({"999001", "999002"})
+
+
+def test_frame_lands_a_null_position_as_null_and_the_catalog_round_trips_it(
+    tmp_path, sleeper_fixture
+):
+    import asyncio
+
+    from ffh.adapters.sleeper.catalog import LakePlayerCatalog
+    from ffh.ingest.lake import parquet_file, write_parquet
+
+    payload = sleeper_fixture("players_slice")
+    payload["999003"] = {"player_id": "999003", "full_name": "No Position", "position": None}
+    out = players_to_frame(payload)
+    assert out.excluded == 0 and out.df.height == 26
+    row = out.df.filter(pl.col("player_id") == "999003").row(0, named=True)
+    assert row["position"] is None and row["name"] == "No Position"
+    write_parquet(out.df, parquet_file(tmp_path, "sleeper", "players", scrape_date="2026-08-16"))
+    refs = asyncio.run(LakePlayerCatalog(tmp_path).all_players())
+    assert refs["999003"].position is None and refs["999003"].name == "No Position"
+
+
 def test_validate_requires_the_crosswalk_columns_and_rows(sleeper_fixture):
     job = SleeperPlayersJob()
-    good = players_to_frame(sleeper_fixture("players_slice"))
+    good = players_to_frame(sleeper_fixture("players_slice")).df
     job.validate(good)
     # ③'s contract: validate() raises IngestValidationError (never a bare assert), so
     # IngestJob.run maps it to status="failed" with the message in ingest_runs.error.
@@ -76,7 +108,7 @@ def test_validate_requires_the_crosswalk_columns_and_rows(sleeper_fixture):
 
 def test_validate_rejects_duplicate_and_null_player_ids(sleeper_fixture):
     job = SleeperPlayersJob()
-    good = players_to_frame(sleeper_fixture("players_slice"))
+    good = players_to_frame(sleeper_fixture("players_slice")).df
     with pytest.raises(IngestValidationError, match="duplicate player_id"):
         job.validate(pl.concat([good, good.head(1)]))
     nulled = good.with_columns(
@@ -140,7 +172,7 @@ def test_landed_partition_is_readable_by_the_lake_player_catalog(tmp_path, sleep
     from ffh.adapters.sleeper.catalog import LakePlayerCatalog
     from ffh.ingest.lake import parquet_file, write_parquet
 
-    df = players_to_frame(sleeper_fixture("players_slice"))
+    df = players_to_frame(sleeper_fixture("players_slice")).df
     write_parquet(df, parquet_file(tmp_path, "sleeper", "players", scrape_date="2026-08-16"))
     refs = asyncio.run(LakePlayerCatalog(tmp_path).all_players())
     assert refs["KC"].position == "DST" and refs["1"].name == "Fixture Quarterback"

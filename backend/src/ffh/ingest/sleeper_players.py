@@ -23,11 +23,12 @@ from __future__ import annotations
 import hashlib
 import json
 from datetime import UTC, datetime
-from typing import Any, ClassVar
+from typing import Any, ClassVar, NamedTuple
 
 import polars as pl
 import structlog
 
+from ffh.adapters.base import PlatformError
 from ffh.adapters.sleeper.adapter import player_ref
 from ffh.adapters.sleeper.catalog import REQUIRED_COLUMNS
 from ffh.adapters.sleeper.models import RawPlayer
@@ -105,19 +106,46 @@ def _row(raw: RawPlayer) -> dict[str, str | None]:
     }
 
 
-def players_to_frame(payload: dict[str, dict[str, Any]]) -> pl.DataFrame:
+class PlayersFrame(NamedTuple):
+    """``players_to_frame`` output: the frame plus how many blob entries it excluded."""
+
+    df: pl.DataFrame
+    #: Entries with no name at all (``player_ref`` raised). They cannot be crosswalked
+    #: and are dropped rather than landed with a fabricated "".
+    excluded: int
+
+
+def players_to_frame(payload: dict[str, dict[str, Any]]) -> PlayersFrame:
     """The ``/players/nfl`` dict -> one all-Utf8 row per entry, in ``PLAYER_COLUMNS`` order.
 
+    Entries ``player_ref`` refuses (no ``full_name``/``first_name``/``last_name`` on the
+    wire) are excluded and counted; a null ``position`` lands as null, never "".
     Row-count invariants only; the duplicate/null ``player_id`` checks belong to
     ``SleeperPlayersJob.validate`` so they surface as ``IngestValidationError``.
     """
     if not payload:
         raise ValueError(f"GET {PLAYERS_PATH} returned an empty payload")
-    rows = [_row(RawPlayer.model_validate(entry)) for entry in payload.values()]
+    rows: list[dict[str, str | None]] = []
+    excluded_ids: list[str] = []
+    for entry in payload.values():
+        raw = RawPlayer.model_validate(entry)
+        try:
+            rows.append(_row(raw))
+        except PlatformError:
+            excluded_ids.append(raw.player_id)
+    if excluded_ids:
+        log.warning(
+            "ingest.sleeper_players.excluded_nameless",
+            count=len(excluded_ids),
+            player_ids=excluded_ids[:20],
+        )
     df = pl.DataFrame(rows, schema={c: pl.Utf8 for c in PLAYER_COLUMNS})
-    if df.height != len(payload):
-        raise ValueError(f"lost rows building the frame: {len(payload)} in, {df.height} out")
-    return df
+    if df.height != len(payload) - len(excluded_ids):
+        raise ValueError(
+            f"lost rows building the frame: {len(payload)} in, {len(excluded_ids)} excluded, "
+            f"{df.height} out"
+        )
+    return PlayersFrame(df=df, excluded=len(excluded_ids))
 
 
 @register
@@ -159,7 +187,8 @@ class SleeperPlayersJob(IngestJob):
         return Fetched(content=result.content, etag=digest, mtime=datetime.now(UTC))
 
     def parse(self, content: bytes) -> pl.DataFrame:
-        return players_to_frame(json.loads(content))
+        # players_to_frame already enforced height == len(payload) - excluded.
+        return players_to_frame(json.loads(content)).df
 
     def validate(self, df: pl.DataFrame) -> None:
         # ③'s contract: raise IngestValidationError, never a bare assert. The base checks

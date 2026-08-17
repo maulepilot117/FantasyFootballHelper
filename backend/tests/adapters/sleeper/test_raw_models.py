@@ -74,9 +74,25 @@ def test_roster_null_collections_become_empty():
 
 
 def test_roster_null_settings_become_defaults():
+    # `settings: null` parses, but nothing is invented: waiver_budget_used is None, not 0.
     r = RawRoster.model_validate({"roster_id": 1, "settings": None})
-    assert r.settings.waiver_budget_used == 0
+    assert r.settings.waiver_budget_used is None
     assert r.settings.wins is None and r.settings.waiver_position is None
+
+
+def test_league_settings_missing_ir_and_taxi_slots_are_none_not_zero():
+    lg = RawLeague.model_validate(
+        {"league_id": "1", "season": "2026", "settings": {"num_teams": 2}}
+    )
+    assert lg.settings.reserve_slots is None and lg.settings.taxi_slots is None
+    lg2 = RawLeague.model_validate(
+        {
+            "league_id": "1",
+            "season": "2026",
+            "settings": {"num_teams": 2, "reserve_slots": 0, "taxi_slots": None},
+        }
+    )
+    assert lg2.settings.reserve_slots == 0 and lg2.settings.taxi_slots is None
 
 
 def test_user_team_name_is_optional():

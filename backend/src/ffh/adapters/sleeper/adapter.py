@@ -87,10 +87,13 @@ def player_ref(raw: RawPlayer) -> PlayerRef:
             gsis_id=None,
         )
     name = raw.full_name or f"{raw.first_name or ''} {raw.last_name or ''}".strip()
+    if not name:
+        raise PlatformError(f"sleeper player {raw.player_id}: no name on the wire")
     return PlayerRef(
         external_id=raw.player_id,
         name=name,
-        position=raw.position or "",
+        # A null position stays null; "" would masquerade as a real (empty) position.
+        position=raw.position,
         team=raw.team,
         gsis_id=normalize_gsis_id(raw.gsis_id),
     )
@@ -112,14 +115,20 @@ def to_roster_settings(raw: RawLeague) -> RosterSettings:
         raise PlatformError(f"unknown flex slot(s) {unknown_flex} in league {raw.league_id}")
     # IR / taxi capacity is a league setting, not a roster_positions token (verified live:
     # reserve_slots=1 with no "IR" token). The settings ints are authoritative; an
-    # explicit 0 there is a real 0. A fallback to counting "IR"/"TAXI" tokens was
-    # deliberately omitted: RawLeagueSettings.reserve_slots / taxi_slots are non-optional
-    # ints (Sleeper always sends them), so there is no "absent" case to fall back from.
+    # explicit 0 there is a real 0. RawLeagueSettings.reserve_slots / taxi_slots are
+    # `int | None` (None == Sleeper omitted or nulled the key); a missing value is a hard
+    # error rather than a guessed 0 or a fallback to counting "IR"/"TAXI" tokens.
+    ir = raw.settings.reserve_slots
+    taxi = raw.settings.taxi_slots
+    if ir is None:
+        raise PlatformError(f"league {raw.league_id}: settings.reserve_slots is missing")
+    if taxi is None:
+        raise PlatformError(f"league {raw.league_id}: settings.taxi_slots is missing")
     return RosterSettings(
         starters=starters,
         bench=tokens.count("BN"),
-        ir=raw.settings.reserve_slots,
-        taxi=raw.settings.taxi_slots,
+        ir=ir,
+        taxi=taxi,
         flex_composition={s: FLEX_COMPOSITION[s] for s in starters if s in FLEX_COMPOSITION},
     )
 
@@ -193,6 +202,8 @@ class SleeperAdapter:
         users = {u.user_id: u for u in await self._client.get_users(league_id)}
         is_faab = raw.settings.waiver_type == FAAB_WAIVER_TYPE
         budget = raw.settings.waiver_budget if is_faab else None
+        if is_faab and budget is None:
+            raise PlatformError(f"league {league_id}: FAAB league without settings.waiver_budget")
         slots = await self._draft_slots(raw)
         teams = [self._team(r, users.get(r.owner_id or ""), budget, slots) for r in rosters]
         if len(teams) != len(rosters):
@@ -206,18 +217,27 @@ class SleeperAdapter:
         faab_budget: int | None,
         slots: dict[int, int],
     ) -> LeagueTeam:
+        """`faab_budget` is None for a non-FAAB league (-> faab_remaining None)."""
         # metadata is opaque dict[str, Any]; coerce at point of use.
         raw_team_name = user.metadata.get("team_name") if user else None
         team_name = str(raw_team_name) if raw_team_name else None
         manager = user.display_name if user else None
+        faab_remaining: int | None = None
+        if faab_budget is not None:
+            used = roster.settings.waiver_budget_used
+            if used is None:
+                # A FAAB league must say how much each roster has spent; 0 is a guess.
+                raise PlatformError(
+                    f"roster {roster.roster_id}: FAAB league but settings.waiver_budget_used "
+                    "is missing"
+                )
+            faab_remaining = faab_budget - used
         return LeagueTeam(
             external_id=str(roster.roster_id),
             display_name=team_name or manager,
             manager_name=manager,
             draft_slot=slots.get(roster.roster_id),
-            faab_remaining=(
-                None if faab_budget is None else faab_budget - roster.settings.waiver_budget_used
-            ),
+            faab_remaining=faab_remaining,
             waiver_priority=roster.settings.waiver_position,
             is_me=self._is_mine(roster),
         )
@@ -339,18 +359,24 @@ class SleeperAdapter:
         return [self._transaction(t, week) for t in raws]
 
     def _transaction(self, raw: RawTransaction, week: int) -> Transaction:
-        if raw.type in ("waiver", "trade"):
+        if raw.type in ("waiver", "trade", "commissioner"):
+            # "commissioner" is a commish-forced move; its adds/drops map exactly like a
+            # free_agent's, but the type is kept so downstream never mistakes it for a
+            # manager's own claim.
             kind = raw.type
         elif raw.type == "free_agent":
             kind = "add" if raw.adds else "drop"
         else:
             raise PlatformError(f"unrecognised Sleeper transaction type {raw.type!r}")
+        # A waiver_bid on a failed/pending claim was never charged: only a completed
+        # transaction actually spent FAAB.
+        faab_spent = raw.settings.waiver_bid if raw.settings and raw.status == "complete" else None
         return Transaction(
             external_id=raw.transaction_id,
             type=kind,  # type: ignore[arg-type]
             week=raw.leg if raw.leg is not None else week,
             executed_at=_ms_to_dt(raw.status_updated or raw.created),
-            faab_spent=raw.settings.waiver_bid if raw.settings else None,
+            faab_spent=faab_spent,
             status=raw.status or "unknown",
             adds={pid: str(rid) for pid, rid in raw.adds.items()},
             drops={pid: str(rid) for pid, rid in raw.drops.items()},
@@ -444,14 +470,26 @@ class SleeperAdapter:
         )
 
     async def draft_changed_since(self, draft_id: str, cursor: str | None) -> tuple[bool, str]:
+        """Cursor is ``"{last_picked_ms}:{status}"``.
+
+        `last_picked` alone misses status-only transitions (pre_draft -> drafting,
+        drafting -> paused, last pick -> complete), so the status rides along. Pre-draft
+        `last_picked` is null; `0` is the stable "nothing picked yet" value. A legacy bare
+        numeric cursor (no ":") is compared on the epoch-ms part only.
+        """
         raw = await self._client.get_draft(draft_id)
-        # Pre-draft last_picked is null; "0" is the stable cursor for "nothing picked yet".
         new_ms = raw.last_picked or 0
-        new_cursor = str(new_ms)
+        new_cursor = f"{new_ms}:{raw.status}"
         if cursor is None:
             return True, new_cursor
+        prev_ms_text, sep, prev_status = cursor.partition(":")
         try:
-            previous = int(cursor)
+            previous_ms = int(prev_ms_text)
         except ValueError:
             return True, new_cursor
-        return previous != new_ms, new_cursor
+        if previous_ms != new_ms:
+            return True, new_cursor
+        if not sep:
+            # Legacy cursor without a status: epoch-ms parity is all we can compare.
+            return False, new_cursor
+        return prev_status != raw.status, new_cursor

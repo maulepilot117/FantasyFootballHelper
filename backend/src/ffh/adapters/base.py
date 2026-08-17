@@ -22,7 +22,7 @@ ScoringFormat = Literal["ppr", "half_ppr", "standard", "custom"]
 LeagueType = Literal["redraft", "keeper", "dynasty"]
 DraftType = Literal["snake", "linear", "auction"]
 DraftStatus = Literal["pre_draft", "drafting", "paused", "complete"]
-TransactionType = Literal["add", "drop", "trade", "waiver"]
+TransactionType = Literal["add", "drop", "trade", "waiver", "commissioner"]
 # Mirrors docs/DATABASE.md §4 roster_slots.slot.
 RosterSlotName = str
 
@@ -55,7 +55,11 @@ class ScoringSettings(_Frozen):
 
     @property
     def format(self) -> ScoringFormat:
-        rec = self.points.get("rec", 0.0)
+        # No `rec` key at all is NOT standard scoring — we do not know what the platform
+        # awards per reception, so we refuse to guess.
+        rec = self.points.get("rec")
+        if rec is None:
+            return "custom"
         if rec == 1.0:
             return "ppr"
         if rec == 0.5:
@@ -142,7 +146,9 @@ class Transaction(_Frozen):
 class PlayerRef(_Frozen):
     external_id: str
     name: str
-    position: str
+    # None when the platform publishes no position (Sleeper: some retired/unsigned blob
+    # entries). Never "".
+    position: str | None = None
     team: str | None
     # NFL GSIS id when the platform publishes one (Sleeper: null for DEF and ~2/3 of the
     # blob). Whitespace-stripped; never "". The crosswalk's strongest join key.

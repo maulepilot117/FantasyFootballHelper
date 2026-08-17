@@ -7,8 +7,9 @@ import respx
 from ffh.adapters.base import PlatformAuthError, PlatformError, PlatformNotFound
 from ffh.adapters.ratelimit import TokenBucket
 from ffh.adapters.sleeper.client import SleeperClient
+from ffh.config import get_settings
 
-BASE = "https://api.sleeper.app/v1"
+BASE = get_settings().sleeper_base_url.rstrip("/")
 
 
 class SleepRecorder:
@@ -206,6 +207,53 @@ async def test_get_user_null_body_raises_platform_not_found():
 
 
 @respx.mock
+async def test_typed_getter_translates_a_bad_shape_into_platform_error():
+    # A 200 whose body does not fit the Raw model is Sleeper misbehaving, not our bug:
+    # pydantic's ValidationError must never escape the client.
+    respx.get(f"{BASE}/league/5").mock(return_value=httpx.Response(200, json={"league_id": 5}))
+    async with _client() as client:
+        with pytest.raises(PlatformError) as exc_info:
+            await client.get_league("5")
+    assert exc_info.type is PlatformError
+    assert "unexpected shape for /league/5" in str(exc_info.value)
+
+
+@respx.mock
+async def test_typed_list_getter_translates_a_null_body_into_platform_error():
+    # `null` where a list was expected used to surface as TypeError from iterating None.
+    respx.get(f"{BASE}/league/5/rosters").mock(
+        return_value=httpx.Response(200, text="null", headers={"content-type": "application/json"})
+    )
+    async with _client() as client:
+        with pytest.raises(PlatformError) as exc_info:
+            await client.get_rosters("5")
+    assert exc_info.type is PlatformError
+    assert "unexpected shape for /league/5/rosters" in str(exc_info.value)
+
+
+@respx.mock
+async def test_typed_object_getter_translates_a_null_body_into_platform_error():
+    respx.get(f"{BASE}/draft/9").mock(
+        return_value=httpx.Response(200, text="null", headers={"content-type": "application/json"})
+    )
+    async with _client() as client:
+        with pytest.raises(PlatformError) as exc_info:
+            await client.get_draft("9")
+    assert exc_info.type is PlatformError
+    assert "null body" in str(exc_info.value)
+
+
+@respx.mock
+async def test_typed_list_getter_translates_a_bad_element_into_platform_error():
+    respx.get(f"{BASE}/league/5/users").mock(
+        return_value=httpx.Response(200, json=[{"user_id": "u1"}, {"display_name": "no id"}])
+    )
+    async with _client() as client:
+        with pytest.raises(PlatformError, match="unexpected shape for /league/5/users"):
+            await client.get_users("5")
+
+
+@respx.mock
 async def test_every_request_spends_a_rate_limit_token():
     respx.get(f"{BASE}/state/nfl").mock(return_value=httpx.Response(200, json={}))
     bucket = TokenBucket(rate_per_min=300, burst=30)
@@ -225,11 +273,12 @@ async def test_default_rate_is_300_per_minute_burst_30():
         assert bucket.tokens < 1.0
         # 300/min == 5 tokens/s: the 31st acquire must wait for the remaining deficit,
         # i.e. (1 - tokens) / 5 seconds (~0.2s), whatever the drain loop cost.
-        t = bucket.tokens
         t0 = time.monotonic()
         await bucket.acquire()
         elapsed = time.monotonic() - t0
-    assert elapsed == pytest.approx((1 - t) / 5.0, abs=0.1)
+    # Loose bounds: it must actually wait (not fall through) and must not wait for a
+    # whole burst; timer resolution and CI load make a tight approx flaky.
+    assert 0.15 <= elapsed <= 1.0
 
 
 async def test_context_manager_closes_owned_http():

@@ -17,7 +17,9 @@ from ffh.adapters.sleeper.gsis import normalize_gsis_id
 
 PLAYERS_LAKE_GLOB = "raw/sleeper/players/scrape_date=*"
 # The ONE definition of the player-partition column contract. The `sleeper_players`
-# IngestJob imports this to write exactly these columns.
+# IngestJob imports this to write exactly these columns. `position` and `team` are
+# nullable columns (a null lands as PlayerRef.position/team None); `player_id` and
+# `name` are not — a null there is a PlatformError.
 REQUIRED_COLUMNS = ("player_id", "name", "position", "team")
 # Carried into PlayerRef when the partition has it (every job-written partition does);
 # an older partition without it still loads, with gsis_id=None.
