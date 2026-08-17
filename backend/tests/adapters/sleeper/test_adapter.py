@@ -5,8 +5,9 @@ import polars as pl
 import pytest
 
 from ffh.adapters.base import FantasyPlatformAdapter, PlatformError, PlayerRef
-from ffh.adapters.sleeper.adapter import SleeperAdapter
+from ffh.adapters.sleeper.adapter import SleeperAdapter, player_ref
 from ffh.adapters.sleeper.catalog import LakePlayerCatalog
+from ffh.adapters.sleeper.models import RawPlayer
 from tests.conftest import FIXTURE_DRAFT_ID as DRAFT
 from tests.conftest import FIXTURE_LEAGUE_ID as LEAGUE
 
@@ -86,6 +87,16 @@ async def test_get_teams_maps_names_faab_and_is_me(adapter):
     assert teams["2"].is_me is False
 
 
+async def test_get_teams_raises_when_two_draft_slots_map_to_one_roster(
+    adapter, sleeper_mock, sleeper_fixture
+):
+    raw = sleeper_fixture("draft")
+    raw["slot_to_roster_id"] = {"1": 1, "2": 1}
+    sleeper_mock.get(f"/draft/{DRAFT}").mock(return_value=httpx.Response(200, json=raw))
+    with pytest.raises(PlatformError):
+        await adapter.get_teams(LEAGUE)
+
+
 async def test_get_rosters_assigns_every_slot_kind_and_drops_the_zero_placeholder(adapter):
     rosters = {r.team_external_id: r for r in await adapter.get_rosters(LEAGUE, 1)}
     mine = {e.player_external_id: e for e in rosters["1"].players}
@@ -138,6 +149,19 @@ async def test_get_matchups_emits_a_bye_for_a_null_matchup_id(
     assert by_home["1"].matchup_no == 1  # kept its platform matchup_id
     assert by_home["2"].matchup_no == 2  # bye, synthesised after max(groups)
     assert by_home["2"].home_points == pytest.approx(88.0)
+
+
+async def test_get_matchups_prefers_commissioner_custom_points(
+    adapter, sleeper_mock, sleeper_fixture
+):
+    raw = sleeper_fixture("matchups_week1")
+    raw[1]["custom_points"] = 95.25  # commissioner override on roster 2; roster 1 stays null
+    sleeper_mock.get(f"/league/{LEAGUE}/matchups/1").mock(
+        return_value=httpx.Response(200, json=raw)
+    )
+    (m,) = await adapter.get_matchups(LEAGUE, 1)
+    assert m.home_team_external_id == "1" and m.home_points == pytest.approx(100.5)
+    assert m.away_team_external_id == "2" and m.away_points == pytest.approx(95.25)
 
 
 async def test_get_transactions_normalizes_type_faab_and_epoch_ms(adapter):
@@ -218,6 +242,45 @@ async def test_draft_changed_since_handles_a_predraft_null_last_picked(
     assert changed is False and cursor == "0"
 
 
+def test_player_ref_maps_a_defense_to_dst_named_by_team_abbreviation():
+    raw = RawPlayer(
+        player_id="KC",
+        position="DEF",
+        team="KC",
+        first_name="Kansas City",
+        last_name="Chiefs",
+        fantasy_positions=["DEF"],
+    )
+    ref = player_ref(raw)
+    assert ref.external_id == "KC"
+    assert ref.position == "DST"
+    assert ref.name == "KC"  # the one form the crosswalk's normalize_dst canonicalizes
+    assert ref.team == "KC"
+
+
+def test_player_ref_builds_a_human_name_from_first_and_last_when_full_name_is_missing():
+    raw = RawPlayer(
+        player_id="4046", first_name="Patrick", last_name="Mahomes", position="QB", team="KC"
+    )
+    ref = player_ref(raw)
+    assert ref.external_id == "4046"
+    assert ref.name == "Patrick Mahomes"
+    assert ref.position == "QB" and ref.team == "KC"
+
+
+def test_player_ref_prefers_full_name_when_present():
+    raw = RawPlayer(
+        player_id="1",
+        full_name="Fixture Quarterback",
+        first_name="X",
+        last_name="Y",
+        position="QB",
+        team=None,
+    )
+    ref = player_ref(raw)
+    assert ref.name == "Fixture Quarterback" and ref.team is None
+
+
 async def test_lake_player_catalog_reads_the_newest_partition(tmp_path):
     old = tmp_path / "raw" / "sleeper" / "players" / "scrape_date=2026-08-01"
     new = tmp_path / "raw" / "sleeper" / "players" / "scrape_date=2026-08-15"
@@ -228,6 +291,21 @@ async def test_lake_player_catalog_reads_the_newest_partition(tmp_path):
         ).write_parquet(d / "players.parquet")
     refs = await LakePlayerCatalog(tmp_path).all_players()
     assert refs["1"].name == "Fresh Player"
+
+
+async def test_lake_player_catalog_translates_a_null_name_row_into_platform_error(tmp_path):
+    part = tmp_path / "raw" / "sleeper" / "players" / "scrape_date=2026-08-15"
+    part.mkdir(parents=True)
+    pl.DataFrame(
+        {
+            "player_id": ["1", "2"],
+            "name": ["Ok", None],
+            "position": ["QB", "RB"],
+            "team": ["KC", None],
+        }
+    ).write_parquet(part / "players.parquet")
+    with pytest.raises(PlatformError, match="scrape_date=2026-08-15"):
+        await LakePlayerCatalog(tmp_path).all_players()
 
 
 async def test_lake_player_catalog_raises_when_the_lake_is_empty(tmp_path):

@@ -10,6 +10,7 @@ from __future__ import annotations
 from pathlib import Path
 
 import polars as pl
+from pydantic import ValidationError
 
 from ffh.adapters.base import PlatformError, PlayerRef
 
@@ -43,15 +44,20 @@ class LakePlayerCatalog:
         missing = [c for c in REQUIRED_COLUMNS if c not in df.columns]
         if missing:
             raise PlatformError(f"{partition} is missing columns {missing}")
-        refs = {
-            row["player_id"]: PlayerRef(
-                external_id=row["player_id"],
-                name=row["name"],
-                position=row["position"],
-                team=row["team"],
-            )
-            for row in df.select(REQUIRED_COLUMNS).iter_rows(named=True)
-        }
+        try:
+            refs = {
+                row["player_id"]: PlayerRef(
+                    external_id=row["player_id"],
+                    name=row["name"],
+                    position=row["position"],
+                    team=row["team"],
+                )
+                for row in df.select(REQUIRED_COLUMNS).iter_rows(named=True)
+            }
+        except ValidationError as exc:
+            raise PlatformError(
+                f"{partition} has a row that is not a valid PlayerRef: {exc}"
+            ) from exc
         if len(refs) != df.height:
             raise PlatformError(
                 f"{partition} has duplicate player_id rows ({df.height} rows, {len(refs)} ids)"

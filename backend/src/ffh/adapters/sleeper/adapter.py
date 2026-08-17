@@ -61,6 +61,11 @@ EMPTY_SLOT = "0"
 FAAB_WAIVER_TYPE = 2
 
 
+def _matchup_points(m: RawMatchup) -> float | None:
+    """A non-null custom_points is a commissioner override that REPLACES the computed score."""
+    return m.custom_points if m.custom_points is not None else m.points
+
+
 def _ms_to_dt(ms: int | None) -> datetime | None:
     """Sleeper timestamps are EPOCH MILLISECONDS (AGENTS.md Tier 1)."""
     return None if ms is None else datetime.fromtimestamp(ms / 1000, tz=UTC)
@@ -217,7 +222,13 @@ class SleeperAdapter:
         if not raw.draft_id:
             return {}
         draft = await self._client.get_draft(raw.draft_id)
-        return {roster_id: int(slot) for slot, roster_id in draft.slot_to_roster_id.items()}
+        slots = {roster_id: int(slot) for slot, roster_id in draft.slot_to_roster_id.items()}
+        if len(slots) != len(draft.slot_to_roster_id):
+            raise PlatformError(
+                f"draft {raw.draft_id}: slot_to_roster_id maps {len(draft.slot_to_roster_id)} "
+                f"slots onto {len(slots)} rosters — a roster holds more than one slot"
+            )
+        return slots
 
     # --- rosters ---------------------------------------------------------------
     async def get_rosters(self, league_id: str, week: int) -> list[Roster]:
@@ -288,8 +299,8 @@ class SleeperAdapter:
                     matchup_no=matchup_id,
                     home_team_external_id=str(home.roster_id),
                     away_team_external_id=None if away is None else str(away.roster_id),
-                    home_points=home.points,
-                    away_points=None if away is None else away.points,
+                    home_points=_matchup_points(home),
+                    away_points=None if away is None else _matchup_points(away),
                 )
             )
         # Byes (null matchup_id) get synthetic matchup numbers after the platform's own.
@@ -301,7 +312,7 @@ class SleeperAdapter:
                     matchup_no=next_no,
                     home_team_external_id=str(m.roster_id),
                     away_team_external_id=None,
-                    home_points=m.points,
+                    home_points=_matchup_points(m),
                     away_points=None,
                 )
             )
