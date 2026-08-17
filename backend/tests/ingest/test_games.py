@@ -30,6 +30,10 @@ GAMES_CSV = (
     "2025_01_DAL_PHI,2025,REG,1,2025-09-04,Thursday,20:20,DAL,20,PHI,24,Home,4,44,0,"
     "2025090400,,,202509040phi,,401772510,,7,7,330,-400,-8.5,-110,-110,47.5,-110,-110,1,"
     "outdoors,grass,72,6,,,,,Brian Schottenheimer,Nick Sirianni,,PHI00,Lincoln Financial Field\n"
+    "2025_10_LV_DEN,2025,REG,10,2025-11-06,Thursday,20:15,LV,7,DEN,10,Home,3,17,0,2025110600,"
+    "59978,,202511060den,28553,401772944,6869,4,4,380,-500,9.5,-112,-108,42.5,-110,-110,1,"
+    "outdoors,grass,60,10,00-0030565,00-0039732,Geno Smith,Bo Nix,Pete Carroll,Sean Payton,"
+    "Bill Vinovich,DEN00,Empower Field at Mile High\n"
 )
 
 STADIUMS_CSV = (
@@ -73,6 +77,17 @@ def test_kickoff_at_converts_eastern_wall_clock_to_utc():
     opener = rows.filter(pl.col("game_id") == "2026_01_NE_SEA")["kickoff_at"].item()
     # 2026-09-09 20:20 ET (EDT, UTC-4) -> 2026-09-10 00:20 UTC
     assert opener == datetime(2026, 9, 10, 0, 20, tzinfo=UTC)
+    # Melbourne game: games.csv still records the ET wall clock, so 20:35 ET -> 00:35 UTC.
+    melbourne = rows.filter(pl.col("game_id") == "2026_01_SF_LA")["kickoff_at"].item()
+    assert melbourne == datetime(2026, 9, 11, 0, 35, tzinfo=UTC)
+
+
+def test_kickoff_at_uses_est_after_the_november_dst_change():
+    rows = to_game_rows(_raw(), 2025)
+    tnf = rows.filter(pl.col("game_id") == "2025_10_LV_DEN")["kickoff_at"].item()
+    # 2025-11-06 20:15 ET is EST (UTC-5; DST ended 2025-11-02) -> 2025-11-07 01:15 UTC.
+    # A fixed UTC-4 offset would yield 00:15 and fail here.
+    assert tnf == datetime(2025, 11, 7, 1, 15, tzinfo=UTC)
 
 
 def test_empty_roof_becomes_null_not_empty_string():
@@ -92,7 +107,7 @@ def test_season_filter_and_season_type_mapping():
     rows_2026 = to_game_rows(_raw(), 2026)
     assert rows_2026.height == 3
     assert set(rows_2026["season_type"]) == {"REG"}
-    assert to_game_rows(_raw(), 2025).height == 1
+    assert to_game_rows(_raw(), 2025).height == 2
 
 
 def test_div_game_and_rest_and_lines_map_through():
@@ -173,3 +188,14 @@ def test_persist_upserts_for_the_jobs_season(seeded, monkeypatch):
     job.persist(seeded, _raw())
     seeded.flush()
     assert len(list(seeded.scalars(select(Game)))) == 3
+
+
+def test_upsert_games_rejects_a_blank_stadium_id(seeded):
+    blanked = _raw().with_columns(
+        pl.when(pl.col("game_id") == "2026_01_NE_SEA")
+        .then(pl.lit(""))
+        .otherwise(pl.col("stadium_id"))
+        .alias("stadium_id")
+    )
+    with pytest.raises(ValueError, match="2026_01_NE_SEA"):
+        upsert_games(seeded, blanked, 2026)

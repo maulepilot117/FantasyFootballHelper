@@ -180,3 +180,12 @@ def test_assert_stadium_coverage_raises_with_the_unmatched_list(db_session):
         assert_stadium_coverage(db_session, rows)
     assert "NOPE1" in str(excinfo.value)
     assert "DEN00" not in str(excinfo.value)
+
+
+def test_assert_stadium_coverage_rejects_null_stadium_ids_by_game(db_session):
+    # A blank stadium_id in games.csv becomes NULL; it must not slip past "100% coverage".
+    seed_stadiums(db_session, _stadiums())
+    db_session.flush()
+    rows = pl.DataFrame({"game_id": ["2026_01_A_B", "2026_01_C_D"], "stadium_id": ["DEN00", None]})
+    with pytest.raises(ValueError, match="2026_01_C_D"):
+        assert_stadium_coverage(db_session, rows)

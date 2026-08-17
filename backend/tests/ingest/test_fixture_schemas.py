@@ -63,3 +63,36 @@ def test_stadiums_fixture_passes_validate_and_has_62_rows():
 def test_stats_player_week_fixture_has_150_columns():
     schema = pl.read_parquet_schema(FIXTURES / "nflverse" / "stats_player_week.parquet")
     assert len(schema) == 150, "DATA_SOURCES.md §1 records 150 columns"
+
+
+# --- live drift check ---------------------------------------------------------------------
+# The fixture-based tests above are an OFFLINE compatibility check: they prove the code still
+# matches the assets as recorded, not that upstream is unchanged today. This one hits the real
+# release URLs; `pytest -m network` runs it by hand (excluded from CI via addopts).
+
+
+@pytest.mark.network
+@pytest.mark.parametrize(
+    ("cls", "season"),
+    [
+        (NflversePlayersJob, None),
+        (NflverseStatsPlayerWeekJob, 2025),
+        (NflverseSnapCountsJob, 2025),
+        (NflverseDepthChartsJob, 2026),
+        (NflverseInjuriesJob, 2025),
+        (NflversePbpJob, 2025),
+    ],
+    ids=lambda v: getattr(v, "name", str(v)),
+)
+def test_live_asset_still_has_required_columns(cls, season):
+    import io
+
+    from ffh.ingest.http import Fetched, get_bytes, make_client
+
+    job = cls(season=season)
+    with make_client() as client:
+        result = get_bytes(client, job.url())
+    assert isinstance(result, Fetched), f"{job.url()} -> {type(result).__name__}"
+    columns = set(pl.read_parquet_schema(io.BytesIO(result.content)))
+    missing = sorted(cls.REQUIRED_COLUMNS - columns)
+    assert not missing, f"{cls.name}: upstream dropped {missing}"

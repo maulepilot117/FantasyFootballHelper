@@ -152,11 +152,21 @@ def assert_stadium_coverage(session: Session, rows: pl.DataFrame) -> None:
         {"stadium_id": list(session.scalars(select(Stadium.stadium_id)))},
         schema={"stadium_id": pl.String},
     )
-    subject = rows.select("stadium_id").drop_nulls()
+    # A NULL stadium_id (games.csv quoted-empty -> NULL) would silently pass a drop_nulls()
+    # coverage check and land as NULL in a nullable column. Reject it by name instead.
+    null_ids = rows.filter(pl.col("stadium_id").is_null())
+    if null_ids.height:
+        games = sorted(null_ids["game_id"].to_list()) if "game_id" in rows.columns else []
+        raise ValueError(
+            f"{null_ids.height} game row(s) have no stadium_id: {games[:20]}. "
+            "games.csv promises a stadium_id for every game (DATA_SOURCES.md §4)."
+        )
+    subject = rows.select("stadium_id")
+    assert subject.height == rows.height, "coverage subject must cover every input row"
     unmatched = subject.join(known, on="stadium_id", how="anti")
     matched = subject.join(known, on="stadium_id", how="semi")
-    assert matched.height + unmatched.height == subject.height, (
-        f"anti/semi join lost rows: {matched.height} + {unmatched.height} != {subject.height}"
+    assert matched.height + unmatched.height == rows.height, (
+        f"anti/semi join lost rows: {matched.height} + {unmatched.height} != {rows.height}"
     )
     if unmatched.height:
         missing = sorted(set(unmatched["stadium_id"]))

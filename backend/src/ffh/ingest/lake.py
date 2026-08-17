@@ -44,8 +44,9 @@ def write_parquet(df: pl.DataFrame, path: Path) -> int:
     """
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_name(f".{path.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp")
-    df.write_parquet(tmp, compression="zstd")
     try:
+        # inside the try: a failing serialization must not leak a partial temp file either
+        df.write_parquet(tmp, compression="zstd")
         os.link(tmp, path)
     except FileExistsError as exc:
         raise PartitionExistsError(f"lake partition already exists: {path}") from exc
