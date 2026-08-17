@@ -18,6 +18,8 @@ from ffh.db.models import Player
 # backend/tests/fixtures/ — Task 4 adds dynastyprocess CSVs here.
 FIXTURE_DIR = Path(__file__).resolve().parents[1] / "fixtures"
 
+DP_SAMPLE_CSV = FIXTURE_DIR / "dynastyprocess" / "db_playerids_sample.csv"
+
 # nflverse players.parquet column names and dtypes (birth_date is a String in the file).
 # fmt: off
 PLAYERS_ROWS: list[dict[str, object]] = [
@@ -86,3 +88,11 @@ def players_frame() -> pl.DataFrame:
 @pytest.fixture
 def seeded_registry(db_session: Session) -> dict[str, uuid.UUID]:
     return seed_fixture_registry(db_session)
+
+
+@pytest.fixture
+def dp_frame() -> pl.DataFrame:
+    """The 13-row DynastyProcess sample parsed exactly as apply_playerids receives it."""
+    from ffh.crosswalk.dynastyprocess import read_playerids_csv
+
+    return read_playerids_csv(DP_SAMPLE_CSV.read_bytes())
