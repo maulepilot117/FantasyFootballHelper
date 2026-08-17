@@ -59,6 +59,17 @@ past recommendation requires the inputs as they were.
 `ffh.features.duck.connect()` reads the **lexicographic maximum** partition path per asset,
 which is chronological because both partition keys are zero-padded ISO.
 
+*Lake grain is one snapshot per UTC day — by design (decided 2026-08-16, Codex review of
+PR ③).* `IngestJob.run()` persists to Postgres **before** landing Parquet, so a second
+run on the same day that fetches changed content still upserts Postgres (all `persist()`
+implementations are idempotent upserts) but hits `PartitionExistsError` → status
+`skipped`; the lake keeps the first-of-day snapshot and the ETag watermark stays at the
+last *landed* version, so later same-day runs re-download rather than 304. Consequences:
+**Postgres is the live system of record; the lake is a daily archive.** Nothing that needs
+intraday freshness (lines, injury status) may read it from DuckDB. If a future job needs
+intraday lake versions, add a finer partition key (`scrape_ts=`) for that job — do not
+loosen the never-overwrite rule.
+
 ---
 
 ## 2. Core reference tables
