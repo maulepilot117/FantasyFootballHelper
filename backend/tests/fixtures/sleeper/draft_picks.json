@@ -1,0 +1,23 @@
+[
+  {"draft_id": "2000000000000000001", "pick_no": 1, "round": 1, "draft_slot": 1,
+   "roster_id": 1, "picked_by": "USER_ME", "player_id": "1", "is_keeper": null,
+   "reactions": null,
+   "metadata": {"first_name": "Fixture", "last_name": "Quarterback", "position": "QB",
+     "team": "KC", "status": "Active", "injury_status": "", "number": "1",
+     "player_id": "1", "slot": "1", "sport": "nfl", "years_exp": "3", "amount": "0"}},
+  {"draft_id": "2000000000000000001", "pick_no": 2, "round": 1, "draft_slot": 2,
+   "roster_id": 2, "picked_by": "USER_OPP", "player_id": "13", "is_keeper": null,
+   "reactions": null,
+   "metadata": {"first_name": "Fixture", "last_name": "Quarterbacktwo", "position": "QB",
+     "team": "SF", "status": "Active", "player_id": "13", "amount": "0"}},
+  {"draft_id": "2000000000000000001", "pick_no": 3, "round": 2, "draft_slot": 2,
+   "roster_id": 2, "picked_by": "USER_OPP", "player_id": "14", "is_keeper": true,
+   "reactions": null,
+   "metadata": {"first_name": "Fixture", "last_name": "Runningbackfour", "position": "RB",
+     "team": "SF", "status": "Active", "player_id": "14", "amount": "0"}},
+  {"draft_id": "2000000000000000001", "pick_no": 4, "round": 2, "draft_slot": 1,
+   "roster_id": 1, "picked_by": "USER_ME", "player_id": "2", "is_keeper": null,
+   "reactions": null,
+   "metadata": {"first_name": "Fixture", "last_name": "Runningback", "position": "RB",
+     "team": "KC", "status": "Active", "player_id": "2", "amount": "12"}}
+]
