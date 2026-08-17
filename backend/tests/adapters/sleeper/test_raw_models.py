@@ -4,6 +4,7 @@ from ffh.adapters.sleeper.models import (
     RawDraft,
     RawDraftPick,
     RawLeague,
+    RawMatchup,
     RawPlayer,
     RawRoster,
     RawState,
@@ -48,6 +49,8 @@ def test_league_keeps_scoring_settings_verbatim_and_ignores_unknown_keys():
     assert lg.scoring_settings == {"rec": 0.5, "fgm_yds_over_30": 0.0}
     assert lg.settings.num_teams == 2 and lg.settings.type == 0
     assert lg.roster_positions == ["QB", "SUPER_FLEX", "BN"]
+    assert "some_new_key_sleeper_added" not in lg.model_dump()
+    assert "shard" not in lg.model_dump()
 
 
 def test_roster_null_collections_become_empty():
@@ -127,6 +130,52 @@ def test_draft_pick_auction_amount_is_a_string_in_metadata():
         }
     )
     assert p.is_keeper is None and p.metadata["amount"] == "64"
+
+
+def test_metadata_is_opaque_and_tolerates_non_string_values():
+    # Sleeper metadata values are not always strings; a single int must not fail the parse.
+    p = RawDraftPick.model_validate(
+        {
+            "pick_no": 2,
+            "round": 1,
+            "draft_slot": 1,
+            "metadata": {"amount": "42", "years_exp": 8, "number": 26, "slot": 1},
+        }
+    )
+    assert p.metadata["amount"] == "42" and p.metadata["years_exp"] == 8
+    u = RawUser.model_validate({"user_id": "u1", "metadata": {"mention_pn": True}})
+    assert u.metadata["mention_pn"] is True
+    lg = RawLeague.model_validate(
+        {"league_id": "1", "season": "2026", "settings": {"num_teams": 2}, "metadata": None}
+    )
+    assert lg.metadata == {}
+
+
+def test_matchup_per_roster_shape_with_nulls():
+    m = RawMatchup.model_validate(
+        {
+            "roster_id": 4,
+            "matchup_id": None,
+            "points": 0.0,
+            "custom_points": None,
+            "starters": ["4866", "0"],
+            "starters_points": None,
+            "players": ["4866"],
+            "players_points": {"4866": 21.3},
+        }
+    )
+    assert m.matchup_id is None and m.starters_points == []
+    assert m.players_points == {"4866": 21.3} and m.starters == ["4866", "0"]
+    m2 = RawMatchup.model_validate(
+        {
+            "roster_id": 5,
+            "matchup_id": 1,
+            "points": 101.2,
+            "starters_points": [20.1, 9.0],
+            "players_points": None,
+        }
+    )
+    assert m2.starters_points == [20.1, 9.0] and m2.players_points == {}
 
 
 def test_transaction_shape():

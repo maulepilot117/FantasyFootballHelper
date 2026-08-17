@@ -31,7 +31,10 @@ def _none_to(default: Any) -> BeforeValidator:
 StrList = Annotated[list[str], _none_to(list)]
 IntList = Annotated[list[int], _none_to(list)]
 FloatList = Annotated[list[float], _none_to(list)]
-StrDict = Annotated[dict[str, str], _none_to(dict)]
+# Sleeper `metadata` objects are OPAQUE payloads: values may be str, int, float or bool and
+# Pydantic lax mode does not coerce non-str -> str. Consumers coerce at point of use
+# (e.g. `str(metadata["amount"])`).
+Metadata = Annotated[dict[str, Any], _none_to(dict)]
 StrIntDict = Annotated[dict[str, int], _none_to(dict)]
 StrFloatDict = Annotated[dict[str, float], _none_to(dict)]
 
@@ -63,7 +66,7 @@ class RawUser(_Raw):
     is_owner: bool | None = None
     league_id: str | None = None
     # metadata["team_name"] is OPTIONAL — absent for several verified users.
-    metadata: StrDict = Field(default_factory=dict)
+    metadata: Metadata = Field(default_factory=dict)
 
 
 class RawLeagueSettings(_Raw):
@@ -101,7 +104,7 @@ class RawLeague(_Raw):
     scoring_settings: StrFloatDict = Field(default_factory=dict)
     # Required: a league with no settings is a hard error, never a default.
     settings: RawLeagueSettings
-    metadata: StrDict = Field(default_factory=dict)
+    metadata: Metadata = Field(default_factory=dict)
 
 
 class RawRosterSettings(_Raw):
@@ -131,7 +134,7 @@ class RawRoster(_Raw):
     settings: Annotated[RawRosterSettings, _none_to(RawRosterSettings)] = Field(
         default_factory=RawRosterSettings
     )
-    metadata: StrDict = Field(default_factory=dict)
+    metadata: Metadata = Field(default_factory=dict)
 
 
 class RawDraftSettings(_Raw):
@@ -160,7 +163,7 @@ class RawDraft(_Raw):
     season_type: str | None = None
     # Required: a draft with no settings is a hard error, never a default.
     settings: RawDraftSettings
-    metadata: StrDict = Field(default_factory=dict)
+    metadata: Metadata = Field(default_factory=dict)
     # user_id -> draft slot. Null before the order is set.
     draft_order: StrIntDict = Field(default_factory=dict)
     # draft slot (STRING key) -> roster_id. Only present on GET /draft/{id}.
@@ -185,7 +188,7 @@ class RawDraftPick(_Raw):
     # null | true on the wire.
     is_keeper: bool | None = None
     # metadata["amount"] is the auction bid AS A STRING. There is no per-pick timestamp.
-    metadata: StrDict = Field(default_factory=dict)
+    metadata: Metadata = Field(default_factory=dict)
 
 
 class RawMatchup(_Raw):
@@ -222,7 +225,7 @@ class RawTransaction(_Raw):
     roster_ids: IntList = Field(default_factory=list)
     consenter_ids: IntList = Field(default_factory=list)
     settings: RawTransactionSettings | None = None
-    metadata: StrDict = Field(default_factory=dict)
+    metadata: Metadata = Field(default_factory=dict)
 
 
 class RawPlayer(_Raw):
