@@ -44,3 +44,8 @@ _to_delete/
 # Harness scratch
 .claude/worktrees/
 .superpowers/
+
+# Checked-in reference data and recorded test fixtures must survive the broad rules above.
+# `data/` above matches at any depth, so the directory itself has to be re-included.
+!backend/src/ffh/data/
+!backend/tests/fixtures/**/*.parquet

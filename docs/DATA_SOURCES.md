@@ -11,8 +11,9 @@ priors, and re-verify before assuming a source is broken.
 1. **`nfl_data_py` is ARCHIVED** (read-only since 2025-09-25). Its README: *"nfl_data_py
    has been deprecated in favour of nflreadpy. All future development will occur in
    nflreadpy and users are encouraged to switch immediately."* Nearly every tutorial and
-   blog post still references the dead package. **Use `nflreadpy` — it is Polars-native,
-   not pandas.**
+   blog post still references the dead package. **This project uses neither:** the nflverse
+   release Parquet/CSV URLs are read directly with httpx + Polars (`ffh.ingest.nflverse`);
+   `nflreadpy` is a thin loader we chose not to depend on. Both imports are ruff-banned.
 
 2. **The nflverse player-stats asset was renamed.** `player_stats/player_stats.parquet` is
    frozen at 2025-05-07 and silently serves year-old data. The live path is
@@ -52,21 +53,43 @@ https://github.com/nflverse/nflverse-data/releases/download/{asset}/{file}.parqu
 | `pbp_participation/{YEAR}.parquet` | Routes run, coverage type, personnel groupings | ⚠️ **POST-SEASON ONLY** |
 
 **Caveats:**
-- `injuries_2025.parquet` exists and is populated (6,068 rows, weeks 1–22) even though the
-  official schedule page still claims it doesn't. But it was last written 2026-03-18 — a
-  post-season backfill. **In-season cadence for 2026 is unproven.** Use Sleeper for live
-  injury status and treat nflverse injuries as historical training data. Also note the 2025
-  file dropped the `date_modified` column present in 2024.
+- **Every per-season asset 404s until Week 1 — not just play-by-play.** Verified live
+  2026-08-16 (24 days before kickoff): `players.parquet` **200** and
+  `depth_charts_2026.parquet` **200**, but `stats_player_week_2026`, `snap_counts_2026`,
+  `injuries_2026` and `play_by_play_2026` all **404**. Every seasonal ingest job therefore
+  maps 404 → `skipped`, never `failed`.
+- `injuries_{YEAR}.parquet` exists and is populated for completed seasons (2025: 6,068
+  rows, 16 columns) even though the official schedule page claims it doesn't. **In-season
+  cadence for 2026 is unproven.** Use Sleeper for live injury status and treat nflverse
+  injuries as historical training data. The 2025 file dropped the `date_modified` column
+  present in 2024 — confirmed 2026-08-16.
 - `pbp_participation` (routes run) is delivered by FTN only **after the season ends**.
   Useless in-season. **Use snap % as the route-participation proxy** — it refreshes 4×/day.
-- `play_by_play_2026.parquet` returns 404 until Week 1 (Sept 9–13). Handle this.
+- **ETag / `If-None-Match` works on both hosts** (verified 2026-08-16: conditional GET →
+  304 on `players.parquet`, `games.csv` and `stadiums.csv`). GitHub Releases serves a
+  strong ETag plus `Last-Modified`; `raw.githubusercontent.com` serves a weak ETag and no
+  `Last-Modified`. ⚠️ **The ETag value depends on the negotiated `Accept-Encoding`**, so a
+  stored ETag is only valid for a request made by the same client configuration — which is
+  why every job goes through `ffh.ingest.http.make_client()`.
+
+**Verified schemas (2026-08-16) — these field names contradict the table names in
+`DATABASE.md`, which is deliberate; the lake stores upstream names verbatim:**
+
+| Asset | Rows × cols | Player key | Gotchas |
+|---|---|---|---|
+| `players/players.parquet` | 25,033 × 39 | `gsis_id` | `display_name` (no `full_name`), `college_name` (no `college`), `rookie_season` (no `rookie_year`), `height`/`weight` (no `height_in`/`weight_lb`), **`birth_date` is a String** |
+| `stats_player/stats_player_week_2025.parquet` | 19,422 × **150** | **`player_id`** (this IS the GSIS id) | there is **no** `gsis_id` column |
+| `snap_counts/snap_counts_2025.parquet` | 26,612 × 16 | **`pfr_player_id`** | **carries no GSIS id at all** — the crosswalk must hold `pfr` ids |
+| `depth_charts/depth_charts_2026.parquet` | 439,615 × 12 | `gsis_id`, `espn_id` | **`dt` is a String** ISO-8601 UTC stamp, not a datetime; positions in `pos_abb`/`pos_rank` |
+| `injuries/injuries_2025.parquet` | 6,068 × 16 | `gsis_id` | no `date_modified` |
+| `pbp/play_by_play_2025.parquet` | — × 372 | `passer/rusher/receiver_player_id` | 20 MB compressed |
 
 **License:** package code MIT. Data CC-BY 4.0 — **except FTN charting, which is
 CC-BY-SA 4.0 (share-alike).** If we build on FTN charting that obligation is real.
 
-**Library:** `nflreadpy` (PyPI, MIT, Polars-native). Note v0.1.5 dates to 2025-11-19 with
-no 2026 release; the loader is thin, so falling back to reading the Parquet URLs directly
-is entirely reasonable and removes a dependency.
+**Library:** none. `nflreadpy` (PyPI, MIT, Polars-native) exists but v0.1.5 dates to
+2025-11-19 with no 2026 release; the loader is thin, so PR ③ reads the release Parquet URLs
+directly (`ffh.ingest.nflverse`) and `nflreadpy` is **not** a dependency — decided 2026-08-16.
 
 ---
 
@@ -83,6 +106,27 @@ published (272 games). **Refreshes every 5 minutes in season.**
 
 This single file is both our live line feed and our backtest dataset. `temp`/`wind` are
 post-game actuals, which makes it the training target for weather adjustment.
+
+**Verified live 2026-08-16 — 46 columns, 7,548 rows, 272 for season 2026:**
+
+- `gameday` (`YYYY-MM-DD`) and `gametime` (`HH:MM`) are **Eastern wall-clock**, not UTC.
+  Convert with `America/New_York` → UTC (`2026_01_NE_SEA` is `2026-09-09 20:20` ET, the
+  8:20 pm Wednesday opener). Both are Strings; there is no timezone column.
+- ⚠️ **`roof` is the literal quoted empty string `""`, not NULL, for retractable-roof
+  stadiums whose game has not been played** — 43 of 272 rows in 2026 (HOU00, IND00, ATL97,
+  DAL00, PHO00, VEG00 …). Polars reports `null_count = 0`. Map `""` → NULL explicitly or
+  you will store an empty roof state. All-time values: `outdoors` 5,510 · `dome` 1,246 ·
+  `closed` 621 · `open` 128 · `""` 43.
+- `game_type` ∈ {`REG`, `WC`, `DIV`, `CON`, `SB`}; `games.season_type` in `DATABASE.md` is
+  `REG|POST`, so map every non-`REG` value to `POST`.
+- `location` ∈ {`Home`, `Neutral`} → `games.neutral_site`. 2026 has **8** neutral-site games.
+- ⚠️ **Neutral-site games carry the nominal HOME team's `stadium_id` while `stadium` names
+  the real venue** (2026: SoFi/Melbourne, DAL00/Maracana, WAS00/Tottenham, JAX00/Wembley,
+  NOR00/Stade de France, ATL97/Bernabeu, DET00/Munich, SFO01/Estadio Banorte). The 30/30
+  stadium join succeeds *because* it degrades to the home stadium — **never read stadium
+  coordinates, altitude or tz for a row with `neutral_site = true`.**
+- Lines are sparse pre-season: on 2026-08-16, 68 of 272 rows had `spread_line`/`total_line`.
+  `temp`/`wind`/scores are NULL until a game is played.
 
 ### Live odds: ESPN, undocumented, no auth
 
@@ -217,6 +261,17 @@ game than one that was closed, and only `games.csv` knows which happened.
 `ThompsonJamesBliss/WeatherData` is stale (2000–2020) but its `stadium_coordinates.csv` has
 a true Indoor/Outdoor/**Retractable** classification and stadium azimuth, useful as
 reference.
+
+**Verified live 2026-08-16:** 62 rows × 35 columns, `stadium_id` unique. The columns this
+project uses are `stadium_id, stadium_name, lat, lon, altitude, heading, surface_type,
+roof_type, tz` — all non-null for the 30 stadiums referenced by 2026 games, and all 30 join
+(0 unmatched, confirming the 30/30 claim).
+
+⚠️ **`altitude` is in METRES, not feet.** `DEN00` = 1583.586 (Mile High is 1,609 m /
+5,280 ft); `SEA00` = 5.214 (sea level). `DATABASE.md` §2 declares `stadiums.altitude_ft
+INTEGER`, so `ffh.ingest.reference.seed_stadiums` multiplies by 3.280839895 and rounds.
+`surface_type` ∈ {`Grass`, `Turf`}; `roof_type` ∈ {`Dome`, `Outdoors`}; `tz` is a valid
+IANA name. The column is `stadium_name`, not `name`.
 
 ---
 

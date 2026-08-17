@@ -33,9 +33,10 @@ Nothing works without this. No shortcuts here.
 - [x] Postgres schema + initial Alembic migration ([`DATABASE.md`](DATABASE.md))
 - [ ] **★ Player ID crosswalk ★** — DynastyProcess ingest, resolution ladder, unmatched
       table, and the four mandatory coverage tests. **Highest-risk component; do it first.**
-- [ ] nflverse ingest → Parquet lake (players, stats_player_week, snap counts, depth
-      charts, injuries). ⚠️ `nflreadpy`, **not** `nfl_data_py` (archived)
-- [ ] `nfldata/games.csv` ingest → schedule + Vegas lines + roof state
+- [x] nflverse ingest → Parquet lake (players, stats_player_week, snap counts, depth
+      charts, injuries, pbp). Release Parquet URLs read directly with httpx + Polars —
+      **no `nflreadpy`, no `nfl_data_py`** (archived)
+- [x] `nfldata/games.csv` ingest → schedule + Vegas lines + roof state
 - [ ] Platform adapter interface + **Sleeper implementation** (no auth, no approval
       dependency — the one that can't block us)
 - [ ] ADP + ECR ingest with `adp_stdev` ⚠️ required for VONA

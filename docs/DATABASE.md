@@ -26,16 +26,20 @@ decision we made, or state we can't re-derive, lives in Postgres.**
 
 ### Lake layout
 
+Written by `ffh.ingest.lake.partition_path`. Every partition holds exactly one file named
+`<asset>.parquet`; a re-scrape is a new `scrape_date=` directory, never an overwrite.
+
 ```
 /nfs/ffh/lake/
   raw/
-    nflverse/pbp/season=2026/play_by_play.parquet
-    nflverse/stats_player_week/season=2026/stats.parquet
-    nflverse/snap_counts/season=2026/...
-    nflverse/injuries/season=2026/...
-    nflverse/depth_charts/season=2026/...
-    nflverse/ftn_charting/season=2026/...
-    odds/games.csv → games.parquet
+    nflverse/players/scrape_date=2026-08-16/players.parquet
+    nflverse/stats_player_week/season=2026/scrape_date=2026-08-16/stats_player_week.parquet
+    nflverse/snap_counts/season=2026/scrape_date=2026-08-16/snap_counts.parquet
+    nflverse/depth_charts/season=2026/scrape_date=2026-08-16/depth_charts.parquet
+    nflverse/injuries/season=2026/scrape_date=2026-08-16/injuries.parquet
+    nflverse/pbp/season=2026/scrape_date=2026-09-14/pbp.parquet
+    nfldata/games/scrape_date=2026-08-16/games.parquet
+    greerre/stadiums/scrape_date=2026-08-16/stadiums.parquet
     odds/espn_live/date=2026-09-13/odds.parquet
     weather/forecast/game_id=.../forecast.parquet
     market/fantasycalc/scrape_date=2026-08-15/values.parquet
@@ -49,6 +53,22 @@ decision we made, or state we can't re-derive, lives in Postgres.**
 Partition by `season`, then by `week` or `scrape_date` where the data is a time series.
 **Never overwrite a scrape partition** — a new scrape is a new partition. Reproducing a
 past recommendation requires the inputs as they were.
+
+*Phase 0 note:* `games.csv` lands under `raw/nfldata/games/`, named for its job
+(`nfldata_games`), not under the `odds/` sketch this document previously showed.
+`ffh.features.duck.connect()` reads the **lexicographic maximum** partition path per asset,
+which is chronological because both partition keys are zero-padded ISO.
+
+*Lake grain is one snapshot per UTC day — by design (decided 2026-08-16, Codex review of
+PR ③).* `IngestJob.run()` persists to Postgres **before** landing Parquet, so a second
+run on the same day that fetches changed content still upserts Postgres (all `persist()`
+implementations are idempotent upserts) but hits `PartitionExistsError` → status
+`skipped`; the lake keeps the first-of-day snapshot and the ETag watermark stays at the
+last *landed* version, so later same-day runs re-download rather than 304. Consequences:
+**Postgres is the live system of record; the lake is a daily archive.** Nothing that needs
+intraday freshness (lines, injury status) may read it from DuckDB. If a future job needs
+intraday lake versions, add a finer partition key (`scrape_ts=`) for that job — do not
+loosen the never-overwrite rule.
 
 ---
 
@@ -116,7 +136,13 @@ CREATE TABLE stadiums (
     roof_type    TEXT,                  -- Outdoors|Dome (NOT retractable — see games.roof)
     tz           TEXT NOT NULL
 );
+```
 
+*Phase 0 note:* greerreNFL's `altitude` column is **metres**; `altitude_ft` is populated by
+`ffh.ingest.reference.seed_stadiums` as `round(altitude * 3.280839895)`. Its `name` comes
+from the upstream `stadium_name` column.
+
+```sql
 CREATE TABLE games (
     game_id        TEXT PRIMARY KEY,    -- nflverse game_id, e.g. 2026_01_NE_SEA
     season         SMALLINT NOT NULL,
@@ -431,7 +457,10 @@ CREATE TABLE player_week_actuals (
 
 **Sentinel generic league.** `league_id` is NOT NULL in both `projections` and `player_week_actuals` (in the latter it is part of the PK). League-agnostic ("generic PPR") rows in either table use the sentinel `00000000-0000-0000-0000-000000000000` (`ffh.db.models.GENERIC_LEAGUE_ID`) — never NULL. Backtest joins `projections ⋈ player_week_actuals` on `(player_id, season, week, league_id)` directly — both use the sentinel; never COALESCE.
 
-Because of the FK, a sentinel `leagues` row must exist. PR ③ seeds it via `seed_generic_league(session)` in `backend/src/ffh/ingest/reference.py` (`seed_nfl_teams`' companion) with exactly this row:
+Because of the FK, a sentinel `leagues` row must exist. It is seeded by
+`ffh.ingest.reference.seed_generic_league(session)` (shipped in PR ③, idempotent via
+`ON CONFLICT (league_id) DO NOTHING`) and run by `ffh ingest seed` alongside `nfl_teams`
+and `stadiums`, with exactly this row:
 
 | column | value |
 |---|---|
@@ -447,6 +476,13 @@ Because of the FK, a sentinel `leagues` row must exist. PR ③ seeds it via `see
 | `roster_settings` | `{"QB":1,"RB":2,"WR":2,"TE":1,"FLEX":1,"K":1,"DST":1,"BN":6}` |
 
 All other `leagues` columns (`playoff_teams`, `playoff_start_wk`, `faab_budget`, `my_team_id`) are NULL; `created_at` takes its default.
+
+*`roster_settings` has two shapes.* The sentinel row stores a **count map**
+(`GENERIC_ROSTER`: `{"QB": 1, "RB": 2, "WR": 2, "TE": 1, "FLEX": 1, "K": 1, "DST": 1,
+"BN": …}`). Platform-loaded leagues (`ffh.ingest.platform_sync`, PR ⑤) store
+`RosterSettings.model_dump()` — `{"starters": [...], "bench", "ir", "taxi",
+"flex_composition", "is_superflex"}`. Consumers must branch on shape (e.g.
+`"starters" in roster_settings`), never assume one.
 
 ```sql
 CREATE TABLE player_injury_status (
@@ -531,7 +567,7 @@ CREATE TABLE ingest_runs (
     week         SMALLINT,
     started_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
     finished_at  TIMESTAMPTZ,
-    status       TEXT NOT NULL,          -- running|success|failed|skipped_not_modified
+    status       TEXT NOT NULL,          -- running|success|failed|skipped_not_modified|skipped
     rows_written INTEGER,
     source_etag  TEXT,                   -- for If-None-Match / 304 handling
     source_mtime TIMESTAMPTZ,
@@ -541,6 +577,9 @@ CREATE TABLE ingest_runs (
 CREATE INDEX ingest_runs_source_idx ON ingest_runs (source, asset, started_at);
 -- DESC omitted — btree scans backward; keeps autogenerate drift-free.
 ```
+
+`status` vocabulary: `running` (row created, lifecycle in flight) · `success` (landed a new partition; `source_etag` becomes the watermark) · `skipped_not_modified` (304 against the watermark) · `skipped` (either a 404 on a `skip_on_404` seasonal asset — not published yet — or the day's partition already existed; `error` says which) · `failed` (any exception; `error` holds the repr). Only `success` rows advance the ETag watermark.
+
 
 ---
 
