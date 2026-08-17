@@ -22,6 +22,7 @@ from ffh.db.lock import advisory_lock
 from ffh.ingest import games as _games  # noqa: F401
 from ffh.ingest import nflverse as _nflverse  # noqa: F401
 from ffh.ingest import reference as _reference  # noqa: F401
+from ffh.ingest import sleeper_players as _sleeper_players  # noqa: F401
 from ffh.ingest.base import JOBS, STATUS_FAILED, get_job
 from ffh.ingest.reference import StadiumsJob, seed_generic_league, seed_nfl_teams
 from ffh.log import configure_logging
