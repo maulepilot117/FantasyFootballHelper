@@ -5,9 +5,10 @@ only valid for a request made with the same client configuration. That is why th
 exactly one client factory and every job goes through it.
 """
 
+import math
 import time
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import UTC, datetime
 from email.utils import parsedate_to_datetime
 
 import httpx
@@ -77,13 +78,37 @@ def make_client(timeout: float = 60.0) -> httpx.Client:
 
 
 def _retry_after_seconds(response: httpx.Response) -> float | None:
+    """Parse ``Retry-After`` (RFC 9110 §10.2.3): delay-seconds or an HTTP-date.
+
+    Returns a non-negative finite number of seconds, or ``None`` when the header is absent
+    or malformed (negative, NaN/inf, unparseable) — ``None`` means "fall back to backoff".
+    """
     raw = response.headers.get("retry-after")
     if raw is None:
         return None
+    raw = raw.strip()
     try:
-        return float(raw)
+        seconds = float(raw)
     except ValueError:
+        seconds = _http_date_delay(raw)
+        if seconds is None:
+            log.warning("ingest.http.bad_retry_after", value=raw)
+            return None
+    if not math.isfinite(seconds) or seconds < 0:
+        log.warning("ingest.http.bad_retry_after", value=raw)
         return None
+    return seconds
+
+
+def _http_date_delay(raw: str) -> float | None:
+    """Seconds from now until an HTTP-date; 0.0 if it is already past; None if unparseable."""
+    try:
+        when = parsedate_to_datetime(raw)
+    except (TypeError, ValueError, IndexError):
+        return None
+    if when.tzinfo is None:
+        when = when.replace(tzinfo=UTC)
+    return max(0.0, (when - datetime.now(UTC)).total_seconds())
 
 
 def _last_modified(response: httpx.Response) -> datetime | None:

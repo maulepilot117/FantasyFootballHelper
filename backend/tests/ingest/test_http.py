@@ -137,6 +137,57 @@ def test_retry_after_beyond_the_max_stops_retrying_instead_of_firing_early(monke
     assert slept == [] and route.call_count == 1
 
 
+@pytest.mark.parametrize("bad", ["-1", "NaN", "inf", "-inf", "soon", ""])
+@respx.mock
+def test_malformed_retry_after_falls_back_to_backoff_and_still_retries(monkeypatch, bad):
+    monkeypatch.setattr("ffh.ingest.http._RETRY_WAIT_CAP", 0.0)
+    slept: list[float] = []
+    monkeypatch.setattr("ffh.ingest.http._sleep", slept.append)
+    respx.get(URL).mock(
+        side_effect=[
+            httpx.Response(429, headers={"Retry-After": bad}),
+            httpx.Response(200, content=b"ok"),
+        ]
+    )
+    with make_client() as client:
+        assert isinstance(get_bytes(client, URL), Fetched)
+    assert slept == [0.0], "malformed directive must use the (capped) backoff, never crash sleep"
+
+
+@respx.mock
+def test_retry_after_http_date_is_honoured(monkeypatch):
+    from datetime import UTC, datetime, timedelta
+    from email.utils import format_datetime
+
+    slept: list[float] = []
+    monkeypatch.setattr("ffh.ingest.http._sleep", slept.append)
+    when = format_datetime(datetime.now(UTC) + timedelta(seconds=40), usegmt=True)
+    respx.get(URL).mock(
+        side_effect=[
+            httpx.Response(429, headers={"Retry-After": when}),
+            httpx.Response(200, content=b"ok"),
+        ]
+    )
+    with make_client() as client:
+        assert isinstance(get_bytes(client, URL), Fetched)
+    assert len(slept) == 1 and 30.0 < slept[0] <= 40.0
+
+
+@respx.mock
+def test_retry_after_http_date_in_the_past_retries_immediately(monkeypatch):
+    slept: list[float] = []
+    monkeypatch.setattr("ffh.ingest.http._sleep", slept.append)
+    respx.get(URL).mock(
+        side_effect=[
+            httpx.Response(429, headers={"Retry-After": "Wed, 21 Oct 2015 07:28:00 GMT"}),
+            httpx.Response(200, content=b"ok"),
+        ]
+    )
+    with make_client() as client:
+        assert isinstance(get_bytes(client, URL), Fetched)
+    assert slept == [0.0]
+
+
 @respx.mock
 def test_malformed_last_modified_yields_mtime_none():
     respx.get(URL).mock(

@@ -10,6 +10,8 @@ Postgres un-persisted; therefore persist implementations must be idempotent upse
 
 import uuid
 from abc import ABC, abstractmethod
+from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -45,11 +47,10 @@ __all__ = [
     "IngestValidationError",
     "NotFound",
     "NotModified",
-    "acquire_lock",
+    "advisory_lock",
     "get_job",
     "last_successful_etag",
     "register",
-    "release_lock",
     "try_lock",
 ]
 
@@ -135,14 +136,13 @@ class IngestJob(ABC):
 
         # Serialize the whole lifecycle per (source, asset, season). Without this, a stalled
         # run A (holding v1) can persist AFTER a faster run B landed v2 and recorded ETag v2,
-        # leaving Postgres on v1 while every later conditional GET 304s against v2. A
-        # session-level advisory lock survives the commits inside the lifecycle and is
-        # released in `finally` (or by Postgres when the connection dies).
-        acquire_lock(session, self.lock_key())
-        try:
+        # leaving Postgres on v1 while every later conditional GET 304s against v2.
+        #
+        # A session-level advisory lock belongs to one PHYSICAL connection, and an
+        # Engine-bound Session returns its connection to the pool on every commit(), so the
+        # lock is taken on a dedicated connection that is held open until `finally`.
+        with advisory_lock(session, self.lock_key()):
             return self._run_locked(session, lake_root)
-        finally:
-            release_lock(session, self.lock_key())
 
     def _run_locked(self, session: Session, lake_root: Path) -> IngestRunResult:
         cls = type(self)
@@ -263,28 +263,46 @@ def get_job(name: str) -> type[IngestJob]:
         raise KeyError(f"unknown ingest job {name!r}; known: {sorted(JOBS)}") from exc
 
 
-def acquire_lock(session: Session, key: str) -> None:
-    """Block until the session-level advisory lock for ``key`` is held by this connection.
+@contextmanager
+def advisory_lock(session: Session, key: str) -> Iterator[None]:
+    """Hold the Postgres session-level advisory lock for ``key`` on a DEDICATED connection.
 
-    ``hashtext`` maps the key to an int4; collisions across unrelated keys only cost
+    Session-level advisory locks are owned by a physical backend connection. A Session bound
+    to an Engine returns its connection to the pool on ``commit()``, so taking the lock
+    through the Session would let (a) the rest of the lifecycle run on another backend and
+    (b) another Session re-acquire the "same" lock on the recycled backend. Instead we check
+    out one connection from the Session's engine, lock on it, keep it open for the whole
+    block, and unlock on that same connection — asserting the unlock actually released it.
+
+    ``hashtext`` maps the key to an int4; a collision between unrelated keys only costs
     unnecessary serialization, never correctness.
     """
-    session.execute(text("SELECT pg_advisory_lock(hashtext(:key))"), {"key": key})
-    session.commit()
-
-
-def release_lock(session: Session, key: str) -> None:
-    """Release the session-level lock. Never raises: a dead connection drops it anyway."""
+    engine = session.get_bind().engine
+    conn = engine.connect()
     try:
-        session.execute(text("SELECT pg_advisory_unlock(hashtext(:key))"), {"key": key})
-        session.commit()
-    except Exception:  # pragma: no cover - only reachable with a broken connection
-        session.rollback()
-        log.warning("ingest.lock.release_failed", key=key)
+        conn.execute(text("SELECT pg_advisory_lock(hashtext(:key))"), {"key": key})
+        conn.commit()
+        log.debug("ingest.lock.acquired", key=key)
+        try:
+            yield
+        finally:
+            released = conn.execute(
+                text("SELECT pg_advisory_unlock(hashtext(:key))"), {"key": key}
+            ).scalar()
+            conn.commit()
+            if not released:  # pragma: no cover - would mean the lock was never ours
+                log.error("ingest.lock.release_returned_false", key=key)
+            else:
+                log.debug("ingest.lock.released", key=key)
+    finally:
+        conn.close()  # returns the connection to the pool; a dead connection drops the lock
 
 
 def try_lock(session: Session, key: str) -> bool:
-    """Non-blocking probe: True if this connection now holds the lock (caller must release)."""
+    """Non-blocking probe on the SESSION's current connection: True if it now holds the lock.
+
+    Test helper; production code uses ``advisory_lock``.
+    """
     return bool(session.scalar(text("SELECT pg_try_advisory_lock(hashtext(:key))"), {"key": key}))
 
 

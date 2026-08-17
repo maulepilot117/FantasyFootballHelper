@@ -265,6 +265,44 @@ def test_lock_is_released_even_when_the_run_fails(db_session, migrated_engine, t
         other.execute(text("SELECT pg_advisory_unlock(hashtext(:k))"), {"k": job.lock_key()})
 
 
+def test_lock_survives_commits_of_an_engine_bound_session(migrated_engine, tmp_path: Path):
+    """The production shape: Sessions bound to an Engine, which return their connection to
+    the pool on every commit(). The lock must (a) still be held while run() is inside
+    persist() — even though the Session has committed since acquiring it — as observed by a
+    *second Engine-bound Session*, and (b) be released cleanly afterwards."""
+    from sqlalchemy import delete
+    from sqlalchemy.orm import Session
+
+    from ffh.ingest.base import try_lock
+
+    class EngineBound(FakeJob):
+        name = "engine_bound_lock"
+        source = "fake_engine_lock"
+
+        def persist(self, session, df):
+            session.commit()  # force the Session to hand its connection back to the pool
+            with Session(migrated_engine) as other:
+                probes.append(try_lock(other, self.lock_key()))
+                other.rollback()
+
+    probes: list[bool] = []
+    key = EngineBound().lock_key()
+    with Session(migrated_engine) as session_a:
+        try:
+            result = EngineBound(script=[Fetched(content=b"x", etag=None, mtime=None)]).run(
+                session_a, tmp_path
+            )
+            assert result.status == "success"
+            assert probes == [False], "a second Engine-bound Session took the lock mid-run"
+            with Session(migrated_engine) as other:
+                assert try_lock(other, key), "lock not released after run()"
+                other.execute(text("SELECT pg_advisory_unlock(hashtext(:k))"), {"k": key})
+                other.commit()
+        finally:
+            session_a.execute(delete(IngestRun).where(IngestRun.source == "fake_engine_lock"))
+            session_a.commit()
+
+
 def test_lock_key_is_scoped_to_source_asset_and_season():
     class Seasonal(FakeJob):
         name = "seasonal_lock"
