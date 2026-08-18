@@ -52,6 +52,30 @@ def adapter(sleeper_mock):
 
 
 @pytest.fixture
+def adapter_factory(sleeper_mock):
+    """Builds a FRESH adapter (and client) per `load_league` call — `load_league`'s
+    documented lifetime contract, because it runs and closes its own event loop and an
+    httpx pool cannot be reused across loops. Every test that loads twice uses this.
+    respx would happily hide the violation, so the tests model the contract instead."""
+    clients: list[SleeperClient] = []
+
+    def make() -> SleeperAdapter:
+        client = SleeperClient(base_url=get_settings().sleeper_base_url)
+        clients.append(client)
+        return SleeperAdapter(client, my_user_id="USER_ME")
+
+    try:
+        yield make
+    finally:
+        asyncio.run(_aclose_all(clients))
+
+
+async def _aclose_all(clients: list[SleeperClient]) -> None:
+    for client in clients:
+        await client.aclose()
+
+
+@pytest.fixture
 def catalog_adapter(sleeper_mock):
     """Same, with the player blob wired in — the production shape, where a rostered id
     reaches the crosswalk with a name, a position, a team AND a gsis_id."""
@@ -128,9 +152,85 @@ def test_drafts_and_picks_land(seeded, adapter):
     assert all(p.picked_at is None for p in picks)  # Sleeper publishes no per-pick time
 
 
-def test_load_is_idempotent(seeded, adapter):
-    first = load_league(seeded, adapter, LEAGUE, season=2026, week=1)
-    second = load_league(seeded, adapter, LEAGUE, season=2026, week=1)
+def _picks_plus(sleeper_mock, sleeper_fixture, player_id: str) -> None:
+    """Serve the fixture draft with one EXTRA pick, of a player nobody rosters.
+
+    Routine after week-1 waiver churn: the pick is history, the player is gone from every
+    roster. `draft_picks.player_id` still has to point somewhere, so the id must reach the
+    crosswalk even though no roster mentions it.
+    """
+    picks = sleeper_fixture("draft_picks")
+    extra = dict(picks[-1])
+    extra |= {"pick_no": 5, "round": 3, "draft_slot": 1, "player_id": player_id}
+    extra["metadata"] = dict(extra["metadata"]) | {"player_id": player_id, "amount": "0"}
+    sleeper_mock.get(f"/draft/{DRAFT}/picks").mock(
+        return_value=httpx.Response(200, json=[*picks, extra])
+    )
+
+
+def test_a_drafted_but_no_longer_rostered_player_still_reaches_the_crosswalk(
+    seeded, sleeper_mock, sleeper_fixture, adapter
+):
+    """Pick ids are unioned into the crosswalk batch, so a drafted-and-dropped player
+    still resolves — rather than landing as a NULL player_id nobody ever hears about."""
+    _picks_plus(sleeper_mock, sleeper_fixture, "90")  # a free agent: drafted, since dropped
+    report = load_league(seeded, adapter, LEAGUE, season=2026, week=1)
+    assert report.picks == 5
+    assert report.unmatched == [] and report.pending_review == []
+    # He is not on a roster, so the week's snapshot is unchanged...
+    assert report.rostered == 23
+    assert seeded.scalar(select(func.count()).select_from(RosterSlot)) == 23
+    # ...but his pick is fully resolved.
+    pick = seeded.scalars(select(DraftPick).where(DraftPick.pick_no == 5)).one()
+    assert pick.player_id is not None
+
+
+def test_a_drafted_player_the_crosswalk_cannot_resolve_is_reported_not_dropped(
+    seeded, sleeper_mock, sleeper_fixture, adapter
+):
+    """The Global Constraint, applied to picks: an unresolvable drafted id lands in the
+    report AND in crosswalk_unmatched, instead of vanishing behind a NULL FK."""
+    _picks_plus(sleeper_mock, sleeper_fixture, "9999")  # nobody the registry has ever seen
+    report = load_league(seeded, adapter, LEAGUE, season=2026, week=1)
+    assert [u.external_id for u in report.unmatched] == ["9999"]
+    assert report.rostered == 23  # the rostered snapshot is untouched
+    assert (
+        seeded.scalar(
+            select(func.count())
+            .select_from(CrosswalkUnmatched)
+            .where(CrosswalkUnmatched.source == "sleeper", CrosswalkUnmatched.external_id == "9999")
+        )
+        == 1
+    )
+    pick = seeded.scalars(select(DraftPick).where(DraftPick.pick_no == 5)).one()
+    assert pick.player_id is None  # reported, then left NULL — never silently dropped
+
+
+def test_duplicate_pick_numbers_abort_before_any_write(
+    db_session, sleeper_mock, sleeper_fixture, adapter
+):
+    """draft_picks is keyed (draft_id, pick_no): two picks sharing one would ON CONFLICT
+    onto each other. Caught before the first write, like the same-league invariant."""
+    picks = sleeper_fixture("draft_picks")
+    sleeper_mock.get(f"/draft/{DRAFT}/picks").mock(
+        return_value=httpx.Response(200, json=[*picks, dict(picks[0])])
+    )
+    with pytest.raises(PlatformError, match="pick numbers"):
+        load_league(db_session, adapter, LEAGUE, season=2026, week=1)
+    assert db_session.scalar(select(func.count()).select_from(League)) == 0
+
+
+def test_fetch_snapshot_describes_rostered_and_drafted_ids(sleeper_mock, sleeper_fixture, adapter):
+    _picks_plus(sleeper_mock, sleeper_fixture, "9999")
+    snapshot = asyncio.run(fetch_snapshot(adapter, LEAGUE, week=1))
+    rostered = {e.player_external_id for r in snapshot.rosters for e in r.players}
+    assert "9999" not in rostered
+    assert set(snapshot.player_refs) == rostered | {"9999"}
+
+
+def test_load_is_idempotent(seeded, adapter_factory):
+    first = load_league(seeded, adapter_factory(), LEAGUE, season=2026, week=1)
+    second = load_league(seeded, adapter_factory(), LEAGUE, season=2026, week=1)
     assert first.league_id == second.league_id
     assert seeded.scalar(select(func.count()).select_from(League)) == 1
     assert seeded.scalar(select(func.count()).select_from(LeagueTeam)) == 2
@@ -140,22 +240,22 @@ def test_load_is_idempotent(seeded, adapter):
 
 
 def test_reruns_replace_the_week_snapshot_rather_than_accumulating(
-    seeded, sleeper_mock, sleeper_fixture, adapter
+    seeded, sleeper_mock, sleeper_fixture, adapter_factory
 ):
-    load_league(seeded, adapter, LEAGUE, season=2026, week=1)
+    load_league(seeded, adapter_factory(), LEAGUE, season=2026, week=1)
     rosters = sleeper_fixture("rosters")
     rosters[0]["players"] = [p for p in rosters[0]["players"] if p != "10"]  # dropped a bench guy
     sleeper_mock.get(f"/league/{LEAGUE}/rosters").mock(
         return_value=httpx.Response(200, json=rosters)
     )
-    report = load_league(seeded, adapter, LEAGUE, season=2026, week=1)
+    report = load_league(seeded, adapter_factory(), LEAGUE, season=2026, week=1)
     assert report.rostered == 22
     assert seeded.scalar(select(func.count()).select_from(RosterSlot)) == 22
 
 
-def test_a_different_week_keeps_the_earlier_snapshot(seeded, adapter):
-    load_league(seeded, adapter, LEAGUE, season=2026, week=1)
-    load_league(seeded, adapter, LEAGUE, season=2026, week=2)
+def test_a_different_week_keeps_the_earlier_snapshot(seeded, adapter_factory):
+    load_league(seeded, adapter_factory(), LEAGUE, season=2026, week=1)
+    load_league(seeded, adapter_factory(), LEAGUE, season=2026, week=2)
     assert seeded.scalar(select(func.count()).select_from(RosterSlot)) == 46
     assert set(seeded.scalars(select(RosterSlot.week))) == {1, 2}
 

@@ -6,7 +6,8 @@ in ARCHITECTURE.md by this PR.
 
 SYNCHRONOUS by design: it takes an orm.Session, matching the sync engine, the db_session
 test fixture, and the crosswalk's resolve_many. The async adapter boundary is crossed
-exactly once, in load_league.
+exactly once, in load_league — which therefore owns an event loop for the length of one
+call and requires a per-call adapter (see its docstring's lifetime contract).
 """
 
 from __future__ import annotations
@@ -50,6 +51,11 @@ class _WeekAware(Protocol):
 @runtime_checkable
 class _RefAware(Protocol):
     async def get_player_refs(self, external_ids: set[str]) -> dict[str, PlayerRef]: ...
+
+
+@runtime_checkable
+class _DraftListing(Protocol):
+    async def get_league_drafts(self, league_id: str) -> list[Draft]: ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -104,12 +110,24 @@ async def fetch_snapshot(
     drafts = await _league_drafts(adapter, external_id)
     picks = {d.external_id: await adapter.get_draft_picks(d.external_id) for d in drafts}
     rostered_ids = {e.player_external_id for r in rosters for e in r.players}
+    # A drafted player who has since been dropped is NOT on any roster, and `draft_picks`
+    # has its own `player_id` FK. Describing only the rostered ids left every such pick
+    # with a NULL player_id, no crosswalk_unmatched row and no report bucket — a silent
+    # drop, in the one module the Global Constraints name. The crosswalk batch is
+    # therefore rosters UNION picks; `get_player_refs` takes arbitrary ids.
+    drafted_ids = {
+        pick.player_external_id
+        for draft_picks in picks.values()
+        for pick in draft_picks
+        if pick.player_external_id
+    }
+    wanted_ids = rostered_ids | drafted_ids
     if not isinstance(adapter, _RefAware):
         raise ValueError(f"{type(adapter).__name__} cannot describe players for the crosswalk")
-    player_refs = await adapter.get_player_refs(rostered_ids)
-    if set(player_refs) != rostered_ids:
+    player_refs = await adapter.get_player_refs(wanted_ids)
+    if set(player_refs) != wanted_ids:
         raise PlatformError(
-            f"player refs cover {len(player_refs)} of {len(rostered_ids)} rostered ids"
+            f"player refs cover {len(player_refs)} of {len(wanted_ids)} rostered/drafted ids"
         )
     log.info(
         "platform_sync.fetch_snapshot",
@@ -118,6 +136,7 @@ async def fetch_snapshot(
         week=week,
         teams=len(teams),
         rostered=len(rostered_ids),
+        drafted_not_rostered=len(drafted_ids - rostered_ids),
         drafts=len(drafts),
         picks=sum(len(v) for v in picks.values()),
     )
@@ -134,10 +153,16 @@ async def fetch_snapshot(
 
 async def _league_drafts(adapter: FantasyPlatformAdapter, external_id: str) -> list[Draft]:
     """The Protocol exposes get_draft(draft_id), not "the league's drafts"."""
-    lister = getattr(adapter, "get_league_drafts", None)
-    if lister is not None:
-        return list(await lister(external_id))
-    return []
+    if not isinstance(adapter, _DraftListing):
+        # Not an error — ESPN lands in Phase 2 — but `drafts=0` must never look like
+        # "this league has no draft" when it really means "this adapter cannot say".
+        log.warning(
+            "platform_sync.no_draft_listing",
+            adapter=type(adapter).__name__,
+            league=external_id,
+        )
+        return []
+    return list(await adapter.get_league_drafts(external_id))
 
 
 def _validate_snapshot(snapshot: LeagueSnapshot) -> None:
@@ -160,8 +185,25 @@ def _validate_snapshot(snapshot: LeagueSnapshot) -> None:
                 f"roster names team {roster.team_external_id!r}, which is "
                 f"not a team of league {snapshot.league.external_id}"
             )
+    listed = {d.external_id for d in snapshot.drafts}
+    orphaned = set(snapshot.picks) - listed
+    if orphaned:
+        raise PlatformError(
+            f"league {snapshot.league.external_id}: picks for unlisted draft(s) "
+            f"{sorted(orphaned)} would never be persisted"
+        )
     for draft in snapshot.drafts:
-        for pick in snapshot.picks.get(draft.external_id, []):
+        draft_picks = snapshot.picks.get(draft.external_id, [])
+        # `draft_picks` is keyed (draft_id, pick_no): two picks sharing a pick_no would
+        # ON CONFLICT onto each other and one would vanish. Counting rows after the fact
+        # cannot see that — the loop counted both — so it is a pre-write check.
+        numbers = [p.pick_no for p in draft_picks]
+        if len(set(numbers)) != len(numbers):
+            raise PlatformError(
+                f"draft {draft.external_id}: {len(numbers)} picks share "
+                f"{len(set(numbers))} pick numbers"
+            )
+        for pick in draft_picks:
             # Same-league invariant: DATABASE.md §5 leaves this to us, with a test.
             if pick.team_external_id is not None and pick.team_external_id not in known:
                 raise PlatformError(
@@ -331,7 +373,10 @@ def _set_my_team(
     """`leagues.my_team_id` carries a composite FK onto (league_id, league_team_id), so it
     can only be set once this league's teams exist."""
     mine = [t for t in teams if t.is_me]
-    row = session.get(LeagueRow, league_id)
+    # populate_existing: the upsert above went through Core, so an instance already in
+    # the identity map (a previous load in this same transaction) would otherwise be
+    # returned with its pre-upsert column values.
+    row = session.get(LeagueRow, league_id, populate_existing=True)
     if row is None:  # pragma: no cover — the upsert above returned this id
         raise PlatformError(f"league {league_id} vanished mid-load")
     row.my_team_id = team_ids[mine[0].external_id] if mine else None
@@ -422,9 +467,9 @@ def _upsert_drafts(
             )
             session.execute(pstmt)
             picks += 1
-    expected_picks = sum(len(v) for v in snapshot.picks.values())
-    if picks != expected_picks:
-        raise PlatformError(f"persisted {picks} of {expected_picks} draft picks")
+    # No post-write count guard: `_validate_snapshot` already proved every picks key
+    # belongs to a listed draft and that pick numbers are unique per draft, so one row
+    # per pick is landed. A guard here could only raise AFTER the writes it guards.
     return drafts, picks
 
 
@@ -435,7 +480,21 @@ def load_league(
     season: int,
     week: int | None = None,
 ) -> LeagueLoadReport:
-    """Fetch a league and land it in Postgres. The caller commits."""
+    """Fetch a league and land it in Postgres. The caller commits.
+
+    **Adapter lifetime contract — one adapter per call.** This function runs its own
+    event loop (`asyncio.run`), which is closed before it returns. An
+    `httpx.AsyncClient` keep-alive connection belongs to the loop that opened it, so an
+    adapter whose client outlives this call and is passed to a second `load_league` is
+    driving a pool across two dead-and-reborn loops. Tests cannot catch it — respx
+    replaces the transport — so it is a contract, not an assertion: **build the client
+    (and the adapter) inside each invocation and close it after.** Task 8's CLI does
+    exactly that, and `tests/ingest/test_platform_sync.py::adapter_factory` models it.
+
+    Already inside your own event loop, or holding a long-lived client on purpose? Do
+    not call this: `await fetch_snapshot(...)` and then call `persist_snapshot(...)`.
+    Calling `load_league` from a running loop raises rather than nesting.
+    """
     try:
         asyncio.get_running_loop()
     except RuntimeError:
