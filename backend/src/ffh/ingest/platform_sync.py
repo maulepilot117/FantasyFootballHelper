@@ -16,7 +16,6 @@ import asyncio
 import uuid
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from typing import Protocol, runtime_checkable
 
 import structlog
 from sqlalchemy import delete
@@ -25,13 +24,17 @@ from sqlalchemy.orm import Session
 
 from ffh.adapters.base import (
     Draft,
+    DraftListing,
     DraftPick,
     FantasyPlatformAdapter,
+    IdentityAware,
     League,
     LeagueTeam,
     PlatformError,
     PlayerRef,
+    RefAware,
     Roster,
+    WeekAware,
 )
 from ffh.crosswalk.resolve import ResolveInput, resolve_many
 from ffh.db.models import Draft as DraftRow
@@ -41,21 +44,6 @@ from ffh.db.models import LeagueTeam as LeagueTeamRow
 from ffh.db.models import RosterSlot as RosterSlotRow
 
 log = structlog.get_logger(__name__)
-
-
-@runtime_checkable
-class _WeekAware(Protocol):
-    async def current_week(self) -> int: ...
-
-
-@runtime_checkable
-class _RefAware(Protocol):
-    async def get_player_refs(self, external_ids: set[str]) -> dict[str, PlayerRef]: ...
-
-
-@runtime_checkable
-class _DraftListing(Protocol):
-    async def get_league_drafts(self, league_id: str) -> list[Draft]: ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -96,6 +84,11 @@ class LeagueSnapshot:
     week: int
     # external_id -> name/position/team/gsis_id, for crosswalk resolution.
     player_refs: dict[str, PlayerRef]
+    #: Did the adapter have an identity to match teams against AT ALL (base.IdentityAware)?
+    #: False means every `LeagueTeam.is_me=False` in this snapshot means "unknown", NOT
+    #: "the platform says none of these is yours" — so `persist_snapshot` must not treat
+    #: it as the second and erase `leagues.my_team_id` / `league_teams.is_me`.
+    identifies_me: bool
 
 
 async def fetch_snapshot(
@@ -103,7 +96,7 @@ async def fetch_snapshot(
 ) -> LeagueSnapshot:
     """Every network call for one league load. No DB access."""
     if week is None:
-        if not isinstance(adapter, _WeekAware):
+        if not isinstance(adapter, WeekAware):
             raise ValueError(
                 f"{type(adapter).__name__} cannot resolve the current week; pass week="
             )
@@ -128,7 +121,7 @@ async def fetch_snapshot(
         if pick.player_external_id
     }
     wanted_ids = rostered_ids | drafted_ids
-    if not isinstance(adapter, _RefAware):
+    if not isinstance(adapter, RefAware):
         raise ValueError(f"{type(adapter).__name__} cannot describe players for the crosswalk")
     player_refs = await adapter.get_player_refs(wanted_ids)
     if set(player_refs) != wanted_ids:
@@ -146,6 +139,16 @@ async def fetch_snapshot(
         drafts=len(drafts),
         picks=sum(len(v) for v in picks.values()),
     )
+    # An adapter that cannot even be ASKED counts as "could not identify anyone": the
+    # conservative answer, because it only ever costs us leaving a stored pointer alone.
+    identifies_me = isinstance(adapter, IdentityAware) and adapter.identifies_me()
+    if not identifies_me:
+        log.warning(
+            "platform_sync.no_identity",
+            adapter=type(adapter).__name__,
+            league=external_id,
+            detail="no team can be marked as mine; the stored my_team_id is left as it is",
+        )
     return LeagueSnapshot(
         league=league,
         teams=teams,
@@ -154,12 +157,13 @@ async def fetch_snapshot(
         picks=picks,
         week=week,
         player_refs=player_refs,
+        identifies_me=identifies_me,
     )
 
 
 async def _league_drafts(adapter: FantasyPlatformAdapter, external_id: str) -> list[Draft]:
     """The Protocol exposes get_draft(draft_id), not "the league's drafts"."""
-    if not isinstance(adapter, _DraftListing):
+    if not isinstance(adapter, DraftListing):
         # Not an error — ESPN lands in Phase 2 — but `drafts=0` must never look like
         # "this league has no draft" when it really means "this adapter cannot say".
         log.warning(
@@ -289,8 +293,8 @@ def persist_snapshot(session: Session, snapshot: LeagueSnapshot) -> LeagueLoadRe
     """All DB writes for one league load. No network. One transaction (caller commits)."""
     _validate_snapshot(snapshot)
     league_id = _upsert_league(session, snapshot.league)
-    team_ids = _upsert_teams(session, league_id, snapshot.teams)
-    _set_my_team(session, league_id, snapshot.teams, team_ids)
+    team_ids = _upsert_teams(session, league_id, snapshot.teams, snapshot.identifies_me)
+    _set_my_team(session, league_id, snapshot.teams, team_ids, snapshot.identifies_me)
 
     resolved, unmatched, pending_review = _resolve_refs(
         session, snapshot.league.platform, snapshot.player_refs
@@ -354,8 +358,17 @@ def _upsert_league(session: Session, league: League) -> uuid.UUID:
 
 
 def _upsert_teams(
-    session: Session, league_id: uuid.UUID, teams: list[LeagueTeam]
+    session: Session,
+    league_id: uuid.UUID,
+    teams: list[LeagueTeam],
+    identifies_me: bool,
 ) -> dict[str, uuid.UUID]:
+    """`identifies_me=False` means the adapter had no identity to match against, so every
+    incoming `is_me` is False by ignorance rather than by observation. `is_me` is then
+    frozen on conflict: a re-run without the env var must not clear the flag a run WITH it
+    set. New rows still insert False — there is nothing to preserve on a row that is new.
+    """
+    frozen_on_conflict = () if identifies_me else ("is_me",)
     out: dict[str, uuid.UUID] = {}
     for team in teams:
         values = {
@@ -372,7 +385,9 @@ def _upsert_teams(
         stmt = insert(LeagueTeamRow).values(**values)
         stmt = stmt.on_conflict_do_update(
             index_elements=list(keys),
-            set_={k: stmt.excluded[k] for k in values if k not in keys},
+            set_={
+                k: stmt.excluded[k] for k in values if k not in keys and k not in frozen_on_conflict
+            },
         ).returning(LeagueTeamRow.league_team_id)
         out[team.external_id] = session.execute(stmt).scalar_one()
     if len(out) != len(teams):
@@ -385,9 +400,19 @@ def _set_my_team(
     league_id: uuid.UUID,
     teams: list[LeagueTeam],
     team_ids: dict[str, uuid.UUID],
+    identifies_me: bool,
 ) -> None:
     """`leagues.my_team_id` carries a composite FK onto (league_id, league_team_id), so it
-    can only be set once this league's teams exist."""
+    can only be set once this league's teams exist.
+
+    UNKNOWN is not NOBODY. When the adapter could not identify anyone at all
+    (`identifies_me=False` — for Sleeper, `FFH_SLEEPER_USER_ID` unset), no team being
+    flagged is the absence of LOCAL CONFIG, not the platform saying the operator owns no
+    team here. Writing NULL then would silently erase the pointer the draft and lineup
+    modules read, on the first cron run that happens to miss the env var. So the stored
+    value is left exactly as it is, and only a run that COULD identify writes the column —
+    including writing NULL, which then really does mean "none of these teams is yours".
+    """
     mine = [t for t in teams if t.is_me]
     # populate_existing: the upsert above went through Core, so an instance already in
     # the identity map (a previous load in this same transaction) would otherwise be
@@ -395,7 +420,12 @@ def _set_my_team(
     row = session.get(LeagueRow, league_id, populate_existing=True)
     if row is None:  # pragma: no cover — the upsert above returned this id
         raise PlatformError(f"league {league_id} vanished mid-load")
-    row.my_team_id = team_ids[mine[0].external_id] if mine else None
+    if mine:
+        # An adapter that flagged a team HAS identified someone, whatever it answered to
+        # `identifies_me()`; honour the observation over the self-report.
+        row.my_team_id = team_ids[mine[0].external_id]
+    elif identifies_me:
+        row.my_team_id = None
 
 
 def _replace_roster_slots(
@@ -504,8 +534,11 @@ def load_league(
     adapter whose client outlives this call and is passed to a second `load_league` is
     driving a pool across two dead-and-reborn loops. Tests cannot catch it — respx
     replaces the transport — so it is a contract, not an assertion: **build the client
-    (and the adapter) inside each invocation and close it after.** Task 8's CLI does
-    exactly that, and `tests/ingest/test_platform_sync.py::adapter_factory` models it.
+    (and the adapter) inside each invocation, and close the client INSIDE the loop that
+    opened its pool.** A close from a second `asyncio.run` is the same bug wearing a
+    cleanup hat: `httpcore`'s pool close awaits per-connection closes bound to the dead
+    loop. `ffh.cli._fetch_snapshot_and_close` closes in the fetch loop's `finally`, and
+    `tests/ingest/test_platform_sync.py::adapter_factory` models the per-call build.
 
     Already inside your own event loop, or holding a long-lived client on purpose? Do
     not call this: `await fetch_snapshot(...)` and then call `persist_snapshot(...)`.

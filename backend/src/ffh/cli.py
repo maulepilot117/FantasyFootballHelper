@@ -14,7 +14,7 @@ from ffh import __version__
 from ffh.adapters.sleeper.adapter import SleeperAdapter
 from ffh.adapters.sleeper.catalog import LakePlayerCatalog
 from ffh.adapters.sleeper.client import SleeperClient
-from ffh.config import get_settings
+from ffh.config import Settings, get_settings
 
 # Importing the job modules registers every @register-decorated class in ffh.ingest.base.JOBS.
 # isort orders these by module path, so the one crosswalk-owned job sits above ffh.db here
@@ -28,7 +28,7 @@ from ffh.ingest import nflverse as _nflverse  # noqa: F401
 from ffh.ingest import reference as _reference  # noqa: F401
 from ffh.ingest import sleeper_players as _sleeper_players  # noqa: F401
 from ffh.ingest.base import JOBS, STATUS_FAILED, get_job
-from ffh.ingest.platform_sync import load_league
+from ffh.ingest.platform_sync import LeagueSnapshot, fetch_snapshot, persist_snapshot
 from ffh.ingest.reference import StadiumsJob, seed_generic_league, seed_nfl_teams
 from ffh.log import configure_logging
 
@@ -41,14 +41,22 @@ EXIT_GATE_RED = 1
 EXIT_CONFLICT = 2
 EXIT_OPERATIONAL = 3
 
-#: Every crosswalk command that WRITES serializes on this Postgres advisory lock — `seed`,
-#: `verify`, `map` and `resolve-unmatched`. All four read `player_external_ids`, decide who
-#: owns a `(source, player_id)` slot (or whether one exists at all), then write —
-#: `apply_playerids` does it for ~12.5k rows at a time. Those plans are TOCTOU: two
-#: concurrent `ffh crosswalk seed` runs (a cron overlapping a manual re-run) can both pass
-#: the same pre-check and race into the unique index, or worse, both mint a placeholder
-#: `players` row for the same rookie. The ingest framework already serializes its lifecycle
-#: this way; the crosswalk — the highest-risk component in the system — was not.
+#: Every command that WRITES the crosswalk serializes on this Postgres advisory lock.
+#: FIVE of them, not four: `crosswalk seed`, `crosswalk verify`, `crosswalk map`,
+#: `crosswalk resolve-unmatched` — and `league load`, whose `persist_snapshot` reaches
+#: ④'s `resolve_many` -> `_persist`, the same read-then-write plan as the rest (it
+#: pre-checks the unique `(source, player_id)` index via `_slot_holder`, decides
+#: displacement, then writes). `league load` is not named `crosswalk`, which is exactly why
+#: it was the one writer left outside the lock; a cron `ffh crosswalk seed` overlapping an
+#: `ffh league load` could race into that index.
+#:
+#: All five read `player_external_ids`, decide who owns a `(source, player_id)` slot (or
+#: whether one exists at all), then write — `apply_playerids` does it for ~12.5k rows at a
+#: time. Those plans are TOCTOU: two concurrent writers (a cron overlapping a manual
+#: re-run) can both pass the same pre-check and race into the unique index, or worse, both
+#: mint a placeholder `players` row for the same rookie. The ingest framework already
+#: serializes its lifecycle this way; the crosswalk — the highest-risk component in the
+#: system — was not.
 CROSSWALK_LOCK_KEY = "ffh.crosswalk/apply"
 
 #: The crosswalk `source` vocabulary, built ONCE from the DynastyProcess column map that
@@ -160,6 +168,51 @@ def ingest_seed() -> None:
         raise typer.Exit(1)
 
 
+async def _fetch_snapshot_and_close(
+    client: SleeperClient,
+    settings: Settings,
+    league_id: str,
+    week: int | None,
+) -> LeagueSnapshot:
+    """Every network call for one `ffh league load`, INCLUDING the client's close.
+
+    The close belongs in here, not in the caller's `finally`. An `httpx.AsyncClient`
+    keep-alive pool is owned by the loop that opened it; `httpcore`'s pool close awaits
+    per-connection closes wrapping anyio streams bound to that loop. Closing from a
+    SECOND `asyncio.run` — after the first one's loop is already closed — therefore fails
+    with "Event loop is closed" on every real invocation and leaks the sockets to GC. The
+    only loop that can close this pool is the one that opened it, which is this one.
+
+    Resolving `FFH_SLEEPER_USERNAME` happens here for the same reason: it is a network
+    call (GET /user/{username}), so it belongs inside the one loop.
+    """
+    try:
+        my_user_id = settings.sleeper_user_id
+        if my_user_id is None and settings.sleeper_username:
+            # user_id wins; the username is only ever a way to find it. Every roster's
+            # `owner_id` / `co_owners` carries the id, never the username. An unknown
+            # username raises PlatformNotFound -> exit 3, rather than silently loading a
+            # league with nobody marked as mine.
+            my_user_id = (await client.get_user(settings.sleeper_username)).user_id
+        adapter = SleeperAdapter(
+            client,
+            my_user_id=my_user_id,
+            # The catalog is ALWAYS attached: with no lake partition it raises with the
+            # `ffh ingest run sleeper_players` remedy rather than quietly degrading to
+            # id-only refs, which would push every human down the crosswalk ladder into
+            # fuzzy matching.
+            catalog=LakePlayerCatalog(settings.lake_root),
+        )
+        return await fetch_snapshot(adapter, league_id, week)
+    finally:
+        try:
+            await client.aclose()
+        except Exception as close_exc:  # deliberately broad: see below
+            # A raise in a `finally` REPLACES the exception on its way out: a failed close
+            # would swallow the operational error that caused it.
+            typer.echo(f"warning: closing the Sleeper client failed: {close_exc}", err=True)
+
+
 # Placeholder commands so `--help` works on empty groups; later PRs replace these.
 @league_app.command("platforms")
 def league_platforms() -> None:
@@ -191,6 +244,12 @@ def league_load(
     failure: a wrapper reading 1 would file a crosswalk gap for a run that never happened.
 
     Exit 2 = usage error (unknown platform, missing argument), Click's own code.
+
+    This command is the FIFTH crosswalk writer (see `CROSSWALK_LOCK_KEY`): the persist
+    half runs under the crosswalk advisory lock, so an overlapping `ffh crosswalk seed`
+    cannot race it into the `(source, player_id)` unique index. The lock is a BLOCKING
+    acquire — a concurrent writer makes this command wait, never fail — so no new exit
+    code appears here; only the fetch half, which touches no database, runs unlocked.
     """
     from polars.exceptions import PolarsError
     from sqlalchemy.exc import SQLAlchemyError
@@ -202,54 +261,53 @@ def league_load(
             f"platform {platform!r} is not implemented; only 'sleeper' is available",
             param_hint="PLATFORM",
         )
-    client: SleeperClient | None = None
     try:
         # Everything that can fail on the way in is inside the guarded region, so it exits
         # 3 rather than escaping to Click and exiting 1 — including get_settings(), whose
         # pydantic ValidationError on a bad FFH_* env var is a ValueError.
         settings = get_settings()
-        # Built HERE, per invocation, and closed in the `finally`: `load_league` runs and
-        # closes its own event loop (its "adapter lifetime contract"), and an
-        # httpx.AsyncClient keep-alive connection belongs to the loop that opened it. A
-        # module-level client would hand the second invocation a pool bound to a dead loop.
-        client = SleeperClient()
-        # The catalog is ALWAYS attached: with no lake partition it raises with the
-        # `ffh ingest run sleeper_players` remedy rather than quietly degrading to id-only
-        # refs, which would push every human down the crosswalk ladder into fuzzy matching.
-        adapter = SleeperAdapter(
-            client,
-            my_user_id=settings.sleeper_user_id,
-            catalog=LakePlayerCatalog(settings.lake_root),
-        )
-        # ③'s _session_scope() (above) — one sync Session per invocation; it does not commit.
-        with _session_scope() as session:
-            # `if season is None`, not `season or ...`: --season 0 is nonsense, but a
-            # falsy-default fallback would silently load a different season instead.
-            report = load_league(
-                session, adapter, league_id, settings.season if season is None else season, week
+        if settings.sleeper_user_id is None and not settings.sleeper_username:
+            # LOUD, because the failure it warns about is silent: with no identity the
+            # adapter cannot mark any team as mine, and `leagues.my_team_id` /
+            # `league_teams.is_me` are left exactly as they are (never cleared — see
+            # platform_sync._set_my_team). A first run with the variable set followed by a
+            # cron run without it therefore keeps the pointer instead of erasing it.
+            typer.echo(
+                "warning: neither FFH_SLEEPER_USER_ID nor FFH_SLEEPER_USERNAME is set — "
+                "no team can be marked as mine; leagues.my_team_id and league_teams.is_me "
+                "are left unchanged. Set FFH_SLEEPER_USER_ID in backend/.env.",
+                err=True,
             )
+        # Built HERE, per invocation, and closed inside the very loop that opens its
+        # connection pool (its "adapter lifetime contract"): an httpx.AsyncClient keep-alive
+        # connection belongs to the loop that opened it, so neither a module-level client
+        # nor a close from a second `asyncio.run` is sound.
+        snapshot = asyncio.run(
+            _fetch_snapshot_and_close(SleeperClient(), settings, league_id, week)
+        )
+        # `if season is None`, not `season or ...`: --season 0 is nonsense, but a
+        # falsy-default fallback would silently load a different season instead. Checked
+        # here, before the lock: `load_league` used to own this and nothing else does.
+        wanted = settings.season if season is None else season
+        if snapshot.league.season != wanted:
+            raise ValueError(
+                f"league {league_id} is season {snapshot.league.season}, asked for {wanted}"
+            )
+        # ③'s _session_scope() (above) — one sync Session per invocation; it does not commit.
+        with _session_scope() as session, advisory_lock(session, CROSSWALK_LOCK_KEY):
+            report = persist_snapshot(session, snapshot)
             # Committed even when the report is red: ④'s resolve_many has already written
             # this run's `crosswalk_unmatched` entries, and rolling them back would empty
             # the review queue the exit code is telling the operator to work through.
             session.commit()
     # PolarsError belongs here for the same reason it is in `crosswalk_seed`: the catalog
-    # reads the players partition with `pl.read_parquet` INSIDE load_league, and a
-    # truncated or corrupt partition raises a PolarsError, which is none of the others.
-    # Uncaught it reaches Click, which exits 1 — "the crosswalk has a gap" for a run that
-    # never happened, the one confusion these codes exist to prevent.
+    # reads the players partition with `pl.read_parquet` inside the fetch, and a truncated
+    # or corrupt partition raises a PolarsError, which is none of the others. Uncaught it
+    # reaches Click, which exits 1 — "the crosswalk has a gap" for a run that never
+    # happened, the one confusion these codes exist to prevent.
     except (PlatformError, SQLAlchemyError, OSError, PolarsError, ValueError) as exc:
         typer.echo(f"league load failed: {type(exc).__name__}: {exc}", err=True)
         raise typer.Exit(code=EXIT_OPERATIONAL) from exc
-    finally:
-        if client is not None:
-            try:
-                # One more short-lived loop; the pool the fetch opened is released here.
-                asyncio.run(client.aclose())
-            except Exception as close_exc:  # deliberately broad: see below
-                # A raise in a `finally` REPLACES the exception on its way out: a failed
-                # close would swallow the operational error (and its exit code), or the
-                # typer.Exit carrying the report's verdict.
-                typer.echo(f"warning: closing the Sleeper client failed: {close_exc}", err=True)
 
     typer.echo(
         f"league {report.league_id} teams={report.teams} rostered={report.rostered} "

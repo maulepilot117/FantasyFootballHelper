@@ -220,9 +220,14 @@ disagrees with your priors, the record wins):
   a `commissioner` type alongside `free_agent` / `waiver` / `trade`.
 
 **Sleeper `DEF` → `DST` at the adapter boundary.** `roster_slots.slot` and the crosswalk
-both use `DST`. For a defense, `PlayerRef.name` is the **team abbreviation** (which is also
-its Sleeper `player_id`) because the blob has no `full_name` for defenses — that is the one
-form ④'s `normalize_dst` canonicalizes.
+both use `DST`. A defense has no `full_name` in the blob but **does** carry `first_name`
+(`"Kansas City"`) and `last_name` (`"Chiefs"`), so `PlayerRef.name` is
+`f"{first_name} {last_name}"`, falling back to the **team abbreviation** (which is also its
+Sleeper `player_id`) only when both parts are absent. `PlayerRef.team` stays the
+abbreviation. The abbreviation is *not* privileged for the crosswalk's sake: ④'s
+`normalize_dst` canonicalizes `KC`, `Kansas City`, `Chiefs` and `Kansas City Chiefs` alike
+to `kc dst`, and `canonical_dst_key` is **name-first** — so the real name costs the
+crosswalk nothing and is what an operator meets in the `crosswalk_unmatched` review queue.
 
 **Undocumented endpoints on `api.sleeper.com` (verified live, higher break risk, high value):**
 

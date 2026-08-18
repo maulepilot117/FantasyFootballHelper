@@ -34,6 +34,7 @@ from ffh.adapters.sleeper.models import (
     RawDraft,
     RawDraftPick,
     RawLeague,
+    RawLeagueSettings,
     RawMatchup,
     RawPlayer,
     RawRoster,
@@ -72,16 +73,39 @@ def _ms_to_dt(ms: int | None) -> datetime | None:
     return None if ms is None else datetime.fromtimestamp(ms / 1000, tz=UTC)
 
 
+def _faab_budget(league_id: str, settings: RawLeagueSettings) -> int | None:
+    """THE FAAB policy, for `get_league` and `get_teams` alike.
+
+    None means "not a FAAB league" (`waiver_type` 0/1 are priority-based and
+    `waiver_budget` is meaningless there). A FAAB league that publishes no budget raises:
+    the two callers must not disagree about the same payload, and `faab_remaining` is
+    computed as `budget - used`, so a guessed budget is a wrong number in every team row.
+    """
+    if settings.waiver_type != FAAB_WAIVER_TYPE:
+        return None
+    if settings.waiver_budget is None:
+        raise PlatformError(f"league {league_id}: FAAB league without settings.waiver_budget")
+    return settings.waiver_budget
+
+
 def player_ref(raw: RawPlayer) -> PlayerRef:
     """Normalize one blob entry.
 
-    Defenses have no full_name in the blob, and their Sleeper player_id IS the team
-    abbreviation — the one form the crosswalk's normalize_dst is guaranteed to canonicalize.
+    Defenses have no `full_name` in the blob, but they DO carry `first_name` ("Kansas
+    City") and `last_name` ("Chiefs"), and their Sleeper player_id is the team
+    abbreviation. The name is the real one, not the abbreviation: ④'s `normalize_dst`
+    canonicalizes "KC", "Kansas City", "Chiefs" and "Kansas City Chiefs" alike to
+    `kc dst` (and `canonical_dst_key` is name-first), so the abbreviation buys the
+    crosswalk nothing — while costing the operator, who otherwise meets an unmatched
+    defense in the review queue as a bare `raw_name="KC"`. `team` stays the abbreviation.
     """
     if raw.position == "DEF":
+        full = f"{raw.first_name or ''} {raw.last_name or ''}".strip()
         return PlayerRef(
             external_id=raw.player_id,
-            name=raw.player_id,
+            # Fallback to the id (== the abbreviation) only when the blob carries neither
+            # name part: normalize_dst canonicalizes that too, it is just less legible.
+            name=full or raw.player_id,
             position="DST",
             team=raw.team or raw.player_id,
             gsis_id=None,
@@ -148,6 +172,14 @@ class SleeperAdapter:
         self._catalog = catalog
 
     # --- helpers ---------------------------------------------------------------
+    def identifies_me(self) -> bool:
+        """base.IdentityAware: was this adapter given an identity to match against at all?
+
+        False means every `is_me=False` below is ignorance, not observation — see
+        `IdentityAware`'s docstring and `platform_sync._set_my_team`.
+        """
+        return self._my_user_id is not None
+
     def _is_mine(self, roster: RawRoster) -> bool:
         if self._my_user_id is None:
             return False
@@ -168,6 +200,12 @@ class SleeperAdapter:
                 f"settings.num_teams={settings.num_teams}"
             )
         roster_settings = to_roster_settings(raw)
+        # ONE FAAB policy, shared with get_teams: waiver_type 2 says this league runs on
+        # FAAB, so a null budget is Sleeper contradicting itself and we refuse to guess.
+        # This used to pass `faab_budget=None` here while `get_teams` raised on the very
+        # same payload — `leagues.faab_budget` would have read "not a FAAB league" for a
+        # league whose teams could not be loaded at all.
+        faab_budget = _faab_budget(league_id, settings)
         mine = [r for r in rosters if self._is_mine(r)]
         if len(mine) > 1:
             raise PlatformError(f"league {league_id}: {len(mine)} rosters match my_user_id")
@@ -184,9 +222,7 @@ class SleeperAdapter:
             is_superflex=roster_settings.is_superflex,
             playoff_teams=settings.playoff_teams,
             playoff_start_week=settings.playoff_week_start,
-            faab_budget=(
-                settings.waiver_budget if settings.waiver_type == FAAB_WAIVER_TYPE else None
-            ),
+            faab_budget=faab_budget,
             my_team_external_id=str(mine[0].roster_id) if mine else None,
         )
 
@@ -200,15 +236,11 @@ class SleeperAdapter:
         raw = await self._client.get_league(league_id)
         rosters = await self._client.get_rosters(league_id)
         users = {u.user_id: u for u in await self._client.get_users(league_id)}
-        is_faab = raw.settings.waiver_type == FAAB_WAIVER_TYPE
-        budget = raw.settings.waiver_budget if is_faab else None
-        if is_faab and budget is None:
-            raise PlatformError(f"league {league_id}: FAAB league without settings.waiver_budget")
+        budget = _faab_budget(league_id, raw.settings)
         slots = await self._draft_slots(raw)
-        teams = [self._team(r, users.get(r.owner_id or ""), budget, slots) for r in rosters]
-        if len(teams) != len(rosters):
-            raise PlatformError(f"league {league_id}: dropped a roster while mapping teams")
-        return teams
+        # No `len(teams) != len(rosters)` guard: the comprehension is over `rosters` and
+        # emits exactly one element per element, so it could never fire.
+        return [self._team(r, users.get(r.owner_id or ""), budget, slots) for r in rosters]
 
     def _team(
         self,
@@ -268,13 +300,16 @@ class SleeperAdapter:
     async def get_player_refs(self, external_ids: set[str]) -> dict[str, PlayerRef]:
         """Name/position/team/gsis for arbitrary Sleeper ids, for crosswalk resolution.
 
-        Uses the lake catalog when one is configured. Without it, a NON-NUMERIC Sleeper id
-        is a team defense — verified: the 32 DEF entries in /players/nfl are keyed by team
-        abbreviation ("KC", "SF", ...), and that abbreviation is the one form the
-        crosswalk's normalize_dst is guaranteed to canonicalize. Numeric ids fall back to
-        the id alone with a NULL position (never "", which would masquerade as a real
-        position); rung 1 — the DynastyProcess sleeper_id lookup, the primary rung for
-        Sleeper regardless — resolves those.
+        Uses the lake catalog when one is configured — and it always is under `ffh league
+        load`, so a defense reaches the crosswalk under its real name ("Kansas City
+        Chiefs"; see `player_ref`). Without a catalog, a NON-NUMERIC Sleeper id is a team
+        defense — verified: the 32 DEF entries in /players/nfl are keyed by team
+        abbreviation ("KC", "SF", ...) — and the abbreviation is all we have to name it
+        with. ④'s `normalize_dst` canonicalizes that form too, it is merely the less
+        legible one in an operator's review queue. Numeric ids fall back to the id alone
+        with a NULL position (never "", which would masquerade as a real position); rung 1
+        — the DynastyProcess sleeper_id lookup, the primary rung for Sleeper regardless —
+        resolves those.
         """
         catalog: dict[str, PlayerRef] = {}
         if self._catalog is not None:
@@ -450,10 +485,10 @@ class SleeperAdapter:
         reads it, so the mapping is identical.
         """
         raws = await self._client.get_league_drafts(league_id)
-        drafts = [self._draft(raw) for raw in raws]
-        if len(drafts) != len(raws):
-            raise PlatformError(f"league {league_id}: dropped drafts while mapping")
-        return drafts
+        # One Draft per raw row by construction — a count guard over the comprehension's
+        # own source can never fire. `_validate_snapshot` is what actually catches a league
+        # listing the same draft twice, before the first write.
+        return [self._draft(raw) for raw in raws]
 
     def _draft(self, raw: RawDraft) -> Draft:
         if raw.type not in DRAFT_TYPES:
@@ -476,10 +511,9 @@ class SleeperAdapter:
 
     async def get_draft_picks(self, draft_id: str) -> list[DraftPick]:
         raws = await self._client.get_draft_picks(draft_id)
-        picks = [self._pick(p) for p in raws]
-        if len(picks) != len(raws):
-            raise PlatformError(f"draft {draft_id}: dropped picks while mapping")
-        return picks
+        # Same as get_league_drafts: one pick per raw row by construction. Duplicate pick
+        # NUMBERS are the real hazard and are caught in `_validate_snapshot`, pre-write.
+        return [self._pick(p) for p in raws]
 
     def _pick(self, raw: RawDraftPick) -> DraftPick:
         # metadata is opaque dict[str, Any]; `amount` is a STRING on the wire, coerce here.

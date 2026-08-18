@@ -206,3 +206,65 @@ class FantasyPlatformAdapter(Protocol):
         """Cheap change detector. Sleeper: last_picked epoch ms.
         ESPN: inProgress + count of picks with playerId != -1.
         Returns (changed, new_cursor). Called at 1-2s; must be cheap."""
+
+
+# ---------------------------------------------------------------------------
+# The league-sync surface — everything `ffh.ingest.platform_sync.load_league` drives
+# BEYOND `FantasyPlatformAdapter`. It lives here, next to the Protocol it extends,
+# because it is part of the adapter interface: `ffh.ingest` owning it meant the author
+# of the next adapter (ESPN, Phase 2) discovered the requirement as a runtime
+# `ValueError` from a module they never read, instead of statically from this file.
+#
+# The pieces are separate Protocols because `fetch_snapshot` checks them separately and
+# grades them differently — `current_week` is only needed when no `week=` is passed, and
+# a missing `get_league_drafts` is a logged degradation, not an error. `LeagueSyncAdapter`
+# below is the aggregate to declare a new adapter against.
+# ---------------------------------------------------------------------------
+
+
+@runtime_checkable
+class WeekAware(Protocol):
+    """Can answer "what week is it?" — required only when the caller passes no `week=`."""
+
+    async def current_week(self) -> int: ...
+
+
+@runtime_checkable
+class RefAware(Protocol):
+    """Can describe arbitrary platform player ids for the crosswalk. Always required."""
+
+    async def get_player_refs(self, external_ids: set[str]) -> dict[str, PlayerRef]: ...
+
+
+@runtime_checkable
+class DraftListing(Protocol):
+    """Can list a league's drafts. OPTIONAL: `FantasyPlatformAdapter` exposes
+    `get_draft(draft_id)`, not "the league's drafts", and ESPN lands in Phase 2."""
+
+    async def get_league_drafts(self, league_id: str) -> list[Draft]: ...
+
+
+@runtime_checkable
+class IdentityAware(Protocol):
+    """Can say whether it was configured with an identity AT ALL.
+
+    The distinction this exists to preserve is *unknown* vs *nobody*. `LeagueTeam.is_me`
+    is a bool: with no identity configured every team comes back `is_me=False`, which
+    reads as the platform saying "none of these is yours" — and a sync that believes that
+    NULLs `leagues.my_team_id` and clears every `league_teams.is_me`, erasing the pointer
+    the draft and lineup modules depend on. An adapter that returns False here is saying
+    "I could not identify anyone", and `persist_snapshot` leaves the stored pointer alone.
+    """
+
+    def identifies_me(self) -> bool: ...
+
+
+@runtime_checkable
+class LeagueSyncAdapter(
+    FantasyPlatformAdapter, WeekAware, RefAware, DraftListing, IdentityAware, Protocol
+):
+    """The FULL surface `ffh.ingest.platform_sync.load_league` drives.
+
+    Declare a new adapter against this one — not against `FantasyPlatformAdapter` alone —
+    if it is meant to be loadable by `ffh league load`. `SleeperAdapter` satisfies it.
+    """

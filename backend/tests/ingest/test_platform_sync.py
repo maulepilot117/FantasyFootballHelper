@@ -93,6 +93,78 @@ def test_teams_my_team_and_roster_slots(seeded, adapter):
     assert report.rostered == 23  # 13 on my roster + 10 on theirs
 
 
+@pytest.fixture
+def anonymous_adapter(sleeper_mock):
+    """The `adapter` fixture with NO `my_user_id` — an operator whose `.env` (or cron
+    environment) has no FFH_SLEEPER_USER_ID. Every roster then comes back `is_me=False`
+    because nothing could be compared, not because Sleeper said so."""
+    client = SleeperClient(base_url=get_settings().sleeper_base_url)
+    try:
+        yield SleeperAdapter(client)
+    finally:
+        asyncio.run(client.aclose())
+
+
+def test_an_adapter_with_no_identity_never_claims_a_team(seeded, anonymous_adapter):
+    """Absence of local config is not the platform saying "nobody owns a team here".
+    `my_team_id` stays NULL on a FIRST load (there was never a pointer), and the snapshot
+    records that the run could not identify anyone."""
+    snapshot = asyncio.run(fetch_snapshot(anonymous_adapter, LEAGUE, week=1))
+    assert snapshot.identifies_me is False
+    assert all(t.is_me is False for t in snapshot.teams)
+    report = persist_snapshot(seeded, snapshot)
+    league = seeded.get(League, report.league_id)
+    assert league.my_team_id is None
+    assert seeded.scalars(select(LeagueTeam.is_me)).all() == [False, False]
+
+
+def test_a_rerun_without_a_user_id_preserves_my_team_id_and_is_me(
+    seeded, adapter, anonymous_adapter
+):
+    """THE regression: run once with FFH_SLEEPER_USER_ID set, then let a cron run fire
+    without it (no `.env`). `_set_my_team` used to write `my_team_id = None` and the team
+    upsert used to overwrite `is_me` with False — silently erasing the pointer the draft
+    and lineup modules depend on, while the CLI still printed `teams=2`."""
+    first = load_league(seeded, adapter, LEAGUE, season=2026, week=1)
+    league = seeded.get(League, first.league_id)
+    mine = league.my_team_id
+    assert mine is not None
+
+    second = load_league(seeded, anonymous_adapter, LEAGUE, season=2026, week=1)
+    assert second.league_id == first.league_id
+    league = seeded.get(League, second.league_id, populate_existing=True)
+    assert league.my_team_id == mine
+    flagged = seeded.scalars(select(LeagueTeam.league_team_id).where(LeagueTeam.is_me)).all()
+    assert flagged == [mine]
+
+
+def test_a_run_that_can_identify_still_clears_a_stale_pointer(
+    seeded, adapter, sleeper_mock, sleeper_fixture
+):
+    """The other half of the rule: an adapter that COULD identify someone and found
+    nobody is real information — the operator left the league — and must write NULL.
+    Only "unknown" is protected, never "nobody"."""
+    first = load_league(seeded, adapter, LEAGUE, season=2026, week=1)
+    assert seeded.get(League, first.league_id).my_team_id is not None
+    rosters = sleeper_fixture("rosters")
+    for r in rosters:  # the league is still there; my user simply no longer owns a roster
+        r["owner_id"] = "USER_SOMEONE_ELSE"
+        r["co_owners"] = None
+    sleeper_mock.get(f"/league/{LEAGUE}/rosters").mock(
+        return_value=httpx.Response(200, json=rosters)
+    )
+    client = SleeperClient(base_url=get_settings().sleeper_base_url)
+    try:
+        second = load_league(
+            seeded, SleeperAdapter(client, my_user_id="USER_ME"), LEAGUE, season=2026, week=1
+        )
+    finally:
+        asyncio.run(client.aclose())
+    league = seeded.get(League, second.league_id, populate_existing=True)
+    assert league.my_team_id is None
+    assert seeded.scalars(select(LeagueTeam.is_me)).all() == [False, False]
+
+
 def test_drafts_and_picks_land(seeded, adapter):
     report = load_league(seeded, adapter, LEAGUE, season=2026, week=1)
     assert report.drafts == 1 and report.picks == 4
@@ -290,7 +362,9 @@ def test_unmatched_rows_carry_raw_context_for_the_operator(db_session, catalog_a
     }
     assert rows["1"].raw_name == "Fixture Quarterback"
     assert rows["1"].raw_position == "QB" and rows["1"].raw_team == "KC"
-    assert rows["KC"].raw_name == "KC" and rows["KC"].raw_position == "DST"
+    # A defense reaches the queue under its real name, not "KC": ④'s normalize_dst
+    # canonicalizes both to `kc dst`, and only one of them is legible to a human.
+    assert rows["KC"].raw_name == "Kansas City Chiefs" and rows["KC"].raw_position == "DST"
     assert all(r.raw_name for r in rows.values())
     # The report mirrors the queue, not a bare id list.
     described = {u.external_id: u for u in report.unmatched}

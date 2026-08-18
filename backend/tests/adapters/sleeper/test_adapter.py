@@ -5,10 +5,16 @@ import polars as pl
 import pytest
 from polars.exceptions import PolarsError
 
-from ffh.adapters.base import FantasyPlatformAdapter, PlatformError, PlayerRef
+from ffh.adapters.base import (
+    FantasyPlatformAdapter,
+    LeagueSyncAdapter,
+    PlatformError,
+    PlayerRef,
+)
 from ffh.adapters.sleeper.adapter import SleeperAdapter, player_ref
 from ffh.adapters.sleeper.catalog import LakePlayerCatalog
 from ffh.adapters.sleeper.models import RawPlayer
+from ffh.crosswalk.normalize import normalize_dst
 from tests.conftest import FIXTURE_DRAFT_ID as DRAFT
 from tests.conftest import FIXTURE_LEAGUE_ID as LEAGUE
 
@@ -109,6 +115,22 @@ async def test_get_teams_faab_remaining_raises_when_budget_used_is_missing_in_a_
         return_value=httpx.Response(200, json=rosters)
     )
     with pytest.raises(PlatformError, match="waiver_budget_used"):
+        await adapter.get_teams(LEAGUE)
+
+
+async def test_get_league_and_get_teams_share_one_faab_policy(
+    adapter, sleeper_mock, sleeper_fixture
+):
+    """ONE policy for the same payload. `get_league` used to hand back
+    `faab_budget=None` — "not a FAAB league" — for a `waiver_type=2` league whose budget
+    Sleeper omitted, while `get_teams` raised on that very payload."""
+    league = sleeper_fixture("league")
+    assert league["settings"]["waiver_type"] == 2
+    league["settings"]["waiver_budget"] = None
+    sleeper_mock.get(f"/league/{LEAGUE}").mock(return_value=httpx.Response(200, json=league))
+    with pytest.raises(PlatformError, match=r"FAAB league without settings\.waiver_budget"):
+        await adapter.get_league(LEAGUE)
+    with pytest.raises(PlatformError, match=r"FAAB league without settings\.waiver_budget"):
         await adapter.get_teams(LEAGUE)
 
 
@@ -397,7 +419,11 @@ async def test_draft_changed_since_sees_status_only_transitions(
     assert changed is False
 
 
-def test_player_ref_maps_a_defense_to_dst_named_by_team_abbreviation():
+def test_player_ref_maps_a_defense_to_dst_under_its_real_name():
+    """The blob has no `full_name` for a defense but does carry first/last name. ④'s
+    normalize_dst canonicalizes "Kansas City Chiefs" and "KC" alike to `kc dst` (and
+    canonical_dst_key is name-first), so the abbreviation buys the crosswalk nothing —
+    while costing the operator, who meets an unmatched defense as `raw_name`."""
     raw = RawPlayer(
         player_id="KC",
         position="DEF",
@@ -409,9 +435,20 @@ def test_player_ref_maps_a_defense_to_dst_named_by_team_abbreviation():
     ref = player_ref(raw)
     assert ref.external_id == "KC"
     assert ref.position == "DST"
-    assert ref.name == "KC"  # the one form the crosswalk's normalize_dst canonicalizes
-    assert ref.team == "KC"
+    assert ref.name == "Kansas City Chiefs"
+    assert ref.team == "KC"  # the abbreviation stays on `team`, and is still the id
     assert ref.gsis_id is None  # DEF entries carry no gsis_id
+    # ...and the crosswalk really does canonicalize that name onto the same key.
+    assert normalize_dst(ref.name) == normalize_dst(ref.external_id) == "kc dst"
+
+
+def test_player_ref_falls_back_to_the_abbreviation_for_a_nameless_defense():
+    """A defense with neither name part is still a DST, named by its id — the only thing
+    left. `player_ref` raises for a nameless HUMAN, but never for a defense: the id alone
+    canonicalizes, so there is nothing to refuse."""
+    ref = player_ref(RawPlayer(player_id="SF", position="DEF", team="SF"))
+    assert ref.name == "SF" and ref.position == "DST" and ref.team == "SF"
+    assert normalize_dst(ref.name) == "sf dst"
 
 
 def test_player_ref_strips_sleepers_stray_leading_space_from_gsis_id():
@@ -560,6 +597,23 @@ async def test_lake_player_catalog_raises_when_the_lake_is_empty(tmp_path):
 
 async def test_adapter_satisfies_the_protocol(adapter):
     assert isinstance(adapter, FantasyPlatformAdapter)
+    # ...and the FULL league-sync surface `load_league` drives, which lives next to it in
+    # ffh.adapters.base so the next adapter's author finds it statically.
+    assert isinstance(adapter, LeagueSyncAdapter)
+
+
+async def test_identifies_me_reports_whether_an_identity_was_configured(sleeper_client):
+    """UNKNOWN is not NOBODY: with no user id every `is_me` is False by ignorance, and
+    `platform_sync._set_my_team` must not read that as "the operator owns no team here"."""
+    assert SleeperAdapter(sleeper_client, my_user_id="USER_ME").identifies_me() is True
+    assert SleeperAdapter(sleeper_client).identifies_me() is False
+
+
+async def test_teams_are_all_not_mine_when_no_user_id_is_configured(sleeper_client):
+    anonymous = SleeperAdapter(sleeper_client)
+    assert [t.is_me for t in await anonymous.get_teams(LEAGUE)] == [False, False]
+    assert (await anonymous.get_league(LEAGUE)).my_team_external_id is None
+    assert anonymous.identifies_me() is False
 
 
 async def test_current_week_is_zero_outside_the_regular_season(

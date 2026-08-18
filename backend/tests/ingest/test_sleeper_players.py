@@ -51,10 +51,12 @@ def test_frame_is_all_utf8_with_normalized_name_and_position(sleeper_fixture):
     assert row["name"] == "Fixture Quarterback" and row["position"] == "QB"
     assert row["espn_id"] == "9000001" and row["active"] == "true"
     assert row["fantasy_positions"] == "QB"
-    # DEF entries: position becomes DST and the name is the team abbreviation, which is
-    # the one form the crosswalk's normalize_dst can canonicalize.
+    # DEF entries: position becomes DST and the name is the defense's REAL name (the blob
+    # has no full_name for them but does carry first/last), which ④'s normalize_dst
+    # canonicalizes exactly as it does the bare abbreviation.
     dst = df.filter(pl.col("player_id") == "KC").row(0, named=True)
-    assert dst["position"] == "DST" and dst["name"] == "KC" and dst["gsis_id"] is None
+    assert dst["position"] == "DST" and dst["gsis_id"] is None
+    assert dst["name"] == "Kansas City Chiefs" and dst["team"] == "KC"
 
 
 def test_frame_rejects_an_empty_payload():

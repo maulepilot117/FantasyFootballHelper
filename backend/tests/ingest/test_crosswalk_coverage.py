@@ -43,6 +43,10 @@ DP_GAP_NAME = "5"
 #: from the same file the loader read would cancel a mis-mapping out.
 IDENTITIES = {"1": "00-0090001", "13": "00-0090013", DP_GAP_GSIS: "00-0090003"}
 
+#: DP_GAP_NAME's real name (tests/fixtures/sleeper/players_slice.json). He has no gsis_id
+#: in the registry — the fixture dropped it — so his identity is pinned by NAME.
+EXACT_NAME_PLAYER = "Fixture Receivertwo"
+
 
 def _live_mapping(session, external_id: str) -> PlayerExternalId:
     """The one usable sleeper mapping for an id. LIVE_MAPPING (④), never a hand-rolled
@@ -106,6 +110,17 @@ def test_crosswalk_covers_all_rostered_players(db_session, catalog_adapter):
         player = db_session.get(Player, _live_mapping(db_session, sleeper_id).player_id)
         assert player.gsis_id == gsis_id, f"sleeper:{sleeper_id} resolved to {player.full_name}"
         assert player.player_id in rostered_player_ids
+
+    # DP_GAP_NAME is the rung most capable of landing on the wrong person: rung 3 has no
+    # id FACT to check itself against, only (normalized_name, position, team), so a
+    # homonym resolves silently. It is also the one id above that cannot be identity-
+    # checked by gsis — the fixture dropped that column for him, which is *why* he fell to
+    # rung 3 — so his identity is pinned by name instead. Without this, "everyone
+    # resolved" would still hold if he had resolved to somebody else entirely.
+    by_name = db_session.get(Player, _live_mapping(db_session, DP_GAP_NAME).player_id)
+    assert by_name.full_name == EXACT_NAME_PLAYER
+    assert by_name.gsis_id is None  # the dropped fact — the reason rung 3 had to answer
+    assert by_name.player_id in rostered_player_ids
 
 
 def test_crosswalk_covers_all_rostered_players_from_id_only_refs(seeded, adapter):

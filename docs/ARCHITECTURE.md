@@ -151,14 +151,25 @@ once with `asyncio.run(fetch_snapshot(...))` and **refuses to run inside a live 
 loop**; a caller already in async land awaits `fetch_snapshot()` and then calls
 `persist_snapshot()`. Both halves are public so either can be driven alone.
 
-**Adapter lifetime contract — one adapter per `load_league` call.** Because `load_league`
-opens and closes its own event loop, an `httpx.AsyncClient` that outlives the call is
-holding a keep-alive pool bound to a dead loop. Build the Sleeper client *and* the adapter
-inside each invocation and close the client afterwards. `ffh.cli.league_load` does exactly
-that (construct in the `try`, `aclose` in the `finally`), and
-`tests/ingest/test_platform_sync.py`'s `adapter_factory` models it. This is a **documented
-contract, not an enforced one** — respx replaces the transport in tests, so no test can
-catch a violation.
+**Adapter lifetime contract — one adapter per `load_league` call, closed in its own loop.**
+Because `load_league` opens and closes its own event loop, an `httpx.AsyncClient` that
+outlives the call is holding a keep-alive pool bound to a dead loop. Build the Sleeper
+client *and* the adapter inside each invocation, and **close the client inside the very
+loop that opened its pool** — never from a second `asyncio.run` in a `finally`, which is
+the same bug wearing a cleanup hat: `httpcore`'s pool close awaits per-connection closes
+wrapping anyio streams bound to the loop that is now dead, so a real run logs
+`Event loop is closed` and leaks the sockets to GC. `ffh.cli` therefore drives the
+fetch/persist split directly: `_fetch_snapshot_and_close()` awaits `fetch_snapshot()` and
+`aclose()`s in its own `finally`, inside one `asyncio.run`, and
+`tests/ingest/test_platform_sync.py`'s `adapter_factory` models the per-call build. respx
+replaces the transport, so no *networked* test can catch a violation — but
+`tests/test_cli_league.py` pins the loop identity a fake client is closed on, which does.
+
+**The league-sync adapter surface lives in `ffh.adapters.base`,** not in `ffh.ingest`:
+`WeekAware`, `RefAware`, `DraftListing`, `IdentityAware`, and the `LeagueSyncAdapter`
+aggregate to declare a new adapter against. `fetch_snapshot` still checks them separately
+because they are graded differently (`current_week` matters only when no `week=` is
+passed; a missing `get_league_drafts` is a logged degradation, not an error).
 
 Because nothing here opens an **async psycopg** connection, no `WindowsSelectorEventLoopPolicy`
 hook is needed in tests (httpx is happy on the default Proactor loop). The first PR that
