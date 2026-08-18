@@ -81,7 +81,11 @@ backend/src/ffh/
   adapters/      Platform clients behind ONE interface. Nothing outside this
                  package may know which platform is in use.
   ingest/        Fetch → validate → land as Parquet. Idempotent, watermarked.
-                 No business logic.
+                 No business logic. `ingest/platform_sync.py` is the one
+                 exception to "land as Parquet": it lands a league in Postgres
+                 (fetch → validate → land is still the shape). It is
+                 SYNCHRONOUS and takes an orm.Session; adapters are async and
+                 the boundary is crossed once, in load_league().
   crosswalk/     Player identity resolution. See DATABASE.md §3.
   features/      DuckDB SQL over Parquet → feature tables. Pure functions of
                  the lake; safe to recompute from scratch at any time.
@@ -132,7 +136,50 @@ around automated lineup submission.
 
 **Scoring and roster settings are always fetched, never hardcoded.** PPR vs half vs
 standard, superflex, TE premium, and starter counts all move the VORP baselines materially.
-A hardcoded default is a bug even when it happens to be right.
+A hardcoded default is a bug even when it happens to be right. `leagues.scoring_settings`
+stores the platform payload **verbatim** — a test asserts no key is added or removed
+(`tests/ingest/test_platform_sync.py::test_load_league_persists_settings_verbatim`).
+`ScoringSettings.format` is *derived* from `rec` for downstream convenience and is never an
+input; it is `"custom"` when the platform sends no `rec` at all, never an assumed default.
+
+### Async boundary (PR ⑤)
+
+Adapter methods are `async`; `ffh.ingest.platform_sync` is **synchronous** and takes a
+`sqlalchemy.orm.Session` — matching the sync engine, the `db_session` test fixture and the
+crosswalk's `resolve_many(session, rows)`. `load_league()` crosses the boundary exactly
+once with `asyncio.run(fetch_snapshot(...))` and **refuses to run inside a live event
+loop**; a caller already in async land awaits `fetch_snapshot()` and then calls
+`persist_snapshot()`. Both halves are public so either can be driven alone.
+
+**Adapter lifetime contract — one adapter per `load_league` call.** Because `load_league`
+opens and closes its own event loop, an `httpx.AsyncClient` that outlives the call is
+holding a keep-alive pool bound to a dead loop. Build the Sleeper client *and* the adapter
+inside each invocation and close the client afterwards. `ffh.cli.league_load` does exactly
+that (construct in the `try`, `aclose` in the `finally`), and
+`tests/ingest/test_platform_sync.py`'s `adapter_factory` models it. This is a **documented
+contract, not an enforced one** — respx replaces the transport in tests, so no test can
+catch a violation.
+
+Because nothing here opens an **async psycopg** connection, no `WindowsSelectorEventLoopPolicy`
+hook is needed in tests (httpx is happy on the default Proactor loop). The first PR that
+does introduce async psycopg in tests must add
+`if sys.platform == "win32": asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())`
+to `backend/tests/conftest.py`.
+
+### Recorded deviations (PR ⑤)
+
+- **`ffh.ingest.platform_sync` lands a league in Postgres, not Parquet.** The module map
+  above has no home for "load a league into Postgres"; ingest's *fetch → validate → land*
+  shape is still what happens, only the landing zone differs. Spec §5 anticipated this
+  deviation; what it did not anticipate is the **signature**: the shipped function is
+  `load_league(session, adapter, external_id, season, week=None)` — it takes a `Session`
+  and is synchronous, where the spec wrote `load_league(adapter, external_id, season)`.
+- **The `sleeper_players` IngestJob lives at `ffh/ingest/sleeper_players.py`**, not under
+  `ffh/adapters/sleeper/`. The import direction is therefore **ingest → adapters**: the job
+  consumes the adapter's `RawPlayer`, `player_ref()` and the catalog's `REQUIRED_COLUMNS`.
+  **`ffh.adapters` never imports `ffh.ingest`.** `LakePlayerCatalog` reads the newest
+  `raw/sleeper/players/scrape_date=*/` partition with Polars and `pathlib` alone, so the
+  adapter package stays independent of the ingest framework.
 
 ---
 

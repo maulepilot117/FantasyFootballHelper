@@ -1,6 +1,10 @@
 """Record Sleeper fixtures from a real league.
 
-  FFH_SLEEPER_MOCK_LEAGUE_ID=<id> uv run python scripts/record_sleeper_fixtures.py
+Run from backend/. The env var is read from backend/.env too, which is the form that works
+on every host; the inline forms differ by shell:
+
+  FFH_SLEEPER_MOCK_LEAGUE_ID=<id> uv run python scripts/record_sleeper_fixtures.py   # POSIX
+  $env:FFH_SLEEPER_MOCK_LEAGUE_ID="<id>"; uv run python scripts/record_sleeper_fixtures.py  # pwsh
 
 Writes backend/tests/fixtures/sleeper_live/ (the LIVE recording, consumed later by a
 coverage test). The unit-test corpus in backend/tests/fixtures/sleeper/ is a hand-written
@@ -71,9 +75,10 @@ This directory is the LIVE recording; the unit tests are bound to the hand-writt
 synthetic corpus in `tests/fixtures/sleeper/` and must not be re-pointed here.
 
 Source league: `{league_id}` (draft `{draft_id}`), recorded {recorded_on}.
-Re-record from `backend/`:
+Re-record from `backend/` (or set `FFH_SLEEPER_MOCK_LEAGUE_ID` in `backend/.env`):
 
-    FFH_SLEEPER_MOCK_LEAGUE_ID=<id> uv run python scripts/record_sleeper_fixtures.py
+    FFH_SLEEPER_MOCK_LEAGUE_ID=<id> uv run python scripts/record_sleeper_fixtures.py   # POSIX
+    $env:FFH_SLEEPER_MOCK_LEAGUE_ID="<id>"; uv run python scripts/record_sleeper_fixtures.py  # pwsh
 
 Sleeper data is licensed for **non-commercial use only**. These fixtures exist solely to
 test this self-hosted personal project.

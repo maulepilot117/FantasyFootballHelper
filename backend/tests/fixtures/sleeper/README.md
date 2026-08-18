@@ -7,9 +7,14 @@ Source league: hand-written SYNTHETIC corpus (`league_id=1000000000000000001`,
 `draft_id=2000000000000000001`), authored 2026-08-16 to match live-verified shapes.
 The unit tests are bound to this corpus (ids, counts, names) — do not record over it and
 do not re-point the tests elsewhere. A live recording is a separate directory,
-`tests/fixtures/sleeper_live/`, written from `backend/` by:
+`tests/fixtures/sleeper_live/`, written from `backend/` by (or set the var in
+`backend/.env`, which works on every host):
 
-    FFH_SLEEPER_MOCK_LEAGUE_ID=<id> uv run python scripts/record_sleeper_fixtures.py
+    FFH_SLEEPER_MOCK_LEAGUE_ID=<id> uv run python scripts/record_sleeper_fixtures.py   # POSIX
+    $env:FFH_SLEEPER_MOCK_LEAGUE_ID="<id>"; uv run python scripts/record_sleeper_fixtures.py  # pwsh
+
+No live recording has been made yet — `tests/fixtures/sleeper_live/` does not exist in the
+tree, and nothing in the suite reads it.
 
 Sleeper data is licensed for **non-commercial use only**. These fixtures exist solely to
 test this self-hosted personal project.
