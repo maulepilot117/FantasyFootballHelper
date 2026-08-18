@@ -3,7 +3,7 @@
 Consumers (platform_sync in PR ⑤, ADP ingest in PR ⑥) call ``resolve`` / ``resolve_many``
 and never touch ``player_external_ids`` directly. If you must query the table in SQL, apply
 ``confidence >= 0.9 - epsilon OR verified_at IS NOT NULL`` (see ``is_usable`` /
-``CONFIDENCE_EPSILON`` — the column is float4, so 0.9 round-trips as 0.899999988…).
+``CONFIDENCE_EPSILON`` — the column is float4, so 0.9 round-trips as 0.899999976…).
 """
 
 from __future__ import annotations
@@ -38,7 +38,7 @@ FUZZY_CAP = 0.89
 FUZZY_TIE_MARGIN = 0.01
 USABLE_CONFIDENCE = 0.9
 # player_external_ids.confidence is Postgres REAL (float4): a stored 0.9 reads back as
-# 0.899999988…, so every threshold comparison allows this slack. Task 7's SQL variant of
+# 0.899999976…, so every threshold comparison allows this slack. Task 7's SQL variant of
 # the usability rule must use the identical epsilon.
 CONFIDENCE_EPSILON = 1e-6
 

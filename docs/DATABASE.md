@@ -265,6 +265,14 @@ parametrized cases in `backend/tests/crosswalk/test_normalize.py` (spec bar: ≥
 canonicalizes through `normalize_dst`, including a **bare** team abbreviation. Position
 aliases: `DEF`/`D/ST`→`DST`, `PK`→`K`, `FB`/`HB`→`RB`; anything non-fantasy → `None`.
 
+**Rungs 1–2 and what persists.** Rung 1 is a lookup of the existing
+`(source, external_id)` row and writes nothing new. **Rungs 2–4 persist** their result, so
+the next call for the same key is a cheap rung-1 hit — with one exception: **rung 2 skips
+persisting when `source == "gsis"`**, because a gsis id filed under source `gsis` would
+duplicate `players.gsis_id`. Consequence worth knowing before you write a coverage query:
+a gsis-sourced resolution returns a 1.0 `Resolution` but leaves **no** `player_external_ids`
+row, so any coverage measured off that table will read short for those ids by design.
+
 **Rung 3 (`exact_name`) and team.** Candidates are `players` rows with the same
 `(normalized_name, position)` that **do not already hold an id for this source**. Then:
 no team supplied → match iff exactly one candidate remains; team supplied → keep the
@@ -293,13 +301,14 @@ with **`clock_timestamp()`**, and `resolved` flips back to `false`.
 `confidence >= 0.9 - epsilon OR verified_at IS NOT NULL` — `ffh.crosswalk.resolve.is_usable`.
 `resolve` / `resolve_many` already apply it; **any direct SQL over `player_external_ids`
 must too.** The epsilon is not cosmetic: `confidence` is Postgres `REAL` (float4), so a
-stored `0.9` reads back as `0.899999988…` and a naive `>= 0.9` would reject rows that are
+stored `0.9` reads back as `0.899999976…` and a naive `>= 0.9` would reject rows that are
 supposed to pass. Use the exported `resolve.USABLE_CONFIDENCE` and
 `resolve.CONFIDENCE_EPSILON` (`1e-6`) — `report.py`'s SQL predicate uses the identical pair.
 
 **Review-queue lifecycle.** `crosswalk_unmatched.resolved` is set `true` at every point a
-mapping row is **created** for the key (`resolve._persist`, `dynastyprocess.apply_playerids`
-— and nowhere else). `ffh crosswalk verify` closes the entry; `--reject` deliberately
+mapping row is **created** for the key — `resolve._persist` and
+`dynastyprocess.apply_playerids`, and no other mapping-creation path. The human review
+commands close it too: `ffh crosswalk verify` closes the entry; `--reject` deliberately
 leaves it **open** (the id is now unmapped and must stay on the gate);
 `ffh crosswalk resolve-unmatched <source> <id>` closes an entry that will never map
 (retired, practice squad, non-NFL). The upgrade-conflict state below deliberately leaves
@@ -313,7 +322,9 @@ unverified `confidence < 0.9` row exists. `ffh crosswalk seed` exits 2 on a
 positions normalized; non-fantasy rows and rows with no id are skipped and **counted**;
 player assignment is `gsis_id` → registry player, else any already-mapped id → its player,
 else a placeholder (`gsis:<id>` / `mfl:<mfl_id>`) that becomes a new `players` row
-(rookies/UDFAs). Ids appearing on more than one player, or a player holding more than one
+(rookies/UDFAs) — except for DST rows, which resolve against the seeded `<abbr> dst`
+players (see deviation 11) and never take the placeholder path. Ids appearing on more than
+one player, or a player holding more than one
 id for a source, are dropped into `CrosswalkApplyReport.ambiguous` and logged. An existing
 row pointing at a *different* player raises `CrosswalkConflictError` **before any write**
 (the conflict scan runs before placeholder players are created). Ids are stored as TEXT
@@ -342,7 +353,10 @@ rather than silently mangled (`4046.0` must never become `"4046.0"`).
    `gsis_id`; a *different* player means the gsis fact wins and the stored row is corrected
    (`verified_at` cleared); the *same* player upgrades the stored method/confidence to
    `gsis`/1.0. Rows that are `verified_at IS NOT NULL` or `match_method = 'manual'` are
-   locked against this and log `crosswalk.resolve.human_decision_conflict` instead. If a
+   locked against this entirely: a *disagreeing* gsis id logs
+   `crosswalk.resolve.human_decision_conflict` and changes nothing, and a *confirming* one
+   is dropped without a log (the lock is wider than the case it exists for — a known
+   follow-up, not a behaviour to rely on). If a
    correction would give the target player a second id for the source, the incoming id is
    routed to `crosswalk_unmatched` (`crosswalk.resolve.upgrade_conflict`) rather than
    returning a mapping the gsis fact just contradicted.
@@ -363,10 +377,14 @@ rather than silently mangled (`4046.0` must never become `"4046.0"`).
 10. **Review-queue lifecycle** (above) is a mechanism §3 does not describe: `resolved` is
     maintained at the mapping-creation sites, `--reject` deliberately re-opens/keeps open,
     and `resolve-unmatched` is the operator's path back to exit 0.
-11. **`CrosswalkApplyReport.skipped_dst`** — a DynastyProcess row whose position normalizes
-    to DST/DEF never creates a `players` row (defenses come only from `seed_dst_players`).
-    Such rows are counted and logged, never silently dropped. (The live file has no DST
-    rows today; the counter exists so that a future one cannot mint a bogus player.)
+11. **`CrosswalkApplyReport.skipped_dst`** — DynastyProcess rows whose position normalizes
+    to DST/DEF **do** get mapped: the row resolves to the seeded `<abbr> dst` player via
+    `normalize_dst(team) or normalize_dst(name)`, or failing that to whatever player one of
+    its ids is already crosswalked to. Only a row matching *neither* is counted in
+    `skipped_dst` and skipped — counted and logged, never silently dropped. What a DST row
+    can never do is fall through to the placeholder path and mint a `players` row: defenses
+    exist only as the 32 rows `seed_dst_players` creates. (The live file has no DST rows
+    today; the counter exists so a future one cannot invent a 33rd defense.)
 
 ### Mandatory tests — these are not optional
 

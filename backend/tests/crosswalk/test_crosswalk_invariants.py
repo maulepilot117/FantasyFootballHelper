@@ -28,7 +28,7 @@ FIXTURE = FIXTURE_DIR / "dynastyprocess" / "db_playerids_sample.csv"
 
 # The usability rule is `confidence >= 0.9 - epsilon OR verified_at IS NOT NULL`
 # (resolve.is_usable). Never hardcode 0.9 in SQL here: confidence is Postgres REAL, so a
-# stored 0.9 reads back as 0.899999988… and a bare `< 0.9` predicate would sweep usable
+# stored 0.9 reads back as 0.899999976… and a bare `< 0.9` predicate would sweep usable
 # rows into the "needs review" bucket. Report and ladder share the same epsilon.
 LOW_CONFIDENCE_SQL = """
     SELECT source, external_id, player_id

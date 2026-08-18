@@ -11,7 +11,7 @@ from sqlalchemy.orm import Session
 
 # The SQL usability rule below MUST mirror ffh.crosswalk.resolve.is_usable:
 # player_external_ids.confidence is Postgres REAL (float4), so a stored 0.9 reads back
-# as 0.899999988… — the shared epsilon keeps the report and the ladder in agreement
+# as 0.899999976… — the shared epsilon keeps the report and the ladder in agreement
 # about which rows are usable versus awaiting review.
 from ffh.crosswalk.resolve import CONFIDENCE_EPSILON, USABLE_CONFIDENCE
 from ffh.db.models import CrosswalkUnmatched, Player, PlayerExternalId

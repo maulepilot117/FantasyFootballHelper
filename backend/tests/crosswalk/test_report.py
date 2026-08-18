@@ -167,7 +167,7 @@ def test_upgrade_conflict_state_stays_on_report(db_session, seeded_registry):
 
 def test_float4_boundary_confidence_is_usable_not_flagged(db_session, seeded_registry):
     """A stored confidence of exactly 0.9 round-trips through Postgres REAL as
-    0.899999988… — the report's SQL must share resolve's epsilon or it flags usable rows."""
+    0.899999976… — the report's SQL must share resolve's epsilon or it flags usable rows."""
     pid = seeded_registry["00-0034857"]  # Josh Allen QB
     db_session.add(
         PlayerExternalId(

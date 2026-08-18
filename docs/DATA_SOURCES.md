@@ -302,9 +302,12 @@ weight college db_season`. Of these, seven map to `player_external_ids.source`:
 Gotchas, all confirmed against the live file — these contradict what you would guess:
 
 - **Kickers are `PK`, not `K`** (`normalize_position` maps `PK`→`K`, `FB`/`HB`→`RB`).
-- **There are no DST/DEF rows at all.** Defenses come only from
-  `ffh.crosswalk.registry.seed_dst_players`; a DST-positioned DP row would be counted in
-  `CrosswalkApplyReport.skipped_dst` and never mint a `players` row.
+- **There are no DST/DEF rows at all.** The 32 defenses come only from
+  `ffh.crosswalk.registry.seed_dst_players`. Should a future file add DST rows,
+  `apply_playerids` maps each one to the seeded `<abbr> dst` player (by `team`, then by
+  `name`) or to whatever player one of its ids is already crosswalked to; a row matching
+  neither is counted in `CrosswalkApplyReport.skipped_dst` and skipped. Either way a DST
+  row never mints a `players` row.
 - **`team` uses MFL codes**, not nflverse: `KCC TBB GBP NEP NOS SFO LVR LAR JAC` plus
   historic `OAK SDC STL RAM` and `FA` / `FA*`. Everything goes through `normalize_team`.
 - **Every id column must be read as text.** `sportradar_id` is a UUID, `pfr_id` is
@@ -313,7 +316,10 @@ Gotchas, all confirmed against the live file — these contradict what you would
   `read_playerids_csv` forces `pl.Utf8` on the id columns and the ingest job re-asserts it
   before landing Parquet.
 - **~144 QB/RB/WR/TE/PK rows have a `sleeper_id` but no `gsis_id`** (2026 rookies and
-  UDFAs). These are keyed on an `mfl:<mfl_id>` placeholder and create a new `players` row.
+  UDFAs). If none of the row's ids is already crosswalked, it is keyed on an
+  `mfl:<mfl_id>` placeholder and creates a new `players` row; if any of them *is* already
+  mapped, the row joins that player instead — which is what makes a re-run idempotent for
+  rookies rather than minting a duplicate every week.
 - **The file contains duplicate-id glitch rows.** Two rows (`Fred Williams` / `Kevin Smith`,
   both WR) share every id including `gsis_id 00-0031320` but differ on `rotowire_id`;
   `espn_id 2582138` and `pfr_id CartKy01` each appear on two different TEs. This is why
@@ -323,8 +329,11 @@ Gotchas, all confirmed against the live file — these contradict what you would
 **Ingest:** job `dynastyprocess_playerids` (`ffh ingest run dynastyprocess_playerids`) —
 weekly full snapshot, ETag-conditional, no `persist()`. It lands
 `raw/dynastyprocess/playerids/scrape_date=YYYY-MM-DD/playerids.parquet` in the lake;
-Postgres is populated separately by `ffh crosswalk seed --playerids <parquet>`, which
-re-reads that partition and calls `apply_playerids`.
+Postgres is populated separately by `ffh crosswalk seed --playerids <parquet>`. Note that
+this command always seeds the `players` registry first — from `--players` or, by default,
+the newest `raw/nflverse/players` partition — and *then* calls `apply_playerids` on the DP
+frame. There is no way to apply DP ids alone, and that is deliberate: the ids need a
+registry to attach to.
 
 ⚠️ **ECR is an ordinal ranking, not projected points.** Use it for tier clustering and as a
 sanity check on our own projections — never as a projection itself.
