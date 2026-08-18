@@ -70,11 +70,17 @@ class UnmatchedPlayer:
 class LeagueLoadReport:
     league_id: uuid.UUID
     teams: int
+    #: roster_slots rows written for THIS week — roster-scoped, and only the players that
+    #: resolved. A drafted-then-dropped player is on no roster and is never counted here.
     rostered: int
     #: ④ rung 5 — already upserted into crosswalk_unmatched by resolve_many.
+    #: SCOPE: rostered UNION drafted ids, not just the rostered ones (`_resolve_refs` runs over
+    #: the whole crosswalk batch). `len(unmatched)` is therefore NOT `rostered` minus
+    #: anything; an unmatched id here may belong only to a draft pick.
     unmatched: list[UnmatchedPlayer]
     #: ④ rung 4 — fuzzy hit persisted UNVERIFIED in player_external_ids; not in
     #: crosswalk_unmatched. Usable only after `ffh crosswalk verify <source> <id>`.
+    #: Same rostered-UNION-drafted scope as `unmatched`.
     pending_review: list[UnmatchedPlayer]
     drafts: int
     picks: int
@@ -186,6 +192,16 @@ def _validate_snapshot(snapshot: LeagueSnapshot) -> None:
                 f"not a team of league {snapshot.league.external_id}"
             )
     listed = {d.external_id for d in snapshot.drafts}
+    if len(listed) != len(snapshot.drafts):
+        # `picks` is keyed by draft external_id, so a league listing one draft twice
+        # collapses to a single picks key while `drafts` still holds two entries.
+        # `_upsert_drafts` then walks that key once per entry: every pick is re-upserted
+        # and double-counted in the report. Counting rows afterwards cannot catch it —
+        # the loop counted both — so it is a pre-write check, like the pick_no one below.
+        raise PlatformError(
+            f"league {snapshot.league.external_id}: {len(snapshot.drafts)} drafts share "
+            f"{len(listed)} external ids"
+        )
     orphaned = set(snapshot.picks) - listed
     if orphaned:
         raise PlatformError(

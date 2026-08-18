@@ -1,4 +1,5 @@
 import asyncio
+from dataclasses import replace
 
 import httpx
 import pytest
@@ -217,6 +218,34 @@ def test_duplicate_pick_numbers_abort_before_any_write(
     )
     with pytest.raises(PlatformError, match="pick numbers"):
         load_league(db_session, adapter, LEAGUE, season=2026, week=1)
+    assert db_session.scalar(select(func.count()).select_from(League)) == 0
+
+
+def test_duplicate_draft_ids_abort_before_any_write(
+    db_session, sleeper_mock, sleeper_fixture, adapter
+):
+    """`snapshot.picks` is keyed by draft external_id, so a league listing the same draft
+    twice collapses to ONE picks key while `snapshot.drafts` still has two entries —
+    `_upsert_drafts` would then re-walk that key and double-count (and re-ON-CONFLICT)
+    every pick. Counting rows afterwards cannot see it: the loop counted both."""
+    drafts = sleeper_fixture("league_drafts")
+    sleeper_mock.get(f"/league/{LEAGUE}/drafts").mock(
+        return_value=httpx.Response(200, json=[*drafts, dict(drafts[0])])
+    )
+    with pytest.raises(PlatformError, match="external ids"):
+        load_league(db_session, adapter, LEAGUE, season=2026, week=1)
+    assert db_session.scalar(select(func.count()).select_from(League)) == 0
+
+
+def test_picks_for_an_unlisted_draft_abort_before_any_write(db_session, adapter):
+    """`_upsert_drafts` only walks LISTED drafts, so picks under any other key would be
+    silently discarded — the one thing the Global Constraints forbid. `fetch_snapshot`
+    cannot build such a snapshot (it derives the keys from the drafts), so the guard is
+    proved against a hand-made one, the way `persist_snapshot` can be called directly."""
+    snapshot = asyncio.run(fetch_snapshot(adapter, LEAGUE, week=1))
+    orphaned = replace(snapshot, picks={**snapshot.picks, "DRAFT_GONE": snapshot.picks[DRAFT]})
+    with pytest.raises(PlatformError, match="unlisted draft"):
+        persist_snapshot(db_session, orphaned)
     assert db_session.scalar(select(func.count()).select_from(League)) == 0
 
 

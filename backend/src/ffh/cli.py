@@ -1,3 +1,4 @@
+import asyncio
 import json
 import uuid
 from collections.abc import Iterator
@@ -10,6 +11,9 @@ import typer
 from sqlalchemy.orm import Session
 
 from ffh import __version__
+from ffh.adapters.sleeper.adapter import SleeperAdapter
+from ffh.adapters.sleeper.catalog import LakePlayerCatalog
+from ffh.adapters.sleeper.client import SleeperClient
 from ffh.config import get_settings
 
 # Importing the job modules registers every @register-decorated class in ffh.ingest.base.JOBS.
@@ -24,6 +28,7 @@ from ffh.ingest import nflverse as _nflverse  # noqa: F401
 from ffh.ingest import reference as _reference  # noqa: F401
 from ffh.ingest import sleeper_players as _sleeper_players  # noqa: F401
 from ffh.ingest.base import JOBS, STATUS_FAILED, get_job
+from ffh.ingest.platform_sync import load_league
 from ffh.ingest.reference import StadiumsJob, seed_generic_league, seed_nfl_teams
 from ffh.log import configure_logging
 
@@ -160,6 +165,91 @@ def ingest_seed() -> None:
 def league_platforms() -> None:
     """List supported platforms."""
     typer.echo("sleeper")
+
+
+@league_app.command("load")
+def league_load(
+    platform: str = typer.Argument(..., help="Only 'sleeper' is implemented."),
+    league_id: str = typer.Argument(..., help="Platform league id."),
+    season: int | None = typer.Option(None, "--season", help="Defaults to FFH_SEASON."),
+    week: int | None = typer.Option(
+        None, "--week", help="Roster snapshot week. Defaults to the platform's current week."
+    ),
+) -> None:
+    """Load a league into Postgres: settings, teams, the week's roster snapshot, drafts, picks.
+
+    Exit 0 = every rostered and drafted player resolved.
+
+    Exit 1 = gate red: at least one is unmatched (④ rung 5, already queued in
+    crosswalk_unmatched) or awaiting review (④ rung 4, a fuzzy hit persisted unverified).
+    That is a DATA state a human resolves with `ffh crosswalk`, exactly as it is for
+    `ffh crosswalk report`.
+
+    Exit 3 = operational: the league could not be loaded at all — Sleeper down or
+    misbehaving, no player partition in the lake, database unreachable, or the league is
+    a different season than the one asked for. 1 is never returned for an operational
+    failure: a wrapper reading 1 would file a crosswalk gap for a run that never happened.
+
+    Exit 2 = usage error (unknown platform, missing argument), Click's own code.
+    """
+    from sqlalchemy.exc import SQLAlchemyError
+
+    from ffh.adapters.base import PlatformError
+
+    if platform != "sleeper":
+        raise typer.BadParameter(
+            f"platform {platform!r} is not implemented; only 'sleeper' is available",
+            param_hint="PLATFORM",
+        )
+    settings = get_settings()
+    # Built HERE, per invocation, and closed below: `load_league` runs and closes its own
+    # event loop (see its "adapter lifetime contract"), and an httpx.AsyncClient keep-alive
+    # connection belongs to the loop that opened it. A module-level client would hand the
+    # second invocation a pool bound to a dead loop.
+    client = SleeperClient()
+    try:
+        # The catalog is ALWAYS attached: with no lake partition it raises with the
+        # `ffh ingest run sleeper_players` remedy rather than quietly degrading to id-only
+        # refs, which would push every human down the crosswalk ladder into fuzzy matching.
+        # Inside the try so the client above is released even if this raises.
+        adapter = SleeperAdapter(
+            client,
+            my_user_id=settings.sleeper_user_id,
+            catalog=LakePlayerCatalog(settings.lake_root),
+        )
+        # ③'s _session_scope() (above) — one sync Session per invocation; it does not commit.
+        with _session_scope() as session:
+            # `if season is None`, not `season or ...`: --season 0 is nonsense, but a
+            # falsy-default fallback would silently load a different season instead.
+            report = load_league(
+                session, adapter, league_id, settings.season if season is None else season, week
+            )
+            # Committed even when the report is red: ④'s resolve_many has already written
+            # this run's `crosswalk_unmatched` entries, and rolling them back would empty
+            # the review queue the exit code is telling the operator to work through.
+            session.commit()
+    except (PlatformError, SQLAlchemyError, OSError, ValueError) as exc:
+        typer.echo(f"league load failed: {type(exc).__name__}: {exc}", err=True)
+        raise typer.Exit(code=EXIT_OPERATIONAL) from exc
+    finally:
+        # One more short-lived loop; the pool the fetch opened is released before exit.
+        asyncio.run(client.aclose())
+
+    typer.echo(
+        f"league {report.league_id} teams={report.teams} rostered={report.rostered} "
+        f"drafts={report.drafts} picks={report.picks} unmatched={len(report.unmatched)} "
+        f"pending_review={len(report.pending_review)}"
+    )
+    for u in report.unmatched:
+        typer.echo(f"  UNMATCHED {u.external_id} {u.name} {u.position} {u.team}")
+    for u in report.pending_review:
+        # ④ rung 4: persisted unverified in player_external_ids, not in crosswalk_unmatched.
+        typer.echo(
+            f"  PENDING_REVIEW {u.external_id} {u.name} {u.position} {u.team} "
+            f"-> run: ffh crosswalk verify {platform} {u.external_id}"
+        )
+    if report.unmatched or report.pending_review:
+        raise typer.Exit(code=EXIT_GATE_RED)
 
 
 def _coverage_report_for_cli():
