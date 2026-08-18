@@ -39,6 +39,7 @@ Written by `ffh.ingest.lake.partition_path`. Every partition holds exactly one f
     nflverse/injuries/season=2026/scrape_date=2026-08-16/injuries.parquet
     nflverse/pbp/season=2026/scrape_date=2026-09-14/pbp.parquet
     nfldata/games/scrape_date=2026-08-16/games.parquet
+    dynastyprocess/playerids/scrape_date=2026-08-16/playerids.parquet
     greerre/stadiums/scrape_date=2026-08-16/stadiums.parquet
     odds/espn_live/date=2026-09-13/odds.parquet
     weather/forecast/game_id=.../forecast.parquet
@@ -90,11 +91,18 @@ CREATE TABLE players (
     weight_lb       SMALLINT,
     college         TEXT,
     status          TEXT,                     -- Active, IR, PUP, Retired, ...
+    team_abbr       TEXT,                     -- Phase 0: nflverse latest_team; crosswalk rung-3 tie-breaker ONLY, never roster truth
     created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at      TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 CREATE INDEX players_normalized_name_pos_idx ON players (normalized_name, position);
 ```
+
+*Phase 0 note (PR ④):* `team_abbr` was added because §3 rung 3 matches on
+`(normalized_name, position, team)` and the table had no team column. It is refreshed
+from nflverse `latest_team` by `seed_players` (and set from the DynastyProcess `team` for
+rows created there); it is used only inside `ffh.crosswalk.resolve` to break ties and is
+**not** a roster field. Migration `0002_players_team_abbr`.
 
 `updated_at` (here and on `games.updated_at`) is maintained by the ORM `onupdate` only; upserts via `INSERT ... ON CONFLICT` must set `updated_at = now()` explicitly in `SET`.
 
@@ -105,13 +113,28 @@ CREATE TABLE player_external_ids (
     source       TEXT NOT NULL,   -- sleeper|espn|yahoo|pfr|fantasypros|sportradar|rotowire
     external_id  TEXT NOT NULL,
     confidence   REAL NOT NULL DEFAULT 1.0,   -- <1.0 means fuzzy-matched; review these
-    match_method TEXT NOT NULL,               -- dynastyprocess|gsis|exact_name|fuzzy|manual
+    match_method TEXT NOT NULL,               -- dynastyprocess|gsis|exact_name|fuzzy|manual|rejected (tombstone, not a mapping — see §3)
     verified_at  TIMESTAMPTZ,
     created_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
     PRIMARY KEY (source, external_id)
 );
 CREATE INDEX player_external_ids_player_idx ON player_external_ids (player_id);
+CREATE UNIQUE INDEX player_external_ids_source_player_uidx ON player_external_ids (source, player_id)
+    WHERE match_method <> 'rejected';   -- PARTIAL: a tombstone is not a mapping (§3)
+```
 
+*Phase 0 note (PR ④, migration `0002_players_team_abbr`):* `player_external_ids_source_player_uidx`
+enforces the `test_crosswalk_no_duplicate_player_ids` invariant below at the DB level — one
+external id per source per player. It was added late: a preflight check found the plan's
+original claim that this was "enforced by construction" was false, since `resolve._persist`
+and `apply_playerids` can each attempt to insert a second id for a source against a player
+that already holds one. Both writers MUST pre-check `(source, player_id)` before insert and
+route the loser to `crosswalk_unmatched` / the ambiguity report — this index is a backstop,
+not their conflict policy; they must not rely on catching the resulting `IntegrityError`.
+The index is **partial** (`WHERE match_method <> 'rejected'`); migration `0003` is what
+guarantees that predicate on databases already stamped at `0002` (deviation 20 in §3).
+
+```sql
 CREATE TABLE nfl_teams (
     team_abbr    TEXT PRIMARY KEY,      -- nflverse convention: KC, LA, LAC, ...
     espn_id      INTEGER UNIQUE,
@@ -202,10 +225,12 @@ changes every VORP baseline.
    `match_method = 'dynastyprocess'`, confidence 1.0.
 2. **GSIS ID** direct match against nflverse. `match_method = 'gsis'`, confidence 1.0.
 3. **Exact match** on `(normalized_name, position, team)`.
-   `match_method = 'exact_name'`, confidence 0.95.
+   `match_method = 'exact_name'`, confidence 0.95. (Team comes from `players.team_abbr`;
+   see the rung-3 notes below.)
 4. **Fuzzy match** on normalized name + position, Jaro-Winkler ≥ 0.92, disambiguated by
    birth date or college where available. `match_method = 'fuzzy'`, **confidence < 0.9 —
-   these require human review before use.**
+   these require human review before use.** (Persisted unverified; `resolve` returns
+   `None` until a human verifies — see the rung-4 notes below.)
 5. **Unmatched** → row in `crosswalk_unmatched`, alert raised, never silently dropped.
 
 ### Name normalization must handle
@@ -214,6 +239,390 @@ Suffixes (`Jr.`, `Sr.`, `III`, `IV`), punctuation (`D.J.` / `DJ` / `D J`), apost
 (`Ja'Marr`), hyphens (`Amon-Ra`), and known aliases (`Robby` / `Robert` Anderson,
 `Cam` / `Cameron`). Defensive units are a special case: sources vary between team
 abbreviation, `KC DST`, and `Chiefs D/ST`.
+
+### Phase 0 implementation notes (PR ④, `ffh.crosswalk`)
+
+Everything below describes what **shipped**, not what the plan intended. Where the shipped
+behaviour is narrower or wider than the ladder as written above, it is called out as a
+numbered deviation at the end of this subsection.
+
+**Alias table and name normalization.** `ffh.crosswalk.normalize.ALIASES` (28 entries;
+applied to the **first token only**, after suffix stripping — Robby/Robbie/Rob/Bob/Bobby→
+Robert, Cam→Cameron, Mitch→Mitchell, Josh→Joshua, Mike→Michael, Matt→Matthew,
+Chris→Christopher, Nick→Nicholas, Pat→Patrick, Will→William, Ken/Kenny→Kenneth,
+Tony→Anthony, Dan/Danny→Daniel, Dave→David, Jim/Jimmy→James, Joe→Joseph, Zach/Zack→
+Zachary, Ben→Benjamin, Gabe→Gabriel, Jon→Jonathan). Team spellings live in
+`normalize.TEAMS` (32 rows: nflverse abbr, city, nickname, MFL/PFR/ESPN/Sleeper aliases).
+`normalize_name` is: **fold accents** (NFKD, drop combining marks — `Andrés Peña` →
+`andres pena`; this MUST precede the character class, which would otherwise turn every
+non-ASCII letter into a space) → lowercase → drop `.` `'` `’` `-` → non-alphanumerics to
+space → merge
+single-letter runs (`D J`→`dj`, so `D.J. Moore` == `DJ Moore` == `D J Moore`) → strip
+trailing `jr sr ii iii iv v` → alias the first token. `Amon-Ra`→`amonra` but `Amon Ra`→
+`amon ra` (the hyphen is removed, a real space is kept) — sources spell it hyphenated.
+Both sides of every comparison go through the same function, so determinism matters more
+than the output looking like a real name. Covered by 59 name / 59 DST+team / 20 position
+parametrized cases in `backend/tests/crosswalk/test_normalize.py` (spec bar: ≥ 40). The
+team table carries every PFR spelling, including the five that look nothing like the team
+(`CRD`=ARI, `RAV`=BAL, `HTX`=HOU, `CLT`=IND, `RAI`=LV) — `pfr` is one of the seven sources.
+
+**DST canonical form.** `players.normalized_name = "<abbr lowercase> dst"` (e.g. `kc dst`),
+`position = 'DST'`, `full_name = "<City> <Nickname> DST"`, `gsis_id NULL`, `team_abbr` set.
+32 rows, created by `registry.seed_dst_players` (insert-only, idempotent). Any spelling
+(`KC`, `KC DST`, `Chiefs D/ST`, `Kansas City`, `KCC`, `KAN`, `LAR`, `WSH`, `Bucs`, …)
+canonicalizes through `normalize_dst`, including a **bare** team abbreviation. Position
+aliases: `DEF`/`D/ST`→`DST`, `PK`→`K`, `FB`/`HB`→`RB`; anything non-fantasy → `None`.
+
+**DST canonicalization precedence — name, then team, then external id.** A source row
+carries several fields that could name a defense and they can *disagree* (a row named
+`Kansas City Chiefs` listed at `DEN`). The precedence is a single explicit argument list,
+`normalize.canonical_dst_key(*candidates)` — first candidate that resolves to a team wins —
+and **both writers call it with the name first**: `resolve._canonical_name` passes
+`(raw_name, raw_team, external_id)`, `dynastyprocess.apply_playerids` passes `(name, team)`.
+The name is what the row is *about*; the team column is a mutable weekly attribute. Before
+this the two writers inlined their own `or` chains in opposite orders, so the same row
+canonicalized to a different defense depending on which writer saw it first — a silently
+wrong mapping, the one failure mode the crosswalk exists to prevent. (Rung 3 additionally
+weighs `players.team_abbr`, so a *ladder* lookup whose `raw_team` contradicts the seeded
+defense still falls through to rung 4 — that is the team rule, not the canonical key.)
+
+**Rungs 1–2 and what persists.** Rung 1 is a lookup of the existing
+`(source, external_id)` row and writes nothing new. **Rungs 2–4 persist** their result, so
+the next call for the same key is a cheap rung-1 hit — with one exception: **rung 2 skips
+persisting when `source == "gsis"`**, because a gsis id filed under source `gsis` would
+duplicate `players.gsis_id`. Consequence worth knowing before you write a coverage query:
+a gsis-sourced resolution returns a 1.0 `Resolution` but leaves **no** `player_external_ids`
+row, so any coverage measured off that table will read short for those ids by design. It
+does still close an open `crosswalk_unmatched` entry for that key (`resolve.close_unmatched`
+is called directly on this branch, since `_persist` — where the call normally lives — is
+skipped): the id resolved at 1.0, and leaving the queue row open would latch the gate red
+on an id nothing is wrong with.
+
+**The authority rule — a 1.0 fact beats an unverified guess.** Both writers hit the same
+state: the incoming id belongs to a player who *already* holds an id for that source
+(`player_external_ids_source_player_uidx` allows exactly one). The ruling is by
+**authority, not arrival order**:
+
+* Incoming row is a 1.0 fact (`gsis` / `dynastyprocess` / `manual`) **and** the incumbent
+  is an unverified guess (`match_method` not in `{dynastyprocess, manual, rejected}` **and**
+  `verified_at IS NULL`) → **the fact wins.** The guess is deleted and *its* external id is
+  upserted into `crosswalk_unmatched` (`crosswalk.resolve.incumbent_displaced` /
+  `crosswalk.dynastyprocess.incumbent_displaced`, `CrosswalkApplyReport.displaced`).
+* Otherwise → **the holder wins** and the *incoming* id goes to `crosswalk_unmatched`
+  (`crosswalk.resolve.duplicate_for_source` / `CrosswalkApplyReport.blocked_by_existing`).
+
+Either way exactly one id ends up mapped and the other ends up on the gate — never
+dropped. Without this, an unverified `exact_name` 0.95 or `fuzzy` 0.89 guess outranked a
+1.0 gsis/DynastyProcess fact simply by having got there first — the opposite of the ruling
+rung 1's upgrade path already makes.
+
+**Rejection tombstones.** `ffh crosswalk verify <source> <id> --reject` does **not** delete
+the row. It rewrites it as `match_method = 'rejected'`, `confidence = 0.0`,
+`verified_at = NULL`, keeping the rejected `player_id`. A deletion is forgotten by the next
+sync, which re-mints the identical wrong mapping — and `close_unmatched` then turns the
+gate **green on a mapping a human explicitly rejected** (for a rung-4 row the loop never
+ends: re-mint, red, reject, re-mint). The tombstone is what makes a rejection durable:
+
+* It is **not a mapping**: rung 1 records the key unmatched and returns `None`; `is_usable`
+  returns false regardless of `verified_at`; `verify_mapping` refuses to stamp one; the
+  report excludes it from `unverified_low_confidence` (its gate signal is the open
+  `crosswalk_unmatched` row); it is excluded from the rung-3/4 "already mapped for this
+  source" candidate filter.
+* It does **not occupy** the player's slot for that source — the unique index is PARTIAL
+  (`WHERE match_method <> 'rejected'`, migration 0002), so the *correct* id can still map
+  to that player.
+* Re-minting the **same** `(source, external_id) → player_id` pairing is refused by
+  `_persist` and by `apply_playerids` (`CrosswalkApplyReport.blocked_by_rejection`). A
+  **different** player is allowed — that is the correction the rejection asked for.
+* The escape is `ffh crosswalk map` (below), which replaces the tombstone with a `manual`
+  mapping. That is the only path from "rejected" back to exit 0 with the id *mapped*
+  (`resolve-unmatched` only silences the queue entry).
+
+**Rung 3 (`exact_name`) and team.** Candidates are `players` rows with the same
+`(normalized_name, position)` that **do not already hold an id for this source**. Then:
+no team supplied → match iff exactly one candidate remains; team supplied → keep the
+candidates whose `team_abbr` equals it **or is NULL**, match iff exactly one remains.
+The "already mapped" exclusion is a no-duplicate mechanism, **not evidence about
+identity**, so the pick is made twice: once on the post-exclusion set and once on the
+pre-exclusion set. They must agree. When the exclusion is the only reason the answer looks
+unique — two same-name/same-position players and one of them already holds an id for this
+source — rung 3 refuses rather than minting a *usable* 0.95 on the homonym, and the id
+falls straight to rung 5 with `reason="homonym_blocked_by_existing_mapping"`
+(`crosswalk.resolve.homonym_blocked_by_existing_mapping`). A team that disambiguates is
+real evidence and still matches.
+A team disagreement never matches at rung 3 — it falls through to rung 4.
+`players.team_abbr` is refreshed from nflverse `latest_team` by `seed_players` (and set
+from the DynastyProcess `team`, MFL-style, for rows created there); it is a tie-breaker
+only, never roster truth.
+
+**Rung 4 (`fuzzy`) semantics.** rapidfuzz `JaroWinkler.normalized_similarity ≥ 0.92`
+against same-position players not already mapped for the source, then two disambiguation
+legs on birth date and college: **negative** first (a candidate whose stored value is
+non-NULL and differs from the supplied value is eliminated), then **positive**. The
+positive leg differs by column: on **birth date** (exact equality) confirmation keeps only
+the confirmed survivors; on **college** it keeps the confirmed survivors **plus every
+candidate whose stored college is NULL** — an unknown college is no evidence *against* a
+candidate, and evicting it hands the id to a lower-similarity homonym that merely happens
+to have a college on file. Whatever survives is then ruled on by the tie margin, which can
+legitimately end in "no match". Two survivors within
+`0.01` = tie = no match (falls to rung 5). A hit is **persisted** with
+`match_method='fuzzy'`, `confidence = min(similarity, 0.89)`, `verified_at NULL`, and
+`resolve` returns `None` — the outcome is "pending review", not "unmatched", and the row
+is *not* written to `crosswalk_unmatched`. `ffh crosswalk verify <source> <id>` sets
+`verified_at`; `--reject` tombstones the row (above) and parks the id in
+`crosswalk_unmatched`. The two disambiguation legs are **symmetric**: college agreement is
+a shared meaningful token or either string containing the other (`"Ohio St."` agrees with
+stored `"Ohio State"`; `"Michigan State"` does not agree with `"Ohio State"`) — an
+asymmetric `needle in stored` test eliminated correct candidates. When candidates existed
+but the evidence ruled them all out, rung 5 records `reason="fuzzy_eliminated"` (with
+`crosswalk.resolve.fuzzy_eliminated` naming the leg) or `"fuzzy_tie"`, never the
+`"no_candidate"` that means "no name matched at all".
+
+**Rung 5.** `crosswalk_unmatched` upsert (`resolve.upsert_unmatched`, the single writer):
+`first_seen` defaults on insert; on conflict the raw fields refresh, `last_seen` advances
+with **`clock_timestamp()`**, and `resolved` flips back to `false`.
+
+**Consumer filter rule.** A `player_external_ids` row is usable iff
+`match_method <> 'rejected' AND (confidence >= 0.9 - epsilon OR verified_at IS NOT NULL)` —
+`ffh.crosswalk.resolve.is_usable`.
+`resolve` / `resolve_many` already apply it; **any direct SQL over `player_external_ids`
+must too.** The epsilon is not cosmetic: `confidence` is Postgres `REAL` (float4), so a
+stored `0.9` reads back as `0.899999976…` and a naive `>= 0.9` would reject rows that are
+supposed to pass. Use the exported `resolve.USABLE_CONFIDENCE` and
+`resolve.CONFIDENCE_EPSILON` (`1e-6`) — `report.py`'s SQL predicate uses the identical pair.
+
+**Review-queue lifecycle.** `crosswalk_unmatched.resolved` is set `true` at every point a
+mapping row is **created** for the key — `resolve._persist`,
+`dynastyprocess.apply_playerids` and `review.map_mapping`, and no other mapping-creation
+path — plus the one resolution that creates no row: a rung-2 hit with `source == "gsis"`
+(above). The human review
+commands close it too: `ffh crosswalk verify` closes the entry;
+`ffh crosswalk map <source> <id> <player_id>` creates a `manual` 1.0 verified mapping and
+closes it; `--reject` deliberately leaves it **open** (the id is now unmapped and must stay
+on the gate); `ffh crosswalk resolve-unmatched <source> <id>` closes an entry that will
+never map (retired, practice squad, non-NFL).
+
+`resolve-unmatched` **refuses while the key still has a live (non-tombstone) mapping row**
+and prints the operator's real options, because that state is not "an id that will never
+map" — it is a mapping under dispute, and closing the queue row would green the gate while
+`resolve` keeps handing consumers the contradicted player. Rule on it with
+`verify --reject` or `map`; `--force` restores the unconditional close for the rare case
+where the mapping is accepted as-is. (`ffh crosswalk verify` closes the entry through the
+same `force` path: accepting the mapping *is* the decision.)
+
+**A queue entry re-opens only when the id is described differently.** `upsert_unmatched`
+sets `resolved = false` on conflict *only* when a `raw_*` field actually changed
+(`IS DISTINCT FROM`, NULL-safe). An unconditional re-open undid the operator's ruling on
+every seed: the permanently-glitched DynastyProcess ids (DATA_SOURCES.md §5) are re-asserted
+verbatim by every weekly snapshot, so the gate could never reach green. Three states deliberately leave one key in
+*both* tables so `ffh crosswalk report` keeps exiting 1 on it: `upgrade_conflict`,
+`human_decision_conflict` (a `manual`/verified row contradicted by a 1.0 gsis fact — the
+human decision stands and is still returned, but the dispute is on the gate, not only in a
+log line), and a rejection tombstone.
+
+**Every id a writer refuses to map is queued.** Not just rung 5: the ids
+`apply_playerids` drops for ambiguity, the losers of the authority rule, the ids blocked
+by a tombstone, and the incumbents displaced by a 1.0 fact all land in
+`crosswalk_unmatched`. A report field and a log line are not the gate — a known
+fantasy-relevant id that is unmapped must make `ffh crosswalk report` exit 1.
+
+**Exit codes (both crosswalk commands).** `0` = green. `1` = **gate red**, a data state a
+human resolves. `2` = `CrosswalkConflictError`, a crosswalk conflict a human must rule on
+(nothing is committed). `3` = **operational failure** — a malformed CSV, a truncated or
+missing lake partition, a database outage. 3 exists because an operational failure used to
+exit 1 as well, leaving a cron wrapper unable to tell "the crosswalk has a gap" from "the
+run never happened"; `ffh crosswalk seed` and `ffh crosswalk report` both wrap their whole
+guarded region (frame reads, `seed_players`, `apply_playerids`, the report query).
+
+**stdout is data, stderr is everything else.** `ffh crosswalk seed --playerids` and
+`ffh crosswalk report --json` write one JSON object to stdout and nothing else, so both
+pipe into `jq`; progress lines, errors and every structlog line go to stderr. structlog's
+default sink is stdout, so `ffh` configures it once at CLI entry (`ffh.log`) — without
+that, a single log line makes the JSON unparseable.
+
+**`ffh crosswalk report`** exits 1 if any `crosswalk_unmatched` row is open, any
+unverified `confidence < 0.9` non-tombstone row exists, **or the crosswalk is empty**
+(`players_total == 0` or no `player_external_ids` rows at all). Emptiness is the state
+where every downstream lookup silently finds no player, and it produces zero unmatched and
+zero unverified rows — so without that floor the gate reads green on a database where
+nothing was ever seeded. `--allow-empty` opts out for a deliberate pre-seed invocation — and the printed verdict
+line and the JSON `ok` field follow that same gate decision, so neither can contradict the
+exit code of the run that produced it (the un-flagged verdict stays available as
+`ok_strict`, and `NOT SEEDED` is still printed either way). **`ffh crosswalk map SOURCE
+EXTERNAL_ID PLAYER_ID`** writes the human decision (`manual`, confidence 1.0,
+`verified_at` stamped) and closes the queue entry; it refuses an unknown `player_id` and
+pre-checks the `(source, player_id)` unique index, reporting the clash by name instead of
+raising an `IntegrityError`. It is the only way an id in `crosswalk_unmatched` becomes
+*mapped* rather than merely silenced, and the only escape from a tombstone.
+
+**DynastyProcess apply policy** (`dynastyprocess.apply_playerids`, rung 1 bulk load):
+positions normalized; non-fantasy rows and rows with no id are skipped and **counted**;
+player assignment is `gsis_id` → registry player, else any already-mapped id → its player,
+else a placeholder (`gsis:<id>` / `mfl:<mfl_id>`) that becomes a new `players` row
+(rookies/UDFAs) — except for DST rows, which resolve against the seeded `<abbr> dst`
+players (see deviation 11) and never take the placeholder path. Rows with **neither a `gsis_id` nor an `mfl_id`** have no person key
+at all — their placeholder would be the literal `"mfl:None"`, shared by every such row, so
+one invented `players` row would accumulate ids belonging to several different people (the
+ambiguity pass catches only the overlapping case, never the disjoint one). They are counted
+in `skipped_no_person_key` and dropped. Ids appearing on more than one player, or a player
+holding more than one id for a source, are reported **and queued in `crosswalk_unmatched`**,
+split by cause: `ambiguous_in_file` (DynastyProcess contradicts itself) vs
+`blocked_by_existing` (a DB row won the authority rule) vs `blocked_by_rejection` (a
+tombstone), with `displaced` naming the guesses DP evicted. An ambiguous key that already
+has a **live mapping** is reported but NOT queued — it *is* mapped, and queueing it
+re-opened the entry on every seed. An existing
+row pointing at a *different* player raises `CrosswalkConflictError` **before any write**
+— the conflict scan runs before placeholder players are created *and* before the ambiguity
+queueing, so an aborted seed leaves nothing behind in either table. The raise is reserved
+for an incumbent that **outranks** DP's 1.0 fact (`manual`, `dynastyprocess`, verified, or a
+tombstone). An unverified `exact_name`/`fuzzy` guess pointing elsewhere is not a conflict —
+it is exactly what rung 1's upgrade path re-points without complaint — so it is re-pointed
+in place (`crosswalk.dynastyprocess.stale_guess_repointed`, counted in `updated`) rather
+than aborting the entire seed, which discards `seed_players` along with it. Ids are stored as TEXT
+exactly as in the CSV, and a Parquet round-trip that typed them as floats is rejected
+rather than silently mangled (`4046.0` must never become `"4046.0"`).
+
+**Deviations from §3 as written above — all shipped deliberately:**
+
+1. **`players.team_abbr` added** (migration `0002_players_team_abbr`) — §3 rung 3 matches
+   on team and the table had no team column. Tie-breaker only, never roster truth.
+2. **Rung-4 hits are persisted unverified and `resolve` returns `None`** for them. This is
+   *how* §3's "require human review before use" is implemented: the candidate mapping is
+   not lost, but no consumer can use it until `verify` stamps `verified_at`.
+3. **`crosswalk_unmatched.last_seen` bumps with `clock_timestamp()`, not `now()`** —
+   `now()` is transaction-constant, so within a single sync it would never advance.
+4. **One id per source per player is enforced by a PARTIAL UNIQUE index**
+   (`player_external_ids_source_player_uidx`, added in 0002,
+   `WHERE match_method <> 'rejected'` — tombstones are not mappings and must not squat a
+   player's slot) **plus an in-code pre-check in both writers** —
+   stronger than §3, which asked only for a test. The plan's original "enforced by
+   construction" claim was disproved during verification. Writers pre-check
+   `(source, player_id)` and apply the **authority rule** (above): a 1.0 fact displaces an
+   unverified guess and the *guess's* id goes to `crosswalk_unmatched`; otherwise the
+   holder wins and the *incoming* id goes there. Either way the loser is queued — in
+   `apply_playerids` it is queued *and* reported. The index is a backstop, not the policy.
+5. **Rung 1 is generalized** from "the DynastyProcess lookup" to "**any** existing
+   `player_external_ids` row" — it is the cache that makes repeat syncs cheap. It gains an
+   **upgrade path**: *every* rung-1 row is re-checked against a supplied `gsis_id`. A
+   **1.0** row is never rewritten (it is a fact, not a guess), but a gsis id naming a
+   *different* player is two 1.0 facts in contradiction: it logs
+   `crosswalk.resolve.human_decision_conflict` and queues the key, while the stored row is
+   still returned. Gating this check on `confidence < 1.0` made it unreachable for every
+   row `ffh crosswalk map` can actually write (`manual`, confidence 1.0, verified), i.e.
+   for every real human decision. For a row **below** 1.0: a *different* player means the
+   gsis fact wins and the stored row is corrected (`verified_at` cleared); the *same*
+   player upgrades the stored method/confidence to `gsis`/1.0. Rows that are `verified_at IS NOT NULL` or `match_method = 'manual'` are
+   locked against this entirely: a *disagreeing* gsis id logs
+   `crosswalk.resolve.human_decision_conflict`, changes nothing **and queues the key in
+   `crosswalk_unmatched`** so the dispute is on the gate rather than only in a log; a
+   *confirming* one is dropped without a log (the lock is wider than the case it exists
+   for — a known follow-up, not a behaviour to rely on). If a correction would give the
+   target player a second id for the source, the authority rule decides: an unverified
+   incumbent is displaced, otherwise the incoming id is routed to `crosswalk_unmatched`
+   (`crosswalk.resolve.upgrade_conflict`) rather than returning a mapping the gsis fact
+   just contradicted.
+6. **Rung 3 excludes candidates that already hold an id for that source** — and so does
+   rung 4 (tombstones excluded from both). This is part of the no-duplicate mechanism, and
+   rung 3 checks that the exclusion is not what *created* the match (above): a homonym
+   pair with one member already mapped goes red rather than minting a usable 0.95 guess.
+   Consequence: a *wrong* id occupying a player's slot keeps the *correct* id unmatched
+   until a human runs `ffh crosswalk verify <source> <id> --reject` (or the authority rule
+   displaces it automatically, when the correct id arrives as a 1.0 fact). Visibility was
+   originally claimed unconditionally; it is true **only where the losing id is queued**.
+   That is now every path — `resolve`'s rungs *and* `apply_playerids`' ambiguity /
+   blocked / displaced buckets — but before this wave the DynastyProcess buckets were
+   report-and-log only, so `ffh crosswalk report` could exit 0 with known ids unmapped.
+7. **Rung 3's team rule is relaxed:** `team is None` matches iff exactly one candidate
+   remains, and a NULL `players.team_abbr` counts as compatible with any supplied team.
+8. **Rung 4 disambiguates in both directions** (negative elimination then positive
+   confirmation, above) rather than merely tolerating NULLs. A candidate with a NULL
+   **birth date** loses to one whose birth date matches the input. A candidate with a NULL
+   **college** does not: confirmation keeps it alongside the confirmed ones and the tie
+   margin rules. NULL is the absence of evidence, and evicting on it handed ids to
+   lower-similarity homonyms; the price is that a college can no longer break a tie
+   against an unknown-college candidate, which falls to rung 5 as it should.
+9. **`seed_players(session, df)`** takes a Polars frame, not a lake path: the lake read
+   lives in the CLI (`ffh crosswalk seed`). This is what keeps `ffh.crosswalk` free of
+   `ffh.ingest` (the sole exception is `DynastyProcessPlayerIdsJob`) and testable with no
+   network.
+10. **Review-queue lifecycle** (above) is a mechanism §3 does not describe: `resolved` is
+    maintained at the mapping-creation sites (plus the row-less `source == "gsis"` rung-2
+    hit), `--reject` deliberately re-opens/keeps open, `ffh crosswalk map` is the
+    operator's path to *mapped*, and `resolve-unmatched` is the path back to exit 0 for an
+    id that will never map — refused while a live mapping still contradicts it, and
+    re-opened by a later `upsert_unmatched` only when a `raw_*` field changed.
+11. **`CrosswalkApplyReport.skipped_dst`** — DynastyProcess rows whose position normalizes
+    to DST/DEF **do** get mapped: the row resolves to the seeded `<abbr> dst` player via
+    `canonical_dst_key(name, team)` (name-first — see the DST canonicalization precedence
+    above), or failing that to whatever player one of its ids is already crosswalked to. Only a row matching *neither* is counted in
+    `skipped_dst` and skipped — counted and logged, never silently dropped. What a DST row
+    can never do is fall through to the placeholder path and mint a `players` row: defenses
+    exist only as the 32 rows `seed_dst_players` creates. (The live file has no DST rows
+    today; the counter exists so a future one cannot invent a 33rd defense.)
+
+12. **`match_method = 'rejected'` is a fourth kind of row** (tombstone), alongside the
+    ladder's mapping methods. §3 lists only the five rungs; a rejection had nowhere to
+    live, so it was a deletion and therefore not durable.
+13. **`ffh crosswalk map SOURCE EXTERNAL_ID PLAYER_ID`** — `manual` was already
+    first-class in the ladder, the human-decision lock and these docs, but nothing could
+    *create* one. Without it an id in `crosswalk_unmatched` had no operator path to
+    becoming mapped, only to being silenced.
+14. **`resolve_many` runs in priority passes, not one ordered walk.** Rungs 2-4 persist
+    and rungs 3-4 exclude already-mapped players, so a rung-4 guess early in a batch could
+    claim the player a later rung-3 exact match wanted. Pass 1 walks the whole batch with
+    rung 4 deferred (persisting nothing for those inputs), pass 2 re-runs only the deferred
+    ones. The gsis-first ordering inside pass 1 is unchanged; single-id `resolve()` is
+    unaffected. Both passes share one rung-4 **candidate-pool cache** keyed on
+    `(source, position)`, so "every unmapped same-position player" is selected once per
+    key for the whole batch instead of once per input; `_persist` drops a player from the
+    cached pools the moment it claims his slot (what the reload's
+    `NOT IN (mapped for source)` filter would have excluded), and the rarer paths that
+    *free* a player invalidate the pools for that source. `resolve()` passes no cache.
+15. **`ffh crosswalk seed` / `report` exit 3 on operational failure** and the report has an
+    **emptiness floor** plus `--allow-empty` (both above). §3 defined only the green/red
+    gate, which silently conflated "the crosswalk has a gap" with "the run never happened",
+    and read green on a database where nothing had been seeded at all.
+16. **DynastyProcess re-points a stale unverified guess instead of raising** (above). §3
+    and the original policy treated any mismatching existing row as a conflict, so one
+    stale ladder guess aborted the whole seed — including `seed_players`, which is
+    committed in the same transaction.
+17. **Name normalization folds accents** (NFKD + combining-mark strip) rather than
+    deleting non-ASCII letters, and rung 4's college leg is symmetric. Both were silent
+    wrong-answer bugs: `Andrés Peña` could never match `Andres Pena`, and `"Ohio St."`
+    eliminated the candidate stored as `"Ohio State"`.
+18. **`apply_playerids` reconciles placeholder duplicates before anything else**
+    (`CrosswalkApplyReport.merged_placeholders`, `crosswalk.dynastyprocess.placeholder_merged`).
+    A DP row with no `gsis_id` mints a placeholder `players` row carrying `gsis_id NULL`;
+    when nflverse later publishes that person, `seed_players`' ON CONFLICT is on `gsis_id`
+    and **NULL conflicts with nothing**, so it inserts a *second* `players` row for the same
+    human. Every later seed then failed permanently: the DP row resolves by gsis to the new
+    row while its ids still point at the placeholder, and the incumbent is `dynastyprocess`
+    — protected, never re-pointed — so the conflict scan raised on every run; rung 3 saw two
+    `(normalized_name, position)` candidates and returned `None`. The pre-pass repoints the
+    placeholder's `player_external_ids` rows (tombstones included) at the gsis player and
+    deletes the placeholder. It is the **one write that precedes the conflict scan**,
+    because it is the repair that unblocks that scan; an id it cannot carry over (the
+    keeper already holds a live id for that source) is deleted and queued, never dropped.
+    Seeded DST rows are excluded explicitly — they also carry a NULL `gsis_id`.
+19. **The crosswalk write commands take a Postgres advisory lock** —
+    `ffh crosswalk seed` / `map` / `verify` / `resolve-unmatched` wrap their session in
+    `ffh.db.lock.advisory_lock(session, "ffh.crosswalk/apply")` (the same helper
+    `ffh.ingest.base` uses, lifted into `ffh.db` so there is exactly one implementation).
+    All four read `player_external_ids`, decide `(source, player_id)` slot ownership, then
+    write — `apply_playerids` for ~12.5k rows at a time — and that plan is TOCTOU: two
+    concurrent runs (a cron overlapping a manual re-run) can both pass the same pre-check.
+20. **Migration `0003` re-creates `player_external_ids_source_player_uidx`.** The partial
+    predicate was added to `0002` *after* that revision had already been applied somewhere,
+    and Alembic records revisions rather than their content — so a database stamped at 0002
+    silently kept the non-partial index while a freshly created one got the partial form.
+    `0003` drops and recreates it unconditionally. Both migrations' docstrings carry the
+    duplicate pre-flight scan and the `pg_indexes` post-deploy verification query, because
+    `CREATE UNIQUE INDEX` fails the deploy outright on pre-existing duplicates and
+    `alembic check` is blind to a missing predicate.
+21. **`DynastyProcessPlayerIdsJob` enforces a row-count floor** (`DP_MIN_ROWS = 8000`
+    against a live file of ~12,472). `validate` previously rejected only an *empty* frame,
+    so a truncated upstream snapshot landed as a successful partition — and since the lake
+    never overwrites a partition, that day could not then be cleanly re-landed.
 
 ### Mandatory tests — these are not optional
 
@@ -225,6 +634,14 @@ test_crosswalk_no_duplicate_player_ids       no two external IDs from the same s
                                              to one player_id (and vice versa)
 test_crosswalk_low_confidence_reviewed       no confidence < 0.9 row is used unverified
 ```
+
+*Phase 0 status (PR ④):* `test_crosswalk_no_duplicate_player_ids` and
+`test_crosswalk_low_confidence_reviewed` ship in
+`backend/tests/crosswalk/test_crosswalk_invariants.py` under exactly those names.
+`test_crosswalk_covers_all_rostered_players` lands with the Sleeper adapter (PR ⑤ — it
+needs a fixture league) and `test_crosswalk_covers_top_300_adp` with ADP ingest (PR ⑥ — it
+needs an ADP snapshot). **Until both land, §3 is only half-tested**; Phase 0's exit
+criteria are not met by PR ④ alone.
 
 ```sql
 CREATE TABLE crosswalk_unmatched (

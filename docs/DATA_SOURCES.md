@@ -279,12 +279,67 @@ IANA name. The column is `stadium_name`, not `name`.
 
 | Source | URL | Key | Cadence | Use for |
 |---|---|---|---|---|
-| **DynastyProcess player IDs** | `raw.githubusercontent.com/dynastyprocess/data/master/files/db_playerids.csv` | No | Weekly | ⭐ **The crosswalk.** See `docs/DATABASE.md` |
+| **DynastyProcess player IDs** | `raw.githubusercontent.com/dynastyprocess/data/master/files/db_playerids.csv` | No | Weekly | ⭐ **The crosswalk.** Job `dynastyprocess_playerids`; see below and `docs/DATABASE.md` §3 |
 | **DynastyProcess ECR history** | `.../files/db_fpecr.parquet` | No | **Weekly, Fridays** | FantasyPros expert consensus w/ `sd`, `best`, `worst` — the dispersion feeds tier clustering |
 | **DynastyProcess values** | `.../files/values-players.csv` | No | Weekly | `ecr_1qb`, `ecr_2qb`, `value_1qb`, `value_2qb` |
 | **FantasyCalc** | `api.fantasycalc.com/values/current?isDynasty=false&numQbs=1&numTeams=12&ppr=1` | No | Continuous | ⭐ **Market trade values** from ~1M real trades. `trend30Day` included. The market half of trade arbitrage. |
 | **Fantasy Football Calculator** | `fantasyfootballcalculator.com/api/v1/adp/{ppr\|half-ppr\|standard\|2qb}?teams=12&year=2026` | No | Continuous | True ADP from real mock drafts. ⚠️ Unverified — robots.txt blocked automated checking. **Test before depending on it.** |
 | **Sleeper projections** | `api.sleeper.com/projections/nfl/{season}/{week}` | No | ~Daily | Rotowire projections + `adp_dd_ppr` |
+
+### DynastyProcess `db_playerids.csv` — verified live 2026-08-16 (PR ④)
+
+**12,472 rows × 35 columns**, `NA` is the null sentinel. The URL above is exactly what
+`ffh.crosswalk.dynastyprocess.DP_URL` requests
+(`https://raw.githubusercontent.com/dynastyprocess/data/master/files/db_playerids.csv`).
+
+Columns — ids: `mfl_id sportradar_id fantasypros_id gsis_id pff_id sleeper_id nfl_id
+espn_id yahoo_id fleaflicker_id cbs_id pfr_id cfbref_id rotowire_id rotoworld_id ktc_id
+stats_id stats_global_id fantasy_data_id swish_id`; attributes: `name merge_name position
+team birthdate age draft_year draft_round draft_pick draft_ovr twitter_username height
+weight college db_season`. Of these, seven map to `player_external_ids.source`:
+`sleeper_id espn_id yahoo_id pfr_id fantasypros_id sportradar_id rotowire_id`.
+
+Gotchas, all confirmed against the live file — these contradict what you would guess:
+
+- **Kickers are `PK`, not `K`** (`normalize_position` maps `PK`→`K`, `FB`/`HB`→`RB`).
+- **There are no DST/DEF rows at all.** The 32 defenses come only from
+  `ffh.crosswalk.registry.seed_dst_players`. Should a future file add DST rows,
+  `apply_playerids` maps each one to the seeded `<abbr> dst` player (by `team`, then by
+  `name`) or to whatever player one of its ids is already crosswalked to; a row matching
+  neither is counted in `CrosswalkApplyReport.skipped_dst` and skipped. Either way a DST
+  row never mints a `players` row.
+- **`team` uses MFL codes**, not nflverse: `KCC TBB GBP NEP NOS SFO LVR LAR JAC` plus
+  historic `OAK SDC STL RAM` and `FA` / `FA*`. Everything goes through `normalize_team`.
+- **Every id column must be read as text.** `sportradar_id` is a UUID, `pfr_id` is
+  alphanumeric (`CartKy01`), and a numeric id that passes through a float becomes
+  `"4046.0"` — silent corruption of the highest-risk table in the system.
+  `read_playerids_csv` forces `pl.Utf8` on the id columns and the ingest job re-asserts it
+  before landing Parquet.
+- **~144 QB/RB/WR/TE/PK rows have a `sleeper_id` but no `gsis_id`** (2026 rookies and
+  UDFAs). If none of the row's ids is already crosswalked, it is keyed on an
+  `mfl:<mfl_id>` placeholder and creates a new `players` row; if any of them *is* already
+  mapped, the row joins that player instead — which is what makes a re-run idempotent for
+  rookies rather than minting a duplicate every week.
+- **The file contains duplicate-id glitch rows.** Two rows (`Fred Williams` / `Kevin Smith`,
+  both WR) share every id including `gsis_id 00-0031320` but differ on `rotowire_id`;
+  `espn_id 2582138` and `pfr_id CartKy01` each appear on two different TEs. This is why
+  `apply_playerids` has an ambiguity policy — such ids are reported in
+  `CrosswalkApplyReport.ambiguous_in_file` (the sibling buckets are `blocked_by_existing`,
+  `blocked_by_rejection` and `displaced`) **and queued in `crosswalk_unmatched`** so the
+  gate sees them, never applied. The glitches are *permanent*, so the queueing is
+  idempotent in both directions: an ambiguous id that already has a live mapping is
+  reported but not queued, and re-asserting an id verbatim never re-opens a queue entry an
+  operator already closed (DATABASE.md §3, review-queue lifecycle). Without that, every
+  weekly seed re-opened the same rows and `ffh crosswalk report` could never reach exit 0.
+
+**Ingest:** job `dynastyprocess_playerids` (`ffh ingest run dynastyprocess_playerids`) —
+weekly full snapshot, ETag-conditional, no `persist()`. It lands
+`raw/dynastyprocess/playerids/scrape_date=YYYY-MM-DD/playerids.parquet` in the lake;
+Postgres is populated separately by `ffh crosswalk seed --playerids <parquet>`. Note that
+this command always seeds the `players` registry first — from `--players` or, by default,
+the newest `raw/nflverse/players` partition — and *then* calls `apply_playerids` on the DP
+frame. There is no way to apply DP ids alone, and that is deliberate: the ids need a
+registry to attach to.
 
 ⚠️ **ECR is an ordinal ranking, not projected points.** Use it for tier clustering and as a
 sanity check on our own projections — never as a projection itself.

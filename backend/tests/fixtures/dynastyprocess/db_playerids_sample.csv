@@ -1,0 +1,14 @@
+mfl_id,sportradar_id,fantasypros_id,gsis_id,sleeper_id,espn_id,yahoo_id,pfr_id,rotowire_id,name,merge_name,position,team,birthdate,draft_year,college
+13116,11cad59d-90dd-449c-a839-dddaba4fe16c,16413,00-0033873,4046,3139477,30123,MahoPa00,11839,Patrick Mahomes,patrick mahomes,QB,KCC,1995-09-17,2017,Texas Tech
+15281,fa99e984-d63b-4ef4-a164-407f68a7eeaf,19788,00-0036900,7564,4362628,33393,ChasJa00,15183,Ja'Marr Chase,jamarr chase,WR,CIN,2000-03-01,2021,LSU
+13635,d8202e6d-d03b-4cd1-a793-ff8fd39d9755,17265,00-0034827,4983,3915416,30994,MoorD.00,12477,D.J. Moore,dj moore,WR,BUF,1997-04-14,2018,Maryland
+15711,22ee9bac-a64c-4d44-94fc-51d775465b3b,23021,00-0038134,8151,4567048,33996,WalkKe00,15909,Kenneth Walker III,kenneth walker,RB,KCC,2000-10-20,2022,Michigan State
+13354,4ceb866c-8eaf-49b5-9043-56228e43a2e5,16712,00-0033303,4227,3055899,30346,ButkHa00,11783,Harrison Butker,harrison butker,PK,KCC,1995-07-14,2017,Georgia Tech
+17471,125e9b80-426b-11f1-9d61-c7109dbf1b70,28082,NA,13427,5084180,NA,NA,19290,Diego Pavia,diego pavia,QB,FA,2002-02-16,2026,Vanderbilt
+11367,67da5b5c-0db9-4fbc-b98d-7eb8e97b69f6,11798,00-0029892,1379,16002,26753,JuszKy00,8930,Kyle Juszczyk,kyle juszczyk,RB,SFO,1991-04-23,2013,Harvard
+16614,e8da21a8-796d-48a2-b644-57d08983ae01,23064,00-0039849,11628,4432708,40893,HarrMa09,17674,Marvin Harrison Jr.,marvin harrison,WR,ARI,2002-08-11,2024,Ohio State
+17556,8095554c-7eae-4e7c-9213-01f24ceb0185,28053,00-0041509,13377,4950400,NA,ReesAr00,19273,Arvell Reese,arvell reese,LB,NYG,2005-08-30,2026,Ohio State
+12459,2092561a-fc19-4c9a-9695-2f5a537717be,NA,00-0031320,2295,17257,28118,SmitKe04,9898,Fred Williams,fred williams,WR,KCC,1988-04-15,2014,St. Cloud State
+12571,2092561a-fc19-4c9a-9695-2f5a537717be,NA,00-0031320,2295,17257,28118,SmitKe04,10167,Kevin Smith,kevin smith,WR,SEA,1991-12-21,2014,Washington
+99900,NA,NA,NA,NA,NA,NA,NA,NA,Nobody Nowhere,nobody nowhere,QB,FA,NA,NA,NA
+99901,NA,NA,NA,KC,-16012,NA,NA,NA,Kansas City Chiefs,kansas city chiefs,DEF,KCC,NA,NA,NA

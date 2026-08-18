@@ -21,6 +21,7 @@ def test_ingest_list_shows_every_registered_job():
         "nflverse_pbp",
         "nfldata_games",
         "stadiums",
+        "dynastyprocess_playerids",
     ):
         assert name in result.stdout
     assert "no ingest jobs registered" not in result.stdout
@@ -45,7 +46,10 @@ def test_ingest_run_prints_json_and_exits_zero_on_success(monkeypatch):
 
     result = runner.invoke(app, ["ingest", "run", "nfldata_games", "--season", "2026"])
     assert result.exit_code == 0, result.stdout
-    payload = json.loads(result.stdout.strip().splitlines()[-1])
+    # The WHOLE of stdout, not `.splitlines()[-1]`: `ffh ingest run` writes one JSON object
+    # to stdout and nothing else. The last-line workaround existed because structlog's
+    # unconfigured sink dumped log lines onto the same stream (ffh.log).
+    payload = json.loads(result.stdout)
     assert payload == {
         "job": "nfldata_games",
         "status": "success",

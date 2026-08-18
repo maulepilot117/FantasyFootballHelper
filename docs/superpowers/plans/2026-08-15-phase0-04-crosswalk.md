@@ -10,6 +10,37 @@
 
 **Spec:** `docs/superpowers/specs/2026-08-15-phase0-foundation-design.md` §4 · authoritative requirements: `docs/DATABASE.md` §2–§3 · overview and locked scope: `docs/superpowers/plans/2026-08-15-phase0-00-overview.md` (section "④ feat/crosswalk").
 
+> ## ⚠️ SUPERSEDED IN PART BY WHAT SHIPPED — read this first
+>
+> This is the **plan** PR ④ was built from, kept as the record of intent. Where it and the
+> shipped code disagree, the shipped code and `docs/DATABASE.md` §3 win. Two things in
+> particular were revised during implementation and the adversarial review waves:
+>
+> 1. **The consumer filter rule gained a tombstone conjunct.** Every restatement of
+>    `confidence >= 0.9 OR verified_at IS NOT NULL` below is **wrong on its own**. The
+>    canonical rule is `docs/DATABASE.md` §3 "Consumer filter rule":
+>
+>    ```sql
+>    match_method <> 'rejected' AND (confidence >= 0.9 - epsilon OR verified_at IS NOT NULL)
+>    ```
+>
+>    `ffh.crosswalk.resolve.is_usable(confidence, verified_at, match_method)` is its Python
+>    form — `match_method` is **mandatory**, not the optional third argument the plan's
+>    2-argument signature implies — and `resolve.LIVE_MAPPING` is the first conjunct as a
+>    reusable SQLAlchemy clause. The epsilon (`resolve.CONFIDENCE_EPSILON`, `1e-6`) is not
+>    cosmetic: `confidence` is Postgres `REAL`, so a stored `0.9` reads back as
+>    `0.899999976…`.
+> 2. **`CrosswalkApplyReport.ambiguous` no longer exists.** The single bucket was split
+>    into four, so an operator can tell the causes apart: `ambiguous_in_file`,
+>    `blocked_by_existing`, `blocked_by_rejection`, `displaced` — plus the counters
+>    `merged_placeholders`, `skipped_dst` and `skipped_no_person_key`. All four tuple
+>    buckets are also queued in `crosswalk_unmatched`, so a known-but-unmapped id can never
+>    leave `ffh crosswalk report` green.
+>
+> The embedded code blocks are likewise a snapshot of the intended implementation, not the
+> shipped one.
+
+
 ## Global Constraints
 
 - **Never silently drop a row.** Every filter/join in this package asserts `kept + dropped == input` and logs the dropped count with a breakdown; every unresolved id lands in `crosswalk_unmatched` (DATABASE.md §3 rung 5, ARCHITECTURE.md "Known operational hazards", AGENTS.md Tier 1).
@@ -994,14 +1025,14 @@ git commit -m "feat(crosswalk): seed players registry from nflverse frame with D
   - `DP_REQUIRED_COLUMNS: frozenset[str]`, `DP_TEXT_COLUMNS: frozenset[str]`.
   - `class DynastyProcessError(RuntimeError)`; `class CrosswalkConflictError(RuntimeError)` with `.conflicts: list[tuple[str, str, uuid.UUID, uuid.UUID]]` (source, external_id, existing player_id, incoming player_id).
   - `read_playerids_csv(raw: bytes) -> pl.DataFrame` — id columns as `pl.Utf8`, `NA` → null.
-  - `@dataclass(frozen=True) CrosswalkApplyReport(inserted: int, updated: int, unchanged: int, created_players: int, skipped_no_ids: int, skipped_position: int, ambiguous: tuple[tuple[str, str], ...])`.
+  - `@dataclass(frozen=True) CrosswalkApplyReport(inserted: int, updated: int, unchanged: int, created_players: int, merged_placeholders: int, skipped_no_ids: int, skipped_position: int, skipped_dst: int, skipped_no_person_key: int, ambiguous_in_file: tuple[tuple[str, str], ...], blocked_by_existing: tuple[tuple[str, str], ...], blocked_by_rejection: tuple[tuple[str, str], ...], displaced: tuple[tuple[str, str], ...])` — **as shipped**; the plan's single `ambiguous` field was split into the four buckets (see the banner at the top).
   - `apply_playerids(session: Session, df: pl.DataFrame) -> CrosswalkApplyReport`.
 
 **Policies (all recorded in DATABASE.md §3 by Task 9):**
 1. Positions normalized (`PK→K`, `FB→RB`, `DEF→DST`); non-fantasy rows are counted in `skipped_position` — never silently dropped.
 2. Rows with **no** id in any `DP_ID_COLUMNS` are `skipped_no_ids`.
 3. Player assignment per row: `gsis_id` present and in registry → that player; else any of the row's ids already in `player_external_ids` → that player (makes re-runs idempotent for rookies); else a **placeholder** (`gsis:<gsis>` if the row has a gsis, otherwise `mfl:<mfl_id>`) that becomes a new `players` row only if the row still has ≥1 id after the ambiguity pass. DST rows (`position == DST`) map to the seeded DST player via `normalize_dst(team) or normalize_dst(name)`.
-4. **Ambiguity (intra-file):** after unpivoting to `(source, external_id, player_key)` and de-duplicating, any `(source, external_id)` pointing at >1 player key, and any `(source, player_key)` holding >1 external id, is dropped from the batch and listed in `report.ambiguous`. A player holds at most **one** id per source (that is what `test_crosswalk_no_duplicate_player_ids` asserts).
+4. **Ambiguity (intra-file):** after unpivoting to `(source, external_id, player_key)` and de-duplicating, any `(source, external_id)` pointing at >1 player key, and any `(source, player_key)` holding >1 external id, is dropped from the batch and listed in `report.ambiguous_in_file` (shipped name; the plan originally called it `ambiguous`) **and queued in `crosswalk_unmatched`**. A player holds at most **one** id per source (that is what `test_crosswalk_no_duplicate_player_ids` asserts).
 5. **Conflict (vs the DB):** an existing `(source, external_id)` row that points at a *different* `player_id` raises `CrosswalkConflictError` **before any write** — DP is never allowed to silently re-point an id. Fix by hand (`ffh crosswalk verify --reject`, then re-run) after deciding who is right.
 6. Existing row, same player: `match_method='dynastyprocess' AND confidence=1.0` → `unchanged`; otherwise upgraded to `dynastyprocess/1.0` → `updated` (rung 1 outranks 3/4).
 7. Ids are stored as TEXT exactly as in the CSV (`sportradar_id` UUIDs, `pfr_id` alphanumerics, numeric ids never pass through a float).
@@ -1032,7 +1063,7 @@ Expected outcome against `seeded_registry` (14 players + 32 DST) — work it by 
 - Diego Pavia: no gsis → placeholder `mfl:17471`; ids: sportradar, fantasypros, sleeper, espn, rotowire = 5 → new player.
 - Fred Williams / Kevin Smith: same gsis `00-0031320` not in registry → one placeholder `gsis:00-0031320`; shared ids dedupe to 5 (sportradar, sleeper, espn, yahoo, pfr); rotowire has 2 distinct ids for one player → **both ambiguous** and dropped → 5 rows; one new player (named from the first row, "Fred Williams", gsis set, team `KC`).
 - Chiefs DEF → DST player `kc dst`; ids sleeper `KC`, espn `-16012` = 2 rows.
-- Totals: `inserted = 49 + 5 + 5 + 2 = 61`, `created_players = 2`, `ambiguous = (("rotowire", "10167"), ("rotowire", "9898"))`, `updated = 0`, `unchanged = 0`.
+- Totals: `inserted = 49 + 5 + 5 + 2 = 61`, `created_players = 2`, `ambiguous_in_file = (("rotowire", "10167"), ("rotowire", "9898"))`, `updated = 0`, `unchanged = 0`.
 
 - [ ] **Step 2: Write the failing tests `backend/tests/crosswalk/test_dynastyprocess.py`**
 
@@ -1097,7 +1128,7 @@ def test_apply_populates_external_ids(db_session, seeded_registry, dp_frame):
         created_players=2,
         skipped_no_ids=1,
         skipped_position=1,
-        ambiguous=(("rotowire", "10167"), ("rotowire", "9898")),
+        ambiguous_in_file=(("rotowire", "10167"), ("rotowire", "9898")),
     )
     assert _count_ids(db_session) == 61
     rows = db_session.scalars(select(PlayerExternalId)).all()
@@ -1139,7 +1170,7 @@ def test_apply_is_idempotent(db_session, seeded_registry, dp_frame):
     second = apply_playerids(db_session, dp_frame)
     assert second.inserted == 0 and second.created_players == 0 and second.updated == 0
     assert second.unchanged == first.inserted == 61
-    assert second.ambiguous == first.ambiguous
+    assert second.ambiguous_in_file == first.ambiguous_in_file
     assert _count_ids(db_session) == 61
     assert db_session.scalar(select(func.count()).select_from(Player)) == 14 + 32 + 2
 
@@ -1257,9 +1288,15 @@ class CrosswalkApplyReport:
     updated: int
     unchanged: int
     created_players: int
+    merged_placeholders: int
     skipped_no_ids: int
     skipped_position: int
-    ambiguous: tuple[tuple[str, str], ...]
+    skipped_dst: int
+    skipped_no_person_key: int
+    ambiguous_in_file: tuple[tuple[str, str], ...]
+    blocked_by_existing: tuple[tuple[str, str], ...]
+    blocked_by_rejection: tuple[tuple[str, str], ...]
+    displaced: tuple[tuple[str, str], ...]
 
 
 def read_playerids_csv(raw: bytes) -> pl.DataFrame:
@@ -1471,7 +1508,8 @@ def apply_playerids(session: Session, df: pl.DataFrame) -> CrosswalkApplyReport:
         created_players=len(created),
         skipped_no_ids=skipped_no_ids,
         skipped_position=skipped_position,
-        ambiguous=ambiguous,
+        ambiguous_in_file=tuple(sorted(ambiguous)),
+        # …plus blocked_by_existing / blocked_by_rejection / displaced as shipped.
     )
     log.info("crosswalk.dynastyprocess.applied", **report.__dict__)
     return report
@@ -1502,7 +1540,7 @@ git commit -m "feat(crosswalk): apply DynastyProcess ids at rung 1 with ambiguit
   - `@dataclass(frozen=True) Resolution(player_id: uuid.UUID, method: str, confidence: float)`.
   - `@dataclass(frozen=True) ResolveInput(source: str, external_id: str, raw_name: str | None = None, raw_position: str | None = None, raw_team: str | None = None, gsis_id: str | None = None, birth_date: date | None = None, college: str | None = None)` with `.key -> tuple[str, str]`.
   - `@dataclass ResolveManyReport(resolved: dict[tuple[str, str], Resolution], unmatched: list[tuple[str, str]], pending_review: list[tuple[str, str]], by_method: Counter[str])`.
-  - `is_usable(confidence: float, verified_at: datetime | None) -> bool` — `confidence >= 0.9 or verified_at is not None`. **This is the consumer filter rule**: anything reading `player_external_ids` directly (SQL) must apply `confidence >= 0.9 OR verified_at IS NOT NULL`.
+  - `is_usable(confidence: float, verified_at: datetime | None, match_method: str) -> bool` — **the consumer filter rule, whose canonical statement is `docs/DATABASE.md` §3** (see the banner at the top of this plan): `match_method <> 'rejected' AND (confidence >= 0.9 - epsilon OR verified_at IS NOT NULL)`. All three arguments are required. Anything reading `player_external_ids` directly in SQL must apply the identical predicate — the tombstone conjunct included.
   - `resolve(session, source, external_id, raw_name=None, raw_position=None, raw_team=None, *, gsis_id=None, birth_date=None, college=None) -> Resolution | None`.
   - `resolve_many(session, rows: Iterable[ResolveInput]) -> ResolveManyReport`.
 
@@ -2795,9 +2833,11 @@ git commit -m "feat(crosswalk): dynastyprocess_playerids ingest job landing db_p
   `resolve` returns `None` ("pending review", not "unmatched"). `ffh crosswalk verify
   <source> <id>` sets `verified_at`; `--reject` deletes the row and parks the id in
   `crosswalk_unmatched`.
-- **Consumer filter rule:** a row is usable iff `confidence >= 0.9 OR verified_at IS NOT
-  NULL` (`ffh.crosswalk.resolve.is_usable`). `resolve`/`resolve_many` already apply it;
-  any direct SQL over `player_external_ids` must too.
+- **Consumer filter rule:** see `docs/DATABASE.md` §3, which is canonical. As shipped:
+  `match_method <> 'rejected' AND (confidence >= 0.9 - epsilon OR verified_at IS NOT NULL)`
+  (`ffh.crosswalk.resolve.is_usable(confidence, verified_at, match_method)`).
+  `resolve`/`resolve_many` already apply it; any direct SQL over `player_external_ids`
+  must too — dropping the tombstone conjunct hands consumers pairings a human rejected.
 - **One id per source per player** — enforced by construction (rungs 3/4 exclude players
   already mapped for the source; DynastyProcess apply drops intra-file ambiguities) and by
   `test_crosswalk_no_duplicate_player_ids`. Not a DB constraint (schema unchanged).
@@ -2888,6 +2928,6 @@ https://claude.ai/code/session_018YN1sk8qzRpGdzgXYHBPgP
 
 **Placeholder scan:** no TBD/TODO; every step has code/commands. Task 8 and Task 7 Step 6 use ③'s exact merged names (`HttpIngestJob.url`, `@register`, `name` ClassVar, `IngestValidationError`, `scrape_date`, `_session_scope`, `latest_partition`) and say to re-check them against `main` after the rebase.
 
-**Type consistency:** `seeded_registry` keys are `gsis_id` or DST `normalized_name` (Tasks 3→4→5→6→7 all use `["00-0033873"]`, `["kc dst"]`); `CrosswalkApplyReport` fields identical in Task 4 code, tests, and CLI echo; `Resolution(player_id, method, confidence)` positional order identical in Task 5 code and tests; `CoverageReport` field names identical between `report.py`, `test_report.py`, and `test_cli_crosswalk.py`'s `_fake_report`; `is_usable(confidence, verified_at)` used with the same order in Tasks 5–7; `iter_gsis_to_player_id` defined in Task 3 and consumed in Task 4.
+**Type consistency:** `seeded_registry` keys are `gsis_id` or DST `normalized_name` (Tasks 3→4→5→6→7 all use `["00-0033873"]`, `["kc dst"]`); `CrosswalkApplyReport` fields identical in Task 4 code, tests, and CLI echo; `Resolution(player_id, method, confidence)` positional order identical in Task 5 code and tests; `CoverageReport` field names identical between `report.py`, `test_report.py`, and `test_cli_crosswalk.py`'s `_fake_report`; `is_usable(confidence, verified_at, match_method)` used with the same order in Tasks 5–7 (the third argument was added during implementation — see the banner); `iter_gsis_to_player_id` defined in Task 3 and consumed in Task 4.
 
 **Deviations introduced vs DATABASE.md §3 (all recorded in Task 2/9):** (1) `players.team_abbr` column added (migration 0002) for rung 3; (2) rung 4 hits are persisted unverified and `resolve` returns `None` for them (DATABASE.md says "require human review before use" — this is how); (3) `crosswalk_unmatched.last_seen` bumps with `clock_timestamp()` rather than `now()`; (4) one-id-per-source-per-player enforced by construction and test, not by a new DB constraint.
