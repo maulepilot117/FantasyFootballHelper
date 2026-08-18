@@ -23,7 +23,8 @@ from ffh.crosswalk.normalize import (
     normalize_team,
 )
 from ffh.crosswalk.registry import iter_gsis_to_player_id
-from ffh.db.models import Player, PlayerExternalId
+from ffh.crosswalk.resolve import close_unmatched
+from ffh.db.models import CrosswalkUnmatched, Player, PlayerExternalId
 
 log = structlog.get_logger(__name__)
 
@@ -394,6 +395,22 @@ def apply_playerids(session: Session, df: pl.DataFrame) -> CrosswalkApplyReport:
 
     if inserts:
         session.execute(PlayerExternalId.__table__.insert(), inserts)
+        # Every inserted key now has a mapping row: close its review-queue entry if one
+        # is open (a rung-5-queued id that DP later maps). Intersect against the open
+        # queue rows first — the queue is small, the insert batch can be tens of
+        # thousands of rows, and per-key UPDATEs for all of them would be wasteful.
+        inserted_keys = {(str(i["source"]), str(i["external_id"])) for i in inserts}
+        open_keys = {
+            (s, e)
+            for s, e in session.execute(
+                select(CrosswalkUnmatched.source, CrosswalkUnmatched.external_id).where(
+                    CrosswalkUnmatched.resolved.is_(False),
+                    CrosswalkUnmatched.source.in_(sorted({s for s, _ in inserted_keys})),
+                )
+            )
+        }
+        for source, ext in sorted(open_keys & inserted_keys):
+            close_unmatched(session, source, ext)
     for source, ext in updates:
         session.execute(
             update(PlayerExternalId)

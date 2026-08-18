@@ -100,9 +100,9 @@ def test_reject_preserves_queue_raw_fields(db_session, seeded_registry):
 
 
 def test_unmatched_drops_off_when_mapping_appears(db_session, seeded_registry):
-    """The ladder never flips `crosswalk_unmatched.resolved` when a queued id later maps
-    (e.g. a newly-arrived gsis_id) — the report must reflect the tables, not the queue's
-    bookkeeping, or the exit-1 gate latches red forever on a fully-mapped id."""
+    """A queued rung-5 id that later maps (e.g. a newly-arrived gsis_id) must not latch
+    the exit-1 gate red forever: the mapping-creation path (`resolve._persist`) closes
+    the queue entry at the source, and the report simply lists open entries."""
     resolve(db_session, "sleeper", "12345", "Nobody Yet", "QB", "FA")  # rung 5 -> queued
     rep = coverage_report(db_session)
     assert [(r.source, r.external_id) for r in rep.unmatched] == [("sleeper", "12345")]
@@ -114,7 +114,55 @@ def test_unmatched_drops_off_when_mapping_appears(db_session, seeded_registry):
     u = db_session.scalar(
         select(CrosswalkUnmatched).where(CrosswalkUnmatched.external_id == "12345")
     )
-    assert u is not None and u.resolved is False  # bookkeeping untouched; report ignores it
+    assert u is not None and u.resolved is True  # closed by the mapping-creation path
+
+
+def test_apply_playerids_closes_queued_ids(db_session, seeded_registry):
+    """`apply_playerids` inserts into player_external_ids directly (not via `_persist`),
+    so it must close open queue entries for the keys it maps, and only those."""
+    upsert_unmatched(db_session, "sleeper", "4046", raw_name="Patrick Mahomes")  # DP will map
+    upsert_unmatched(db_session, "sleeper", "55555", raw_name="Still Nobody")  # DP will not
+    apply_playerids(db_session, read_playerids_csv(FIXTURE.read_bytes()))
+    mapped = db_session.scalar(
+        select(CrosswalkUnmatched).where(CrosswalkUnmatched.external_id == "4046")
+    )
+    assert mapped is not None and mapped.resolved is True
+    rep = coverage_report(db_session)
+    assert [(r.source, r.external_id) for r in rep.unmatched] == [("sleeper", "55555")]
+
+
+def test_upgrade_conflict_state_stays_on_report(db_session, seeded_registry):
+    """Regression (fix round 2): the rung-1 upgrade-conflict path leaves a disputed
+    mapping in player_external_ids AND an open queue row for the SAME key — no mapping
+    is created, resolve() returns None for that id, and the report MUST exit 1 on it.
+    The 0.95 exact_name flavour is exactly the one a NOT EXISTS predicate would hide."""
+    mahomes, chase = seeded_registry["00-0033873"], seeded_registry["00-0036900"]
+    db_session.add(
+        PlayerExternalId(
+            player_id=mahomes,
+            source="sleeper",
+            external_id="E1",
+            confidence=0.95,
+            match_method="exact_name",
+        )
+    )
+    db_session.add(
+        PlayerExternalId(
+            player_id=chase,
+            source="sleeper",
+            external_id="E2",
+            confidence=1.0,
+            match_method="dynastyprocess",
+        )
+    )
+    db_session.flush()
+    assert resolve(db_session, "sleeper", "E1", gsis_id="00-0036900") is None
+    # disputed row still in place for `ffh crosswalk verify --reject` ...
+    assert db_session.get(PlayerExternalId, ("sleeper", "E1")) is not None
+    # ... and the report surfaces the conflict instead of saying OK
+    rep = coverage_report(db_session)
+    assert ("sleeper", "E1") in [(r.source, r.external_id) for r in rep.unmatched]
+    assert rep.ok is False
 
 
 def test_float4_boundary_confidence_is_usable_not_flagged(db_session, seeded_registry):

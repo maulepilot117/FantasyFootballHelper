@@ -18,7 +18,7 @@ from typing import Literal
 import structlog
 from rapidfuzz import process
 from rapidfuzz.distance import JaroWinkler
-from sqlalchemy import Select, func, select
+from sqlalchemy import Select, func, select, update
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.orm import Session
 
@@ -167,6 +167,30 @@ def upsert_unmatched(
     )
     session.execute(stmt)
     session.flush()
+
+
+def close_unmatched(session: Session, source: str, external_id: str) -> bool:
+    """Flip an open ``crosswalk_unmatched`` row to resolved once its key gains a mapping.
+
+    Called at every point a mapping row is *created* for the key (``_persist`` here,
+    ``apply_playerids`` in dynastyprocess): the queue entry means "this id has no
+    mapping", so creating one closes it. Deliberately NOT called on rung-1 hits (no new
+    mapping) or in ``_upgrade_from_gsis``'s conflict branch (no mapping is created there
+    — that entry must stay open so ``ffh crosswalk report`` exits 1 on it).
+    """
+    result = session.execute(
+        update(CrosswalkUnmatched)
+        .where(
+            CrosswalkUnmatched.source == source,
+            CrosswalkUnmatched.external_id == external_id,
+            CrosswalkUnmatched.resolved.is_(False),
+        )
+        .values(resolved=True)
+    )
+    closed = bool(result.rowcount)
+    if closed:
+        log.info("crosswalk.resolve.unmatched_closed", source=source, external_id=external_id)
+    return closed
 
 
 # ---------------------------------------------------------------------------
@@ -438,6 +462,9 @@ def _persist(
         )
     )
     session.flush()
+    # A mapping row now exists for this key: close any open review-queue entry (e.g. an
+    # id that hit rung 5 on an earlier sync and resolves now that new data arrived).
+    close_unmatched(session, inp.source, inp.external_id)
     return True
 
 

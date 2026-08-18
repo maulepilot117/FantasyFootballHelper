@@ -143,20 +143,14 @@ def coverage_report(session: Session) -> CoverageReport:
             u.first_seen,
             u.last_seen,
         )
+        # `resolved = false` alone: the bookkeeping is maintained at the source — every
+        # mapping-creation path closes its queue entry (resolve.close_unmatched) — so an
+        # open row genuinely needs attention. In particular the upgrade-conflict state
+        # (disputed mapping in player_external_ids AND an open queue row for the same
+        # key) MUST surface here; a NOT EXISTS against the mapping table would hide it.
         for u in session.scalars(
             select(CrosswalkUnmatched)
-            .where(
-                CrosswalkUnmatched.resolved.is_(False),
-                # Reflect reality, not the queue's bookkeeping: the ladder never flips
-                # `resolved` when a queued id later maps (e.g. a newly-arrived gsis_id),
-                # so a queue row whose key now has a mapping must not latch the gate red.
-                ~select(PlayerExternalId.source)
-                .where(
-                    PlayerExternalId.source == CrosswalkUnmatched.source,
-                    PlayerExternalId.external_id == CrosswalkUnmatched.external_id,
-                )
-                .exists(),
-            )
+            .where(CrosswalkUnmatched.resolved.is_(False))
             .order_by(CrosswalkUnmatched.source, CrosswalkUnmatched.external_id)
         )
     )
