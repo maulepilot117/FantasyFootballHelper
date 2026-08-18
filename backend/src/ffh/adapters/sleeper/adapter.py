@@ -255,6 +255,43 @@ class SleeperAdapter:
             )
         return slots
 
+    async def current_week(self) -> int:
+        """Platform week for a roster snapshot. FETCHED, never assumed.
+
+        /state/nfl returns week=2 with season_type="pre" (verified 2026-08-16), so its
+        `week` is meaningless outside the regular season. Week 0 is our explicit
+        "pre-season / post-draft snapshot" marker.
+        """
+        state = await self._client.get_state()
+        return state.week if state.season_type == "regular" else 0
+
+    async def get_player_refs(self, external_ids: set[str]) -> dict[str, PlayerRef]:
+        """Name/position/team/gsis for arbitrary Sleeper ids, for crosswalk resolution.
+
+        Uses the lake catalog when one is configured. Without it, a NON-NUMERIC Sleeper id
+        is a team defense — verified: the 32 DEF entries in /players/nfl are keyed by team
+        abbreviation ("KC", "SF", ...), and that abbreviation is the one form the
+        crosswalk's normalize_dst is guaranteed to canonicalize. Numeric ids fall back to
+        the id alone with a NULL position (never "", which would masquerade as a real
+        position); rung 1 — the DynastyProcess sleeper_id lookup, the primary rung for
+        Sleeper regardless — resolves those.
+        """
+        catalog: dict[str, PlayerRef] = {}
+        if self._catalog is not None:
+            catalog = await self._catalog.all_players()
+        out: dict[str, PlayerRef] = {}
+        for ext in external_ids:
+            known = catalog.get(ext)
+            if known is not None:
+                out[ext] = known
+            elif not ext.isdigit():
+                out[ext] = PlayerRef(external_id=ext, name=ext, position="DST", team=ext)
+            else:
+                out[ext] = PlayerRef(external_id=ext, name=ext, position=None, team=None)
+        if len(out) != len(external_ids):
+            raise PlatformError("get_player_refs lost ids")
+        return out
+
     # --- rosters ---------------------------------------------------------------
     async def get_rosters(self, league_id: str, week: int) -> list[Roster]:
         raw = await self._client.get_league(league_id)

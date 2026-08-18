@@ -544,3 +544,44 @@ async def test_lake_player_catalog_raises_when_the_lake_is_empty(tmp_path):
 
 async def test_adapter_satisfies_the_protocol(adapter):
     assert isinstance(adapter, FantasyPlatformAdapter)
+
+
+async def test_current_week_is_zero_outside_the_regular_season(
+    adapter, sleeper_mock, sleeper_fixture
+):
+    assert await adapter.current_week() == 1
+    pre = sleeper_fixture("state_nfl") | {"season_type": "pre", "week": 2}
+    sleeper_mock.get("/state/nfl").mock(return_value=httpx.Response(200, json=pre))
+    assert await adapter.current_week() == 0
+
+
+async def test_get_player_refs_treats_a_non_numeric_id_as_a_defense(adapter):
+    refs = await adapter.get_player_refs({"1", "KC"})
+    assert refs["KC"].position == "DST" and refs["KC"].team == "KC" and refs["KC"].name == "KC"
+    # `position=""` would masquerade as a real (empty) position; base.PlayerRef says None.
+    assert refs["1"].position is None and refs["1"].name == "1" and refs["1"].team is None
+
+
+async def test_get_player_refs_prefers_the_catalog(sleeper_client):
+    catalog = StubCatalog(
+        {
+            "1": PlayerRef(
+                external_id="1",
+                name="Fixture Quarterback",
+                position="QB",
+                team="KC",
+                gsis_id="00-0090001",
+            )
+        }
+    )
+    adapter = SleeperAdapter(sleeper_client, my_user_id="USER_ME", catalog=catalog)
+    refs = await adapter.get_player_refs({"1", "KC"})
+    assert refs["1"].name == "Fixture Quarterback" and refs["1"].position == "QB"
+    assert refs["1"].gsis_id == "00-0090001"  # the crosswalk's strongest join key survives
+    assert refs["KC"].position == "DST"
+
+
+async def test_get_player_refs_covers_every_id_it_was_asked_for(adapter):
+    ids = {"1", "2", "KC", "SF"}
+    assert set(await adapter.get_player_refs(ids)) == ids
+    assert await adapter.get_player_refs(set()) == {}
