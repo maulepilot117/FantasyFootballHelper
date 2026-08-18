@@ -1,7 +1,8 @@
 """DynastyProcess ``db_playerids.csv`` → ``player_external_ids`` (rung 1 of the ladder).
 
-Pure with respect to ``ffh.ingest``: takes a DataFrame. The IngestJob that fetches the CSV
-into the lake is appended to this module in Task 8 (requires PR ③).
+``apply_playerids`` and everything above it is pure with respect to ``ffh.ingest``: it takes
+a DataFrame, never a URL or a lake path. The one exception is ``DynastyProcessPlayerIdsJob``
+at the bottom of the module — the ingest job that fetches the CSV into the lake.
 """
 
 from __future__ import annotations
@@ -9,6 +10,7 @@ from __future__ import annotations
 import uuid
 from dataclasses import asdict, dataclass
 from datetime import date
+from typing import ClassVar
 
 import polars as pl
 import structlog
@@ -25,6 +27,8 @@ from ffh.crosswalk.normalize import (
 from ffh.crosswalk.registry import iter_gsis_to_player_id
 from ffh.crosswalk.resolve import close_unmatched
 from ffh.db.models import CrosswalkUnmatched, Player, PlayerExternalId
+from ffh.ingest.base import HttpIngestJob, IngestValidationError, register
+from ffh.ingest.lake import scrape_date
 
 log = structlog.get_logger(__name__)
 
@@ -431,3 +435,49 @@ def apply_playerids(session: Session, df: pl.DataFrame) -> CrosswalkApplyReport:
     )
     log.info("crosswalk.dynastyprocess.applied", **asdict(report))
     return report
+
+
+# ---------------------------------------------------------------------------------------
+# The ingest job — the only ``ffh.ingest`` dependency in ``ffh.crosswalk``.
+# ---------------------------------------------------------------------------------------
+
+#: DATA_SOURCES.md §5, verified live 2026-08-16 (12,472 rows, 35 cols, ``NA`` = null).
+DP_URL = "https://raw.githubusercontent.com/dynastyprocess/data/master/files/db_playerids.csv"
+
+
+@register
+class DynastyProcessPlayerIdsJob(HttpIngestJob):
+    """Land ``db_playerids.csv`` in the lake as Parquet with every id column still text.
+
+    Weekly full snapshot: no season, ETag-conditional via ③'s ``HttpIngestJob.fetch``, and a
+    new ``scrape_date=`` partition per scrape (never an overwrite). No ``persist``: the CSV
+    reaches Postgres only through ``ffh crosswalk seed --playerids``, which re-reads the
+    landed Parquet and calls ``apply_playerids``.
+    """
+
+    name: ClassVar[str] = "dynastyprocess_playerids"
+    source: ClassVar[str] = "dynastyprocess"
+    asset: ClassVar[str] = "playerids"
+    REQUIRED_COLUMNS: ClassVar[frozenset[str]] = DP_REQUIRED_COLUMNS
+
+    def url(self) -> str:
+        return DP_URL
+
+    def partition(self) -> dict[str, str]:
+        # ③'s UTC clock — the same key every other lake partition uses.
+        return {"scrape_date": scrape_date()}
+
+    def parse(self, content: bytes) -> pl.DataFrame:
+        return read_playerids_csv(content)
+
+    def validate(self, df: pl.DataFrame) -> None:
+        # The base checks REQUIRED_COLUMNS and the empty frame (both IngestValidationError).
+        super().validate(df)
+        # Ids must land as text so the Parquet round-trip that `ffh crosswalk seed` reads
+        # back can never hand `_validate` a float: 4046.0 -> "4046.0" would be silent
+        # corruption, and a UUID/alphanumeric id (sportradar_id, pfr_id) is not numeric at all.
+        wrong = [c for c in sorted(DP_TEXT_COLUMNS) if df.schema[c] != pl.Utf8]
+        if wrong:
+            raise IngestValidationError(
+                f"{type(self).name}: id columns must be text, got non-text: {wrong}"
+            )

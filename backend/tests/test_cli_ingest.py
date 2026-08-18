@@ -21,6 +21,7 @@ def test_ingest_list_shows_every_registered_job():
         "nflverse_pbp",
         "nfldata_games",
         "stadiums",
+        "dynastyprocess_playerids",
     ):
         assert name in result.stdout
     assert "no ingest jobs registered" not in result.stdout

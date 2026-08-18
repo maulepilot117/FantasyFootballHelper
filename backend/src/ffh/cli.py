@@ -9,9 +9,12 @@ from sqlalchemy.orm import Session
 
 from ffh import __version__
 from ffh.config import get_settings
-from ffh.db.engine import make_engine, make_session_factory
 
 # Importing the job modules registers every @register-decorated class in ffh.ingest.base.JOBS.
+# isort orders these by module path, so the one crosswalk-owned job sits above ffh.db here
+# rather than with the ffh.ingest block below.
+from ffh.crosswalk import dynastyprocess as _dynastyprocess  # noqa: F401
+from ffh.db.engine import make_engine, make_session_factory
 from ffh.ingest import games as _games  # noqa: F401
 from ffh.ingest import nflverse as _nflverse  # noqa: F401
 from ffh.ingest import reference as _reference  # noqa: F401
