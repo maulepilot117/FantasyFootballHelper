@@ -30,6 +30,13 @@ def test_report_on_empty_db_is_not_ok(db_session):
     assert rep.gate_ok(allow_empty=True) is True
     assert "NOT SEEDED" in rep.render() and "unmatched: 0" in rep.render()
     assert json.loads(json.dumps(rep.to_dict()))["seeded"] is False  # serializable
+    # The rendered verdict and the serialized `ok` follow the gate, never `self.ok`:
+    # under --allow-empty they used to contradict the exit code the same run returned.
+    assert rep.render().rstrip().endswith("ATTENTION REQUIRED")
+    assert rep.to_dict()["ok"] is False
+    assert rep.render(allow_empty=True).rstrip().endswith("OK")
+    assert rep.to_dict(allow_empty=True)["ok"] is True
+    assert rep.to_dict(allow_empty=True)["ok_strict"] is False
 
 
 def test_report_with_players_but_no_ids_is_not_ok(db_session, seeded_registry):

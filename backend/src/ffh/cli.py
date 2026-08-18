@@ -24,6 +24,7 @@ from ffh.ingest import nflverse as _nflverse  # noqa: F401
 from ffh.ingest import reference as _reference  # noqa: F401
 from ffh.ingest.base import JOBS, STATUS_FAILED, get_job
 from ffh.ingest.reference import StadiumsJob, seed_generic_league, seed_nfl_teams
+from ffh.log import configure_logging
 
 #: Crosswalk exit codes (DATABASE.md §3). 0 = gate green, 1 = gate red (something is
 #: unmatched or awaiting review — a *data* state a human resolves), 2 = a crosswalk
@@ -34,8 +35,9 @@ EXIT_GATE_RED = 1
 EXIT_CONFLICT = 2
 EXIT_OPERATIONAL = 3
 
-#: Every crosswalk command that WRITES serializes on this Postgres advisory lock. All three
-#: read `player_external_ids`, decide who owns a `(source, player_id)` slot, then write —
+#: Every crosswalk command that WRITES serializes on this Postgres advisory lock — `seed`,
+#: `verify`, `map` and `resolve-unmatched`. All four read `player_external_ids`, decide who
+#: owns a `(source, player_id)` slot (or whether one exists at all), then write —
 #: `apply_playerids` does it for ~12.5k rows at a time. Those plans are TOCTOU: two
 #: concurrent `ffh crosswalk seed` runs (a cron overlapping a manual re-run) can both pass
 #: the same pre-check and race into the unique index, or worse, both mint a placeholder
@@ -57,6 +59,16 @@ crosswalk_app = typer.Typer(no_args_is_help=True, help="Player ID crosswalk tool
 app.add_typer(ingest_app, name="ingest")
 app.add_typer(league_app, name="league")
 app.add_typer(crosswalk_app, name="crosswalk")
+
+
+@app.callback()
+def _root() -> None:
+    # Runs before every subcommand. structlog is unconfigured by default and its default
+    # sink is STDOUT, which puts log lines on the same stream as the JSON `ffh crosswalk
+    # seed --playerids` / `ffh crosswalk report --json` / `ffh ingest run` write — see
+    # ffh.log. No docstring: Typer would use it as the app's `--help` text in place of the
+    # `help=` above.
+    configure_logging()
 
 
 @app.command()
@@ -180,7 +192,14 @@ def crosswalk_report(
     except (SQLAlchemyError, OSError) as exc:
         typer.echo(f"crosswalk report failed: {type(exc).__name__}: {exc}", err=True)
         raise typer.Exit(code=EXIT_OPERATIONAL) from exc
-    typer.echo(json.dumps(rep.to_dict(), indent=2, default=str) if json_out else rep.render())
+    # `allow_empty` goes to the renderer AND the serializer, not just the exit code: the
+    # printed verdict and the JSON `ok` field are read by the same wrapper that reads the
+    # exit code, and all three must be the one decision.
+    typer.echo(
+        json.dumps(rep.to_dict(allow_empty=allow_empty), indent=2, default=str)
+        if json_out
+        else rep.render(allow_empty=allow_empty)
+    )
     raise typer.Exit(code=0 if rep.gate_ok(allow_empty=allow_empty) else EXIT_GATE_RED)
 
 
@@ -354,7 +373,12 @@ def crosswalk_resolve_unmatched(
     """
     from ffh.crosswalk.review import live_mapping, mark_unmatched_resolved
 
-    with _session_scope() as session:
+    # Locked like every other crosswalk write command (CROSSWALK_LOCK_KEY): this one is a
+    # read-then-write too — `mark_unmatched_resolved` checks for a live mapping row and
+    # then flips `resolved`. Without the lock a concurrent `ffh crosswalk seed` can mint
+    # that mapping between the check and the write, and the entry closes on a precondition
+    # that no longer holds — greening the gate over a mapping the ladder still returns.
+    with _session_scope() as session, advisory_lock(session, CROSSWALK_LOCK_KEY):
         ok = mark_unmatched_resolved(session, source, external_id, force=force)
         mapping = None if ok else live_mapping(session, source, external_id)
         if ok:

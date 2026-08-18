@@ -434,12 +434,21 @@ exit 1 as well, leaving a cron wrapper unable to tell "the crosswalk has a gap" 
 run never happened"; `ffh crosswalk seed` and `ffh crosswalk report` both wrap their whole
 guarded region (frame reads, `seed_players`, `apply_playerids`, the report query).
 
+**stdout is data, stderr is everything else.** `ffh crosswalk seed --playerids` and
+`ffh crosswalk report --json` write one JSON object to stdout and nothing else, so both
+pipe into `jq`; progress lines, errors and every structlog line go to stderr. structlog's
+default sink is stdout, so `ffh` configures it once at CLI entry (`ffh.log`) — without
+that, a single log line makes the JSON unparseable.
+
 **`ffh crosswalk report`** exits 1 if any `crosswalk_unmatched` row is open, any
 unverified `confidence < 0.9` non-tombstone row exists, **or the crosswalk is empty**
 (`players_total == 0` or no `player_external_ids` rows at all). Emptiness is the state
 where every downstream lookup silently finds no player, and it produces zero unmatched and
 zero unverified rows — so without that floor the gate reads green on a database where
-nothing was ever seeded. `--allow-empty` opts out for a deliberate pre-seed invocation. **`ffh crosswalk map SOURCE
+nothing was ever seeded. `--allow-empty` opts out for a deliberate pre-seed invocation — and the printed verdict
+line and the JSON `ok` field follow that same gate decision, so neither can contradict the
+exit code of the run that produced it (the un-flagged verdict stays available as
+`ok_strict`, and `NOT SEEDED` is still printed either way). **`ffh crosswalk map SOURCE
 EXTERNAL_ID PLAYER_ID`** writes the human decision (`manual`, confidence 1.0,
 `verified_at` stamped) and closes the queue entry; it refuses an unknown `player_id` and
 pre-checks the `(source, player_id)` unique index, reporting the clash by name instead of
@@ -596,10 +605,10 @@ rather than silently mangled (`4046.0` must never become `"4046.0"`).
     keeper already holds a live id for that source) is deleted and queued, never dropped.
     Seeded DST rows are excluded explicitly — they also carry a NULL `gsis_id`.
 19. **The crosswalk write commands take a Postgres advisory lock** —
-    `ffh crosswalk seed` / `map` / `verify` wrap their session in
+    `ffh crosswalk seed` / `map` / `verify` / `resolve-unmatched` wrap their session in
     `ffh.db.lock.advisory_lock(session, "ffh.crosswalk/apply")` (the same helper
     `ffh.ingest.base` uses, lifted into `ffh.db` so there is exactly one implementation).
-    All three read `player_external_ids`, decide `(source, player_id)` slot ownership, then
+    All four read `player_external_ids`, decide `(source, player_id)` slot ownership, then
     write — `apply_playerids` for ~12.5k rows at a time — and that plan is TOCTOU: two
     concurrent runs (a cron overlapping a manual re-run) can both pass the same pre-check.
 20. **Migration `0003` re-creates `player_external_ids_source_player_uidx`.** The partial

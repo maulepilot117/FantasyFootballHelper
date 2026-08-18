@@ -719,10 +719,11 @@ def _fuzzy(
     # candidate out), then POSITIVE (the input confirms a survivor). A candidate set
     # contradicted by everything falls to rung 5 rather than persisting a fuzzy guess at a
     # demonstrably different player.
-    # The positive leg is NOT "keep only the confirmed" on the college side: a stored NULL
-    # college is no evidence *against* a candidate, and dropping it hands the id to a
-    # lower-similarity homonym that merely happens to have a college on file. Confirmed
-    # and unknown-college candidates both survive; the tie margin below rules on them.
+    # Only birth date gets a positive leg. On the college side "keep only the confirmed"
+    # would be an eviction bug — a stored NULL college is no evidence *against* a
+    # candidate, and dropping it hands the id to a lower-similarity homonym that merely
+    # happens to have a college on file — and the safe version of it is a no-op (see
+    # below). Confirmed and unknown-college candidates both survive; the tie margin rules.
     eliminated_by: list[str] = []
     if inp.birth_date is not None:
         before = len(survivors)
@@ -743,13 +744,14 @@ def _fuzzy(
         ]
         if len(survivors) < before:
             eliminated_by.append("college")
-        confirmed = [
-            (p, s)
-            for p, s in survivors
-            if meta[p][1] is not None and colleges_agree(needle, meta[p][1])
-        ]
-        if confirmed:
-            survivors = confirmed + [(p, s) for p, s in survivors if meta[p][1] is None]
+        # No positive leg here, deliberately — unlike birth date above. Because a NULL
+        # college survives the negative leg (a missing college is no evidence against a
+        # candidate), "the confirmed ones plus the NULL-college ones" IS the survivor set
+        # the negative leg just produced: every non-NULL non-agreeing candidate is already
+        # gone. A positive leg could only re-order a list the score sort below re-orders
+        # anyway. Narrowing to the confirmed ones alone is the eviction bug this leg was
+        # fixed for: it hands the id to a lower-similarity homonym that merely happens to
+        # have a college on file. The tie margin rules on what is left.
     if not survivors:
         log.info(
             "crosswalk.resolve.fuzzy_eliminated",

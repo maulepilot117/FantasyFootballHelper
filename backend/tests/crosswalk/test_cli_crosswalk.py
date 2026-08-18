@@ -6,7 +6,6 @@ from pathlib import Path
 
 import polars as pl
 import pytest
-import structlog.testing
 from sqlalchemy import select
 from typer.testing import CliRunner
 
@@ -88,9 +87,28 @@ def test_report_exit_1_on_an_empty_crosswalk_and_0_with_allow_empty(monkeypatch)
     assert result.exit_code == 1, result.output
     assert "NOT SEEDED" in result.output
 
+    # The un-flagged run says ATTENTION REQUIRED and means it.
+    assert result.output.rstrip().endswith("ATTENTION REQUIRED")
+
     allowed = runner.invoke(cli.app, ["crosswalk", "report", "--allow-empty"])
     assert allowed.exit_code == 0, allowed.output
+    # The emptiness is still stated — `--allow-empty` accepts it, it does not hide it …
     assert "NOT SEEDED" in allowed.output
+    # … but the VERDICT must agree with the exit code the same run produced. It read
+    # `self.ok` while the exit code read `gate_ok(allow_empty=True)`, so this invocation —
+    # the only one the flag exists for — printed ATTENTION REQUIRED and exited 0.
+    assert allowed.output.rstrip().endswith("OK")
+    assert "ATTENTION REQUIRED" not in allowed.output
+
+    # Same for the machine-readable arm: a cron wrapper reading `ok` out of the JSON must
+    # not contradict the exit status of the process it just ran.
+    as_json = runner.invoke(cli.app, ["crosswalk", "report", "--json", "--allow-empty"])
+    assert as_json.exit_code == 0, as_json.output
+    payload = json.loads(as_json.stdout)
+    assert payload["ok"] is True
+    assert payload["allow_empty"] is True
+    # The un-flagged verdict stays available for anything that wants the strict answer.
+    assert payload["ok_strict"] is False and payload["seeded"] is False
 
 
 def test_report_operational_failure_exits_3(monkeypatch):
@@ -570,6 +588,46 @@ def test_map_takes_the_crosswalk_lock(monkeypatch):
     assert session.lock_keys("unlock") == [cli.CROSSWALK_LOCK_KEY]
 
 
+def test_resolve_unmatched_takes_the_crosswalk_lock(monkeypatch):
+    """It writes, so it locks — it was the one crosswalk write command that did not, while
+    CROSSWALK_LOCK_KEY's own docstring promised "every crosswalk command that WRITES".
+    `mark_unmatched_resolved` reads (is there still a live mapping row?) and then writes
+    (`resolved = True`); a concurrent `ffh crosswalk seed` can land that mapping in the
+    gap and the entry closes on a precondition that no longer holds."""
+    session = _FakeSession()
+    monkeypatch.setattr(cli, "_session_scope", _fake_scope(session))
+    monkeypatch.setattr(
+        "ffh.crosswalk.review.mark_unmatched_resolved", lambda s, src, ext, force=False: True
+    )
+
+    result = runner.invoke(cli.app, ["crosswalk", "resolve-unmatched", "sleeper", "4046"])
+
+    assert result.exit_code == 0, result.output
+    assert session.lock_keys("lock") == [cli.CROSSWALK_LOCK_KEY]
+    assert session.lock_keys("unlock") == [cli.CROSSWALK_LOCK_KEY]
+
+
+def test_resolve_unmatched_releases_the_lock_when_the_precondition_fails(monkeypatch):
+    """The refusal path returns non-zero through the same context manager; a lock held by
+    a command that declined to do anything would wedge every later crosswalk write."""
+    from types import SimpleNamespace
+
+    session = _FakeSession()
+    monkeypatch.setattr(cli, "_session_scope", _fake_scope(session))
+    monkeypatch.setattr(
+        "ffh.crosswalk.review.mark_unmatched_resolved", lambda s, src, ext, force=False: False
+    )
+    monkeypatch.setattr(
+        "ffh.crosswalk.review.live_mapping",
+        lambda s, src, ext: SimpleNamespace(player_id=uuid.uuid4(), match_method="manual"),
+    )
+
+    result = runner.invoke(cli.app, ["crosswalk", "resolve-unmatched", "sleeper", "4046"])
+
+    assert result.exit_code == cli.EXIT_GATE_RED
+    assert session.lock_keys("unlock") == [cli.CROSSWALK_LOCK_KEY]
+
+
 @pytest.mark.db
 def test_seed_really_holds_the_lock_against_another_connection(
     monkeypatch, db_session, migrated_engine, tmp_path
@@ -644,27 +702,28 @@ def test_cli_seed_with_playerids_applies_the_crosswalk(monkeypatch, db_session, 
     `.parquet` first — that is the arm `ffh ingest run dynastyprocess_playerids` produces
     and therefore the one the homelab cron actually exercises.
 
-    `capture_logs` silences structlog, whose *default* sink is stdout; the assertion below
-    is about what the COMMAND writes to stdout, which must be the JSON report and nothing
-    else (the human progress line goes to stderr).
+    Deliberately NOT wrapped in `structlog.testing.capture_logs()`: this seed emits real
+    log lines (`crosswalk.dynastyprocess.ambiguous_ids` at minimum), and structlog's
+    default sink is STDOUT. Capturing them would silence the exact defect the stdout
+    assertion below exists to catch — the pipe-ability of `ffh crosswalk seed … | jq`
+    depends on the sink being stderr (ffh.log), not on the test looking away.
     """
     from sqlalchemy import func
 
     from ffh.db.models import Player, PlayerExternalId
 
     monkeypatch.setattr(cli, "_session_scope", _fake_scope(db_session))
-    with structlog.testing.capture_logs():
-        result = runner.invoke(
-            cli.app,
-            [
-                "crosswalk",
-                "seed",
-                "--players",
-                str(_nflverse_players_parquet(tmp_path)),
-                "--playerids",
-                str(_playerids_file(tmp_path, suffix)),
-            ],
-        )
+    result = runner.invoke(
+        cli.app,
+        [
+            "crosswalk",
+            "seed",
+            "--players",
+            str(_nflverse_players_parquet(tmp_path)),
+            "--playerids",
+            str(_playerids_file(tmp_path, suffix)),
+        ],
+    )
 
     assert result.exit_code == 0, result.output
     # ── stdout is parseable JSON and nothing else, so `ffh crosswalk seed ... | jq` works.
@@ -672,6 +731,9 @@ def test_cli_seed_with_playerids_applies_the_crosswalk(monkeypatch, db_session, 
     # `slots=True`) — the field set below is the contract that proves it.
     payload = json.loads(result.stdout)
     assert "players upserted" in result.stderr and "players upserted" not in result.stdout
+    # ── and the log lines this run really emitted went to stderr with it.
+    assert "crosswalk.dynastyprocess.ambiguous_ids" in result.stderr
+    assert "crosswalk." not in result.stdout
     assert payload["inserted"] == 61 and payload["created_players"] == 2
     assert payload["ambiguous_in_file"] == [["rotowire", "10167"], ["rotowire", "9898"]]
     assert payload["blocked_by_existing"] == [] and payload["blocked_by_rejection"] == []

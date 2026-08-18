@@ -396,14 +396,20 @@ def apply_playerids(session: Session, df: pl.DataFrame) -> CrosswalkApplyReport:
     """Populate ``player_external_ids`` at confidence 1.0 / ``dynastyprocess`` from a DP frame.
 
     Policies 1-7 are in the plan (Task 4) and DATABASE.md §3. Runs inside the caller's
-    transaction; a ``CrosswalkConflictError`` is raised before any write — placeholder
-    ``players`` rows AND ``crosswalk_unmatched`` queueing both happen only after the
-    conflict scan passes, so an aborted seed leaves nothing behind in either table.
+    transaction and NEVER commits. A ``CrosswalkConflictError`` is raised before every
+    write except step 3a: placeholder ``players`` rows, id inserts/updates and the bulk of
+    ``crosswalk_unmatched`` queueing all happen after the conflict scan passes.
 
-    The one deliberate exception is step 3a, ``_reconcile_placeholders``: a duplicate
-    ``players`` row for a human nflverse has since published makes the conflict scan raise
-    on *every* run, so the repair has to run before the scan it unblocks. It touches only
-    the two rows for that one person, and the CLI still commits nothing if the scan raises.
+    Step 3a, ``_reconcile_placeholders``, is the deliberate exception, and it writes to
+    BOTH tables: a duplicate ``players`` row for a human nflverse has since published
+    makes the conflict scan raise on *every* run, so the repair has to precede the scan it
+    unblocks. It repoints that person's ids, deletes the placeholder ``players`` row, and
+    queues (``crosswalk_unmatched``) any id the keeper had no free slot for.
+
+    So the invariant is transactional, not ordering-based: an aborted seed leaves nothing
+    behind in either table because the caller rolls back — `ffh crosswalk seed` exits on
+    ``CrosswalkConflictError`` without reaching ``session.commit()``. A caller that
+    commits before handling the exception would persist step 3a's writes.
     """
     df, skipped_no_person_key = _validate(df)
     n_in = df.height

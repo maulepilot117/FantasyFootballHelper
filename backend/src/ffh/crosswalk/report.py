@@ -58,6 +58,11 @@ class CoverageReport:
 
     @property
     def ok(self) -> bool:
+        """The un-flagged verdict: green only on a seeded, fully-resolved crosswalk.
+
+        This is NOT the gate — `gate_ok` is. Renderers and serializers must use that one,
+        or `--allow-empty` produces output that contradicts the exit code it just caused.
+        """
         return self.seeded and not self.unverified_low_confidence and not self.unmatched
 
     def gate_ok(self, *, allow_empty: bool = False) -> bool:
@@ -67,9 +72,17 @@ class CoverageReport:
             return not self.unverified_low_confidence and not self.unmatched
         return self.ok
 
-    def to_dict(self) -> dict[str, object]:
+    def to_dict(self, *, allow_empty: bool = False) -> dict[str, object]:
+        # `ok` is the GATE decision — the same call `cli.crosswalk_report` derives the exit
+        # code from. It used to be the un-flagged `self.ok`, so `--allow-empty --json`
+        # emitted `"ok": false` while the process exited 0: a cron wrapper reading the
+        # field disagreed with the command it had just run, on the one invocation the flag
+        # exists for. The un-flagged value is still available as `ok_strict`, and
+        # `allow_empty` is echoed so the payload says which rule produced `ok`.
         d = asdict(self)
-        d["ok"] = self.ok
+        d["ok"] = self.gate_ok(allow_empty=allow_empty)
+        d["ok_strict"] = self.ok
+        d["allow_empty"] = allow_empty
         d["seeded"] = self.seeded
         # Sort the count maps: SQL GROUP BY order is unspecified, and `--json` output
         # must be deterministic across identical databases (render() already sorts).
@@ -86,7 +99,7 @@ class CoverageReport:
             ]
         return d
 
-    def render(self) -> str:
+    def render(self, *, allow_empty: bool = False) -> str:
         by_position = " ".join(f"{p}={n}" for p, n in sorted(self.players_by_position.items()))
         lines = [
             f"players: {self.players_total} {by_position}".rstrip(),
@@ -112,9 +125,16 @@ class CoverageReport:
             lines.append(
                 "NOT SEEDED: the crosswalk is empty "
                 f"(players={self.players_total}, sources with ids={len(self.ids_by_source)}) "
-                "— run `ffh crosswalk seed`, or pass --allow-empty if that is expected"
+                + (
+                    "— accepted by --allow-empty"
+                    if allow_empty
+                    else "— run `ffh crosswalk seed`, or pass --allow-empty if that is expected"
+                )
             )
-        lines.append("OK" if self.ok else "ATTENTION REQUIRED")
+        # The gate value, not `self.ok`: the verdict a human reads and the exit code a
+        # wrapper reads must never disagree (see `to_dict`). The NOT SEEDED line above
+        # still states the underlying fact, so `--allow-empty` hides nothing.
+        lines.append("OK" if self.gate_ok(allow_empty=allow_empty) else "ATTENTION REQUIRED")
         return "\n".join(lines)
 
 

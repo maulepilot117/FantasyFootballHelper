@@ -960,3 +960,79 @@ def test_tombstone_repoint_blocked_by_a_live_id_is_bucketed_not_an_integrity_err
     # …and the refused id is on the gate rather than silently dropped.
     assert ("sleeper", "4046") in _open_queue(db_session)
     assert coverage_report(db_session).ok is False
+
+
+def test_an_aborted_seed_leaves_nothing_behind_on_the_orphan_path(
+    db_session, seeded_registry, dp_frame
+):
+    """The `apply_playerids` invariant, pinned on the ONE path that writes before the scan.
+
+    Step 3a (`_reconcile_placeholders`) runs ahead of the conflict scan by design, and on
+    the orphan path it writes to BOTH tables the invariant is about: it deletes the
+    placeholder `players` row and queues the id the keeper had no free slot for. So
+    "nothing is written before the scan" is false — what actually holds the line is the
+    transaction: `ffh crosswalk seed` exits on `CrosswalkConflictError` without reaching
+    `session.commit()`. This test drives that sequence and then rolls back exactly the way
+    the CLI does.
+    """
+    from sqlalchemy import update
+
+    from ffh.crosswalk.registry import seed_players
+
+    # 1. Yesterday's seed: DP has no gsis for Pavia, so his ids hang off a placeholder.
+    apply_playerids(db_session, dp_frame)
+    placeholder = db_session.scalar(select(Player).where(Player.normalized_name == "diego pavia"))
+    assert placeholder is not None and placeholder.gsis_id is None
+    placeholder_id = placeholder.player_id
+
+    # 2. nflverse publishes him — a SECOND `players` row for the same human (ON CONFLICT is
+    #    on gsis_id, and the placeholder's is NULL).
+    seed_players(db_session, _pavia_players_frame())
+    keeper = db_session.scalar(select(Player.player_id).where(Player.gsis_id == PAVIA_GSIS))
+
+    # 3. The keeper already holds a DIFFERENT live sleeper id, so the merge in step 3a
+    #    cannot carry the placeholder's sleeper id over: it is orphaned, hence queued.
+    db_session.add(
+        PlayerExternalId(
+            player_id=keeper,
+            source="sleeper",
+            external_id="77777",
+            confidence=1.0,
+            match_method="manual",
+        )
+    )
+    # 4. …and an unrelated protected incumbent contradicts DP, so the step-5 conflict scan
+    #    raises after step 3a has already written.
+    waddle = seeded_registry["00-0036613"]
+    db_session.execute(
+        update(PlayerExternalId)
+        .where(PlayerExternalId.source == "sleeper", PlayerExternalId.external_id == "4046")
+        .values(player_id=waddle)
+    )
+    db_session.commit()  # everything above is "what was already in the database"
+
+    queue_before = set(_open_queue(db_session))
+    players_before = _count_players(db_session)
+    assert ("sleeper", "13427") not in queue_before, "precondition: the orphan is not queued yet"
+
+    published = dp_frame.with_columns(
+        pl.when(pl.col("mfl_id") == "17471")
+        .then(pl.lit(PAVIA_GSIS))
+        .otherwise(pl.col("gsis_id"))
+        .alias("gsis_id")
+    )
+    with pytest.raises(CrosswalkConflictError):
+        apply_playerids(db_session, published)
+
+    # Step 3a really did write before the scan raised — both tables, inside the still-open
+    # transaction. This is the carve-out the docstring used to deny.
+    assert ("sleeper", "13427") in _open_queue(db_session)
+    assert db_session.get(Player, placeholder_id) is None
+
+    db_session.rollback()  # exactly what `ffh crosswalk seed` does by exiting without commit
+
+    # …and nothing survives it, in EITHER table.
+    assert set(_open_queue(db_session)) == queue_before
+    assert _count_players(db_session) == players_before
+    assert db_session.get(Player, placeholder_id) is not None
+    assert db_session.get(PlayerExternalId, ("sleeper", "13427")).player_id == placeholder_id

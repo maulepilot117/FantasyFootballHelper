@@ -2,8 +2,9 @@
 
 Lives in ``ffh.db`` rather than ``ffh.ingest`` because two unrelated subsystems need it:
 the ingest lifecycle (one run per ``(source, asset, season)``) and the crosswalk write
-commands (``ffh crosswalk seed`` / ``map`` / ``verify``, whose read-then-write plans are
-TOCTOU without it). ``ffh.ingest.base`` re-exports both names for its existing callers.
+commands (``ffh crosswalk seed`` / ``map`` / ``verify`` / ``resolve-unmatched``, whose
+read-then-write plans are TOCTOU without it). ``ffh.ingest.base`` re-exports both names
+for its existing callers.
 """
 
 from __future__ import annotations
