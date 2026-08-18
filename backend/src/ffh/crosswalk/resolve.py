@@ -19,7 +19,7 @@ from typing import Literal
 import structlog
 from rapidfuzz import process
 from rapidfuzz.distance import JaroWinkler
-from sqlalchemy import Select, func, select, update
+from sqlalchemy import Select, case, func, select, update
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.orm import Session
 
@@ -61,7 +61,9 @@ _COLLEGE_STOPWORDS: frozenset[str] = frozenset(
     {"state", "st", "university", "univ", "college", "u", "of", "the", "and", "a", "am"}
 )
 
-Outcome = Literal["resolved", "pending_review", "unmatched"]
+#: ``deferred`` is internal to ``resolve_many``'s two-pass ordering (rung 4 held back so a
+#: later rung-1/2/3 claim on the same player wins) and never escapes to a caller.
+Outcome = Literal["resolved", "pending_review", "unmatched", "deferred"]
 
 
 @dataclass(frozen=True)
@@ -132,15 +134,19 @@ def resolve(
 
 
 def resolve_many(session: Session, rows: Iterable[ResolveInput]) -> ResolveManyReport:
+    """Resolve a batch in **priority passes**, so the outcome does not depend on input order.
+
+    Rungs 2-4 persist, and rungs 3/4 exclude players already mapped for the source — so a
+    single ordered walk lets a rung-4 *guess* early in the batch claim the very player a
+    later rung-3 exact (or rung-2 gsis) match wants, pushing the better evidence onto the
+    review queue. Two passes fix that: pass 1 runs the whole batch with ``defer_fuzzy``
+    (settling every rung-1/2/3 claim batch-wide, gsis-bearing inputs first), pass 2 re-runs
+    only the deferred inputs with rung 4 enabled. ``resolve()`` — one id, no batch to be
+    ordered against — is unaffected.
+    """
     report = ResolveManyReport()
-    # gsis-bearing inputs first (order within each group is immaterial): rungs 3-4
-    # persist, so a name-based guess earlier in the batch would otherwise claim a player
-    # and force a later rung-2 certainty for that same player into crosswalk_unmatched.
-    batch = list(rows)
-    ordered = [r for r in batch if r.gsis_id is not None or r.source == "gsis"]
-    ordered += [r for r in batch if r.gsis_id is None and r.source != "gsis"]
-    for inp in ordered:
-        res, outcome = _resolve(session, inp)
+
+    def _record(inp: ResolveInput, res: Resolution | None, outcome: Outcome) -> None:
         if res is not None:
             report.resolved[inp.key] = res
             report.by_method[res.method] += 1
@@ -150,6 +156,22 @@ def resolve_many(session: Session, rows: Iterable[ResolveInput]) -> ResolveManyR
         else:
             report.unmatched.append(inp.key)
             report.by_method["unmatched"] += 1
+
+    # gsis-bearing inputs first (order within each group is immaterial): rung 2 persists,
+    # so a rung-3 exact earlier in the batch would otherwise claim a player and force a
+    # later rung-2 certainty for that same player into crosswalk_unmatched.
+    batch = list(rows)
+    ordered = [r for r in batch if r.gsis_id is not None or r.source == "gsis"]
+    ordered += [r for r in batch if r.gsis_id is None and r.source != "gsis"]
+    deferred: list[ResolveInput] = []
+    for inp in ordered:
+        res, outcome = _resolve(session, inp, defer_fuzzy=True)
+        if outcome == "deferred":
+            deferred.append(inp)
+            continue
+        _record(inp, res, outcome)
+    for inp in deferred:
+        _record(inp, *_resolve(session, inp))
     log.info(
         "crosswalk.resolve_many",
         resolved=len(report.resolved),
@@ -171,9 +193,15 @@ def upsert_unmatched(
 ) -> None:
     """The single writer for ``crosswalk_unmatched`` (rung 5 here; Task 7's review flow).
 
-    ``first_seen`` defaults on insert; on conflict the raw fields refresh, ``last_seen``
-    advances with ``clock_timestamp()`` (``now()`` is frozen per transaction) and
-    ``resolved`` flips back to false — a reappearing id needs another look.
+    ``first_seen`` defaults on insert; on conflict the raw fields refresh and ``last_seen``
+    advances with ``clock_timestamp()`` (``now()`` is frozen per transaction).
+
+    ``resolved`` re-opens **only when a ``raw_*`` field actually changed** — i.e. the id
+    reappeared *described differently* and deserves another look. An unconditional
+    ``resolved = False`` here means every weekly seed silently undoes the operator's
+    ``ffh crosswalk resolve-unmatched``: the permanently-glitched DynastyProcess ids
+    (DATA_SOURCES.md §5) are re-asserted verbatim by every snapshot, so the gate could
+    never reach green. The ``IS DISTINCT FROM`` comparison is NULL-safe in both directions.
     """
     stmt = insert(CrosswalkUnmatched).values(
         source=source,
@@ -182,6 +210,11 @@ def upsert_unmatched(
         raw_position=raw_position,
         raw_team=raw_team,
     )
+    raw_changed = (
+        CrosswalkUnmatched.raw_name.is_distinct_from(stmt.excluded.raw_name)
+        | CrosswalkUnmatched.raw_position.is_distinct_from(stmt.excluded.raw_position)
+        | CrosswalkUnmatched.raw_team.is_distinct_from(stmt.excluded.raw_team)
+    )
     stmt = stmt.on_conflict_do_update(
         index_elements=["source", "external_id"],
         set_={
@@ -189,7 +222,9 @@ def upsert_unmatched(
             "raw_position": stmt.excluded.raw_position,
             "raw_team": stmt.excluded.raw_team,
             "last_seen": func.clock_timestamp(),
-            "resolved": False,
+            # In an ON CONFLICT SET clause the bare table name is the row already stored,
+            # `excluded` the row we tried to insert.
+            "resolved": case((raw_changed, False), else_=CrosswalkUnmatched.resolved),
         },
     )
     session.execute(stmt)
@@ -219,13 +254,21 @@ def queued_raw_context(session: Session, source: str, external_id: str) -> dict[
 
 
 def close_unmatched(session: Session, source: str, external_id: str) -> bool:
-    """Flip an open ``crosswalk_unmatched`` row to resolved once its key gains a mapping.
+    """Flip an open ``crosswalk_unmatched`` row to resolved once its key **resolves**.
 
     Called at every point a mapping row is *created* for the key (``_persist`` here,
     ``apply_playerids`` in dynastyprocess, ``map_mapping`` in review): the queue entry
-    means "this id has no mapping", so creating one closes it. Deliberately NOT called on rung-1 hits (no new
-    mapping) or in ``_upgrade_from_gsis``'s conflict branch (no mapping is created there
-    — that entry must stay open so ``ffh crosswalk report`` exits 1 on it).
+    means "this id has no mapping", so creating one closes it.
+
+    One resolution creates no row and is closed here directly: a rung-2 hit with
+    ``source == "gsis"``, which deliberately skips ``_persist`` because a gsis id filed
+    under source ``gsis`` would duplicate ``players.gsis_id``. Without this the queue entry
+    of an id that missed before the player was seeded would stay open forever and latch
+    ``ffh crosswalk report`` red on an id that resolves at confidence 1.0.
+
+    Deliberately NOT called on rung-1 hits (no new mapping) or in
+    ``_upgrade_from_gsis``'s conflict branches (no mapping is created there — that entry
+    must stay open so ``ffh crosswalk report`` exits 1 on it).
     """
     result = session.execute(
         update(CrosswalkUnmatched)
@@ -245,10 +288,16 @@ def close_unmatched(session: Session, source: str, external_id: str) -> bool:
 # ---------------------------------------------------------------------------
 
 
-def _resolve(session: Session, inp: ResolveInput) -> tuple[Resolution | None, Outcome]:
+def _resolve(
+    session: Session, inp: ResolveInput, *, defer_fuzzy: bool = False
+) -> tuple[Resolution | None, Outcome]:
+    """One id down the ladder. ``defer_fuzzy`` (``resolve_many`` pass 1 only) makes rung 4
+    return ``(None, "deferred")`` and persist nothing, so the batch settles every
+    higher-rung claim before any fuzzy guess takes a player's slot for the source."""
     # Rung 1 — an existing crosswalk row (dynastyprocess, gsis, exact_name, verified fuzzy,
-    # manual). Sub-1.0 rows are re-checked against a caller-supplied gsis_id so a stale
-    # low-confidence guess is never enshrined over a 1.0 gsis fact.
+    # manual). Every row is re-checked against a caller-supplied gsis_id: a stale sub-1.0
+    # guess is corrected rather than enshrined, and a 1.0 row the gsis fact contradicts is
+    # returned but put on the gate.
     row = session.get(PlayerExternalId, (inp.source, inp.external_id))
     if row is not None:
         if row.match_method == REJECTED_METHOD:
@@ -256,7 +305,11 @@ def _resolve(session: Session, inp: ResolveInput) -> tuple[Resolution | None, Ou
             # is unmapped, stays on the gate, and only `ffh crosswalk map` can re-map it.
             _record_unmatched(session, inp, reason="rejected")
             return None, "unmatched"
-        if inp.gsis_id is not None and float(row.confidence) < 1.0 - CONFIDENCE_EPSILON:
+        if inp.gsis_id is not None:
+            # Every supplied gsis_id is checked against the stored row, 1.0 rows included.
+            # Gating this on `confidence < 1.0` made the contradiction check unreachable
+            # for the rows `map_mapping` actually writes (`manual`, confidence 1.0,
+            # verified): a human decision the gsis fact disputes was silently returned.
             handled = _upgrade_from_gsis(session, inp, row)
             if handled is not None:
                 return handled
@@ -271,7 +324,12 @@ def _resolve(session: Session, inp: ResolveInput) -> tuple[Resolution | None, Ou
     if gsis:
         pid = session.scalar(select(Player.player_id).where(Player.gsis_id == gsis))
         if pid is not None:
-            if inp.source != "gsis" and not _persist(session, inp, pid, "gsis", 1.0):
+            if inp.source == "gsis":
+                # No row to create (it would duplicate players.gsis_id) — but the id IS
+                # resolved, so close any queue entry from a miss before the player existed.
+                # `close_unmatched` lives inside `_persist`, which this branch skips.
+                close_unmatched(session, inp.source, inp.external_id)
+            elif not _persist(session, inp, pid, "gsis", 1.0):
                 return None, "unmatched"
             log.info("crosswalk.resolve.gsis", source=inp.source, external_id=inp.external_id)
             return Resolution(pid, "gsis", 1.0), "resolved"
@@ -283,7 +341,14 @@ def _resolve(session: Session, inp: ResolveInput) -> tuple[Resolution | None, Ou
         return None, "unmatched"
 
     # Rung 3 — exact (normalized_name, position[, team]), persisted
-    pid = _exact(session, inp, name, position)
+    pid, homonym_blocked = _exact(session, inp, name, position)
+    if homonym_blocked:
+        # Two same-name/same-position players and the *exclusion* of the one already mapped
+        # for this source is the only reason the answer looks unique. That is an ambiguity,
+        # not evidence: refuse rather than mint a usable 0.95 on the homonym, and send the
+        # id to the gate so a human rules on it.
+        _record_unmatched(session, inp, reason="homonym_blocked_by_existing_mapping")
+        return None, "unmatched"
     if pid is not None:
         if not _persist(session, inp, pid, "exact_name", EXACT_CONFIDENCE):
             return None, "unmatched"
@@ -295,6 +360,10 @@ def _resolve(session: Session, inp: ResolveInput) -> tuple[Resolution | None, Ou
     # Rung 4 — Jaro-Winkler ≥ 0.92, persisted for review, never returned unverified
     fuzzy, fuzzy_reason = _fuzzy(session, inp, name, position)
     if fuzzy is not None:
+        if defer_fuzzy:
+            # Pass 1 of resolve_many: persist nothing, claim nothing — the same input is
+            # re-run in pass 2 once every higher-rung claim in the batch has settled.
+            return None, "deferred"
         pid, similarity = fuzzy
         if not _persist(session, inp, pid, "fuzzy", min(similarity, FUZZY_CAP)):
             return None, "unmatched"
@@ -317,13 +386,34 @@ def _resolve(session: Session, inp: ResolveInput) -> tuple[Resolution | None, Ou
 def _upgrade_from_gsis(
     session: Session, inp: ResolveInput, row: PlayerExternalId
 ) -> tuple[Resolution | None, Outcome] | None:
-    """Rung-1 upgrade path: the caller now supplies a gsis_id worth 1.0 for a stored
-    sub-1.0 row. Same player → upgrade method/confidence; different player → the gsis
-    fact wins and the stored row is corrected. Human decisions (verified rows, manual
-    mappings) are never overwritten. A bare ``None`` means "no ruling" — the caller
-    falls through to normal rung-1 handling."""
+    """Rung-1 upgrade path: the caller supplies a gsis_id worth 1.0 for a stored row.
+
+    Stored row at 1.0 → never rewritten (it is a fact, not a guess), but a *disagreeing*
+    gsis id is a two-facts-conflict and goes on the gate. Stored row below 1.0: same
+    player → upgrade method/confidence; different player → the gsis fact wins and the
+    stored row is corrected. Human decisions (verified rows, manual mappings) are never
+    overwritten. A bare ``None`` means "no ruling" — the caller falls through to normal
+    rung-1 handling, which still returns the stored row."""
     pid = session.scalar(select(Player.player_id).where(Player.gsis_id == inp.gsis_id))
     if pid is None:
+        return None
+    if float(row.confidence) >= 1.0 - CONFIDENCE_EPSILON:
+        # A confidence-1.0 row — `manual` (what `ffh crosswalk map` writes), `gsis` or
+        # `dynastyprocess`. Nothing here outranks it, so the row is returned unchanged;
+        # but when the supplied gsis id names a DIFFERENT player the two 1.0 facts
+        # contradict each other and only a human can rule. Queue the key so
+        # `ffh crosswalk report` exits 1 until they do.
+        if pid != row.player_id:
+            log.warning(
+                "crosswalk.resolve.human_decision_conflict",
+                source=inp.source,
+                external_id=inp.external_id,
+                gsis_id=inp.gsis_id,
+                match_method=row.match_method,
+                stored_player_id=str(row.player_id),
+                gsis_player_id=str(pid),
+            )
+            _record_unmatched(session, inp, reason="human_decision_conflict")
         return None
     if row.verified_at is not None or row.match_method == "manual":
         # A human owns this mapping; a sync's gsis_id must not rewrite it. But a dispute
@@ -405,21 +495,61 @@ def _mapped_for_source(source: str) -> Select[tuple[uuid.UUID]]:
     )
 
 
-def _exact(session: Session, inp: ResolveInput, name: str, position: str) -> uuid.UUID | None:
-    cands = session.execute(
+def _exact(
+    session: Session, inp: ResolveInput, name: str, position: str
+) -> tuple[uuid.UUID | None, bool]:
+    """``(player_id | None, homonym_blocked)`` for rung 3.
+
+    The "already mapped for this source" exclusion is a no-duplicate mechanism, not
+    evidence about identity. Applied naively it silently *creates* uniqueness: with two
+    same-name/same-position players, one of whom already holds an id for the source, the
+    remaining candidate is picked and minted at a usable 0.95 — a coin flip presented as a
+    match. So the pick is run twice, and the 0.95 is accepted only when the pre-exclusion
+    candidate set answers the same way. When the exclusion is what made it unique the
+    second element is True and the caller sends the id to the gate instead.
+    """
+    cands_all = session.execute(
         select(Player.player_id, Player.team_abbr).where(
             Player.normalized_name == name,
             Player.position == position,
-            Player.player_id.not_in(_mapped_for_source(inp.source)),
         )
     ).all()
-    if not cands:
-        return None
+    if not cands_all:
+        return None, False
+    mapped = set(
+        session.scalars(
+            select(PlayerExternalId.player_id).where(
+                PlayerExternalId.source == inp.source,
+                PlayerExternalId.match_method != REJECTED_METHOD,
+                PlayerExternalId.player_id.in_([c.player_id for c in cands_all]),
+            )
+        )
+    )
+    cands = [c for c in cands_all if c.player_id not in mapped]
     team = normalize_team(inp.raw_team)
-    if team is None:
-        return cands[0].player_id if len(cands) == 1 else None
-    compatible = [c for c in cands if c.team_abbr in (team, None)]
-    return compatible[0].player_id if len(compatible) == 1 else None
+
+    def _pick(rows: list) -> uuid.UUID | None:
+        if not rows:
+            return None
+        if team is None:
+            return rows[0].player_id if len(rows) == 1 else None
+        compatible = [c for c in rows if c.team_abbr in (team, None)]
+        return compatible[0].player_id if len(compatible) == 1 else None
+
+    pid = _pick(cands)
+    if pid is None:
+        return None, False
+    if _pick(cands_all) != pid:
+        log.warning(
+            "crosswalk.resolve.homonym_blocked_by_existing_mapping",
+            source=inp.source,
+            external_id=inp.external_id,
+            name=name,
+            position=position,
+            candidates=len(cands_all),
+        )
+        return None, True
+    return pid, False
 
 
 def _college_tokens(raw: str) -> set[str]:
@@ -472,9 +602,13 @@ def _fuzzy(
         return None, "no_candidate"
     # DATABASE.md §3: "disambiguated by birth date or college where available" — two legs:
     # NEGATIVE first (a stored non-NULL value that contradicts the input rules the
-    # candidate out), then POSITIVE (if the input confirms at least one survivor, keep
-    # only those). A candidate set contradicted by everything falls to rung 5 rather
-    # than persisting a fuzzy guess at a demonstrably different player.
+    # candidate out), then POSITIVE (the input confirms a survivor). A candidate set
+    # contradicted by everything falls to rung 5 rather than persisting a fuzzy guess at a
+    # demonstrably different player.
+    # The positive leg is NOT "keep only the confirmed" on the college side: a stored NULL
+    # college is no evidence *against* a candidate, and dropping it hands the id to a
+    # lower-similarity homonym that merely happens to have a college on file. Confirmed
+    # and unknown-college candidates both survive; the tie margin below rules on them.
     eliminated_by: list[str] = []
     if inp.birth_date is not None:
         before = len(survivors)
@@ -501,7 +635,7 @@ def _fuzzy(
             if meta[p][1] is not None and colleges_agree(needle, meta[p][1])
         ]
         if confirmed:
-            survivors = confirmed
+            survivors = confirmed + [(p, s) for p, s in survivors if meta[p][1] is None]
     if not survivors:
         log.info(
             "crosswalk.resolve.fuzzy_eliminated",

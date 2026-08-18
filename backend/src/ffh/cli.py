@@ -22,6 +22,15 @@ from ffh.ingest import reference as _reference  # noqa: F401
 from ffh.ingest.base import JOBS, STATUS_FAILED, get_job
 from ffh.ingest.reference import StadiumsJob, seed_generic_league, seed_nfl_teams
 
+#: Crosswalk exit codes (DATABASE.md §3). 0 = gate green, 1 = gate red (something is
+#: unmatched or awaiting review — a *data* state a human resolves), 2 = a crosswalk
+#: conflict a human must rule on, 3 = an OPERATIONAL failure (unreadable file, malformed
+#: CSV, database down). 3 exists so a cron wrapper can tell "the crosswalk has a gap" from
+#: "the run never happened": both used to exit 1 and were indistinguishable.
+EXIT_GATE_RED = 1
+EXIT_CONFLICT = 2
+EXIT_OPERATIONAL = 3
+
 app = typer.Typer(no_args_is_help=True, help="FantasyFootballHelper CLI.")
 ingest_app = typer.Typer(no_args_is_help=True, help="Run ingest jobs.")
 league_app = typer.Typer(no_args_is_help=True, help="Load leagues from platforms.")
@@ -133,11 +142,28 @@ def _coverage_report_for_cli():
 @crosswalk_app.command("report")
 def crosswalk_report(
     json_out: bool = typer.Option(False, "--json", help="Machine-readable output."),
+    allow_empty: bool = typer.Option(
+        False,
+        "--allow-empty",
+        help="Do not fail on an empty (never-seeded) crosswalk. For pre-seed invocations.",
+    ),
 ) -> None:
-    """Crosswalk coverage report. Exit 1 if anything is unmatched or awaiting review."""
-    rep = _coverage_report_for_cli()
+    """Crosswalk coverage report — the gate.
+
+    Exit 0 = green. Exit 1 = red: something is unmatched, awaiting review, or the
+    crosswalk was never seeded (`--allow-empty` opts out of the last one). Exit 3 = the
+    report could not be produced at all (database down); a wrapper must not read that as
+    a clean crosswalk.
+    """
+    from sqlalchemy.exc import SQLAlchemyError
+
+    try:
+        rep = _coverage_report_for_cli()
+    except (SQLAlchemyError, OSError) as exc:
+        typer.echo(f"crosswalk report failed: {type(exc).__name__}: {exc}", err=True)
+        raise typer.Exit(code=EXIT_OPERATIONAL) from exc
     typer.echo(json.dumps(rep.to_dict(), indent=2, default=str) if json_out else rep.render())
-    raise typer.Exit(code=0 if rep.ok else 1)
+    raise typer.Exit(code=0 if rep.gate_ok(allow_empty=allow_empty) else EXIT_GATE_RED)
 
 
 @crosswalk_app.command("seed")
@@ -158,17 +184,26 @@ def crosswalk_seed(
         ),
     ] = None,
 ) -> None:
-    """Seed the players registry (and DSTs) from nflverse; optionally apply DynastyProcess ids."""
+    """Seed the players registry (and DSTs) from nflverse; optionally apply DynastyProcess ids.
+
+    Exit 0 = seeded. Exit 2 = a `CrosswalkConflictError` a human must rule on (nothing is
+    committed). Exit 3 = an operational failure — no players partition, an unreadable or
+    malformed file, a truncated Parquet, a database error. Exit 1 is reserved for the
+    `report` gate and is never returned here.
+    """
     # Lazy imports: keep CLI start-up fast (the draft pick clock is 90 seconds) — in
     # particular ffh.features.duck pulls in duckdb, which must not load on every command.
     import polars as pl
+    from polars.exceptions import PolarsError
+    from sqlalchemy.exc import SQLAlchemyError
 
     from ffh.crosswalk.dynastyprocess import (
         CrosswalkConflictError,
+        DynastyProcessError,
         apply_playerids,
         read_playerids_csv,
     )
-    from ffh.crosswalk.registry import seed_players
+    from ffh.crosswalk.registry import RegistryError, seed_players
 
     if players is None:
         from ffh.features.duck import latest_partition
@@ -182,27 +217,35 @@ def crosswalk_seed(
                 "nflverse_players` first or pass --players",
                 err=True,
             )
-            raise typer.Exit(code=1)
+            # Operational, not a gate signal: the data never arrived.
+            raise typer.Exit(code=EXIT_OPERATIONAL)
 
-    with _session_scope() as session:
-        n = seed_players(session, pl.read_parquet(players))
-        typer.echo(f"players upserted (incl. 32 DST): {n}")
-        if playerids is not None:
-            frame = (
-                read_playerids_csv(playerids.read_bytes())
-                if playerids.suffix == ".csv"
-                else pl.read_parquet(playerids)
-            )
-            try:
-                report = apply_playerids(session, frame)
-            except CrosswalkConflictError as exc:
-                # Exit 2: conflicts need a human (`ffh crosswalk verify --reject`); the
-                # session is closed without commit so nothing partial lands. Exit 1 is
-                # reserved for the report's "unmatched or unverified rows exist" signal.
-                typer.echo(str(exc), err=True)
-                raise typer.Exit(code=2) from exc
-            typer.echo(json.dumps(report.__dict__, indent=2))
-        session.commit()
+    # The guarded region covers the frame reads and seed_players as well as the DP apply:
+    # a truncated partition, a malformed CSV or a database outage are operational
+    # failures, and letting them escape as exit 1 makes them indistinguishable from a
+    # crosswalk gap to any cron wrapper reading the exit code.
+    try:
+        with _session_scope() as session:
+            n = seed_players(session, pl.read_parquet(players))
+            typer.echo(f"players upserted (incl. 32 DST): {n}")
+            if playerids is not None:
+                frame = (
+                    read_playerids_csv(playerids.read_bytes())
+                    if playerids.suffix == ".csv"
+                    else pl.read_parquet(playerids)
+                )
+                try:
+                    report = apply_playerids(session, frame)
+                except CrosswalkConflictError as exc:
+                    # Exit 2: conflicts need a human (`ffh crosswalk verify --reject`); the
+                    # session is closed without commit so nothing partial lands.
+                    typer.echo(str(exc), err=True)
+                    raise typer.Exit(code=EXIT_CONFLICT) from exc
+                typer.echo(json.dumps(report.__dict__, indent=2))
+            session.commit()
+    except (DynastyProcessError, RegistryError, OSError, PolarsError, SQLAlchemyError) as exc:
+        typer.echo(f"crosswalk seed failed: {type(exc).__name__}: {exc}", err=True)
+        raise typer.Exit(code=EXIT_OPERATIONAL) from exc
 
 
 @crosswalk_app.command("verify")
@@ -228,7 +271,10 @@ def crosswalk_verify(
                 # tombstone (so no sync can re-mint the pairing) and the id is now
                 # unmapped, so it must stay on the gate until `ffh crosswalk map` or
                 # `ffh crosswalk resolve-unmatched` rules on it.
-                mark_unmatched_resolved(session, source, external_id)
+                # force=True: the key HAS a live mapping here — accepting that mapping is
+                # exactly the human decision that closes the entry, which is the one case
+                # `mark_unmatched_resolved`'s live-mapping guard must not refuse.
+                mark_unmatched_resolved(session, source, external_id, force=True)
             session.commit()
     if not ok:
         hint = (
@@ -274,15 +320,38 @@ def crosswalk_resolve_unmatched(
         ..., help="sleeper|espn|yahoo|pfr|fantasypros|sportradar|rotowire"
     ),
     external_id: str = typer.Argument(...),
+    force: bool = typer.Option(
+        False,
+        "--force",
+        help="Close the entry even though the id still has a mapping row. Only for an id "
+        "that will never map correctly and whose mapping you accept as-is.",
+    ),
 ) -> None:
-    """Close a review-queue entry that has no mapping row (rung-5 ids that will never map)."""
-    from ffh.crosswalk.review import mark_unmatched_resolved
+    """Close a review-queue entry that has no mapping row (rung-5 ids that will never map).
+
+    Exit 0 = closed. Exit 1 = nothing to close, or the precondition failed: the id still
+    has a live mapping row, so closing the entry would green the gate while `resolve`
+    keeps handing consumers the contradicted mapping. Rule on that with
+    `ffh crosswalk verify --reject` / `ffh crosswalk map` (or `--force`).
+    """
+    from ffh.crosswalk.review import live_mapping, mark_unmatched_resolved
 
     with _session_scope() as session:
-        ok = mark_unmatched_resolved(session, source, external_id)
+        ok = mark_unmatched_resolved(session, source, external_id, force=force)
+        mapping = None if ok else live_mapping(session, source, external_id)
         if ok:
             session.commit()
     if not ok:
-        typer.echo(f"no crosswalk_unmatched row for {source}:{external_id}", err=True)
-        raise typer.Exit(code=1)
+        if mapping is not None:
+            typer.echo(
+                f"{source}:{external_id} still maps to {mapping.player_id} "
+                f"({mapping.match_method}) — closing the queue entry would hide a mapping "
+                "the ladder still returns. Rule on it with "
+                f"`ffh crosswalk verify {source} {external_id} --reject` or "
+                f"`ffh crosswalk map {source} {external_id} <player_id>`, or pass --force.",
+                err=True,
+            )
+        else:
+            typer.echo(f"no crosswalk_unmatched row for {source}:{external_id}", err=True)
+        raise typer.Exit(code=EXIT_GATE_RED)
     typer.echo(f"resolved unmatched {source}:{external_id}")

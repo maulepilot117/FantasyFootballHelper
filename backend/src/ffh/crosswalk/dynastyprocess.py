@@ -74,7 +74,12 @@ class DynastyProcessError(RuntimeError):
 
 
 class CrosswalkConflictError(RuntimeError):
-    """An existing (source, external_id) row points at a different player than DP says."""
+    """An existing (source, external_id) row that OUTRANKS DynastyProcess points at a
+    different player than DP says — `manual`, `dynastyprocess`, verified, or a tombstone.
+
+    An unverified `exact_name`/`fuzzy` guess pointing elsewhere is NOT this: DP's 1.0 fact
+    outranks it (the authority rule), so it is re-pointed in place. Raising on it aborted
+    the whole seed — `seed_players` included — over one stale ladder row."""
 
     def __init__(self, conflicts: list[tuple[str, str, uuid.UUID, uuid.UUID]]) -> None:
         self.conflicts = conflicts
@@ -89,7 +94,9 @@ class CrosswalkConflictError(RuntimeError):
 class CrosswalkApplyReport:
     """Every id cell in the file ends in exactly one of these buckets — the four
     ``*ambiguous*``/``blocked*`` tuples are also **queued in ``crosswalk_unmatched``**, so a
-    known-but-unmapped id can never leave ``ffh crosswalk report`` green."""
+    known-but-unmapped id can never leave ``ffh crosswalk report`` green. The one
+    exception: an ``ambiguous_in_file`` key that already has a live mapping is reported but
+    NOT queued — it is mapped, and queueing it re-opened the entry on every seed."""
 
     inserted: int
     updated: int
@@ -187,8 +194,9 @@ def apply_playerids(session: Session, df: pl.DataFrame) -> CrosswalkApplyReport:
     """Populate ``player_external_ids`` at confidence 1.0 / ``dynastyprocess`` from a DP frame.
 
     Policies 1-7 are in the plan (Task 4) and DATABASE.md §3. Runs inside the caller's
-    transaction; a ``CrosswalkConflictError`` is raised before any write — including
-    placeholder ``players`` rows, which are only created after the conflict scan passes.
+    transaction; a ``CrosswalkConflictError`` is raised before any write — placeholder
+    ``players`` rows AND ``crosswalk_unmatched`` queueing both happen only after the
+    conflict scan passes, so an aborted seed leaves nothing behind in either table.
     """
     df, skipped_no_person_key = _validate(df)
     n_in = df.height
@@ -375,27 +383,67 @@ def apply_playerids(session: Session, df: pl.DataFrame) -> CrosswalkApplyReport:
             count=len(ambiguous),
             sample=sorted(ambiguous)[:10],
         )
-        for source, ext in sorted(ambiguous):
-            _queue(source, ext)
     # Deterministic apply/report order regardless of CSV row order.
     clean = clean.sort(["source", "external_id"])
 
-    # 5. conflict scan (vs the DB) — BEFORE any write, including placeholder players.
-    # Placeholder rows cannot conflict: step 3 assigned them a placeholder precisely
-    # because none of their ids exist in player_external_ids. `existing` excludes
-    # tombstones, so a rejected pairing does not raise here — step 7 rules on it (and a
-    # rejection would otherwise fail every subsequent seed run with exit 2).
+    # 5. conflict scan (vs the DB) — BEFORE any write, including placeholder players and
+    # the ambiguity queueing below. Placeholder rows cannot conflict: step 3 assigned them
+    # a placeholder precisely because none of their ids exist in player_external_ids.
+    # `existing` excludes tombstones, so a rejected pairing does not raise here — step 7
+    # rules on it (and a rejection would otherwise fail every subsequent seed run).
+    #
+    # A mismatch is only a CONFLICT when the incumbent outranks DP's 1.0 fact. An
+    # unverified `exact_name`/`fuzzy` guess does not: it is exactly what rung 1's upgrade
+    # path re-points without complaint, so raising on it would abort the whole seed —
+    # `ffh crosswalk seed` exits before `session.commit()`, discarding `seed_players` too —
+    # over one stale ladder guess. Those keys are re-pointed in place instead (step 7).
     conflicts: list[tuple[str, str, uuid.UUID, uuid.UUID]] = []
+    stale_guesses: dict[tuple[str, str], PlayerExternalId] = {}
     for r in clean.iter_rows(named=True):
         if r["player_key"].startswith(_PLACEHOLDER_PREFIXES):
             continue
         pid = uuid.UUID(r["player_key"])
         ex = existing.get((r["source"], r["external_id"]))
         if ex is not None and ex.player_id != pid:
-            conflicts.append((r["source"], r["external_id"], ex.player_id, pid))
+            if displaceable(ex):
+                stale_guesses[(r["source"], r["external_id"])] = ex
+            else:
+                conflicts.append((r["source"], r["external_id"], ex.player_id, pid))
     if conflicts:
         log.error("crosswalk.dynastyprocess.conflicts", count=len(conflicts))
         raise CrosswalkConflictError(conflicts)
+
+    # --- past this point the function writes. Nothing above it may. ---
+    for (source, ext), ex in sorted(stale_guesses.items()):
+        log.warning(
+            "crosswalk.dynastyprocess.stale_guess_repointed",
+            source=source,
+            external_id=ext,
+            stored_method=ex.match_method,
+            stored_player_id=str(ex.player_id),
+        )
+        # Hidden from step 7's `existing` lookup so the key takes the full write path:
+        # the (source, player_id) slot check and the authority rule both apply to it.
+        del existing[(source, ext)]
+        held_by_player.pop((source, ex.player_id), None)
+
+    # 5b. the ambiguous ids DP contradicts itself on go on the review queue — EXCEPT the
+    # ones that already have a live mapping. Those are mapped: DynastyProcess being
+    # self-contradictory about an id it previously agreed on is a reason to report it, not
+    # to re-open a queue entry an operator already ruled on. The glitch ids are permanent
+    # (DATA_SOURCES.md §5), so queueing them every seed made the gate unreachable.
+    for source, ext in sorted(ambiguous):
+        live = existing.get((source, ext))
+        if live is not None:
+            log.info(
+                "crosswalk.dynastyprocess.ambiguous_but_mapped",
+                source=source,
+                external_id=ext,
+                match_method=live.match_method,
+                player_id=str(live.player_id),
+            )
+            continue
+        _queue(source, ext)
 
     # 6. create players for placeholders that still hold ≥ 1 id
     is_placeholder = pl.col("player_key").str.starts_with("gsis:") | pl.col(
@@ -500,10 +548,11 @@ def apply_playerids(session: Session, df: pl.DataFrame) -> CrosswalkApplyReport:
                 _queue(source, ext)
                 continue
         claimed.add((source, pid))
-        if tomb is not None:
-            # Same key, DIFFERENT player: the rejection was about the other player, and
-            # this is the correction it was asking for. Repoint the tombstone in place
-            # (its primary key is already taken by definition).
+        if tomb is not None or (source, ext) in stale_guesses:
+            # The key already has a row pointing at another player — a tombstone (the
+            # rejection was about that other player, and this is the correction it asked
+            # for) or a stale ladder guess DP contradicts. Either way the primary key is
+            # taken, so repoint in place rather than inserting.
             repoints.append((source, ext, pid))
         else:
             inserts.append(
@@ -525,6 +574,23 @@ def apply_playerids(session: Session, df: pl.DataFrame) -> CrosswalkApplyReport:
         == clean.height
     ), "row loss in partition"
 
+    # Repoints run BEFORE the inserts: a repointed row still occupies its old
+    # (source, player_id) slot, and this batch may be inserting a different id for that
+    # old player — the partial unique index would refuse it in the other order.
+    for source, ext, pid in repoints:
+        session.execute(
+            update(PlayerExternalId)
+            .where(PlayerExternalId.source == source, PlayerExternalId.external_id == ext)
+            .values(
+                player_id=pid,
+                match_method=DP_METHOD,
+                confidence=DP_CONFIDENCE,
+                verified_at=None,
+            )
+        )
+        close_unmatched(session, source, ext)
+    if repoints:
+        session.flush()
     if inserts:
         session.execute(PlayerExternalId.__table__.insert(), inserts)
         # Every inserted key now has a mapping row: close its review-queue entry if one
@@ -549,18 +615,6 @@ def apply_playerids(session: Session, df: pl.DataFrame) -> CrosswalkApplyReport:
             .where(PlayerExternalId.source == source, PlayerExternalId.external_id == ext)
             .values(match_method=DP_METHOD, confidence=DP_CONFIDENCE)
         )
-    for source, ext, pid in repoints:
-        session.execute(
-            update(PlayerExternalId)
-            .where(PlayerExternalId.source == source, PlayerExternalId.external_id == ext)
-            .values(
-                player_id=pid,
-                match_method=DP_METHOD,
-                confidence=DP_CONFIDENCE,
-                verified_at=None,
-            )
-        )
-        close_unmatched(session, source, ext)
     session.flush()
 
     report = CrosswalkApplyReport(

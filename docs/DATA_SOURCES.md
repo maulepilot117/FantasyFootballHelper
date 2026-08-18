@@ -326,7 +326,11 @@ Gotchas, all confirmed against the live file — these contradict what you would
   `apply_playerids` has an ambiguity policy — such ids are reported in
   `CrosswalkApplyReport.ambiguous_in_file` (the sibling buckets are `blocked_by_existing`,
   `blocked_by_rejection` and `displaced`) **and queued in `crosswalk_unmatched`** so the
-  gate sees them, never applied.
+  gate sees them, never applied. The glitches are *permanent*, so the queueing is
+  idempotent in both directions: an ambiguous id that already has a live mapping is
+  reported but not queued, and re-asserting an id verbatim never re-opens a queue entry an
+  operator already closed (DATABASE.md §3, review-queue lifecycle). Without that, every
+  weekly seed re-opened the same rows and `ffh crosswalk report` could never reach exit 0.
 
 **Ingest:** job `dynastyprocess_playerids` (`ffh ingest run dynastyprocess_playerids`) —
 weekly full snapshot, ETag-conditional, no `persist()`. It lands

@@ -82,14 +82,44 @@ def reject_mapping(session: Session, source: str, external_id: str) -> bool:
     return True
 
 
-def mark_unmatched_resolved(session: Session, source: str, external_id: str) -> bool:
-    """Flip crosswalk_unmatched.resolved after a human decision handled the queue entry."""
+def live_mapping(session: Session, source: str, external_id: str) -> PlayerExternalId | None:
+    """The key's mapping row, or ``None`` when it has none. A ``rejected`` tombstone is not
+    a mapping (the id is unmapped by definition), so it reads as ``None`` here."""
+    row = session.get(PlayerExternalId, (source, external_id))
+    return row if row is not None and row.match_method != REJECTED_METHOD else None
+
+
+def mark_unmatched_resolved(
+    session: Session, source: str, external_id: str, *, force: bool = False
+) -> bool:
+    """Flip crosswalk_unmatched.resolved after a human decision handled the queue entry.
+
+    Refuses while the key still has a **live mapping row**. Three ladder states park an id
+    in *both* tables (`upgrade_conflict`, `human_decision_conflict`, and a mapping a human
+    is disputing): there the queue row is the gate signal for a mapping that `resolve`
+    keeps returning, so closing it would green the gate on a contradicted mapping while
+    every consumer still gets the wrong player. The operator paths for that state are
+    `ffh crosswalk verify --reject` (tombstone it) or `ffh crosswalk map` (re-point it).
+
+    ``force`` restores the unconditional close for the case the command is *for*: an id
+    that will never map, plus the internal `ffh crosswalk verify` call, where accepting the
+    mapping is precisely the decision that closes the entry.
+    """
     u = session.scalar(
         select(CrosswalkUnmatched).where(
             CrosswalkUnmatched.source == source, CrosswalkUnmatched.external_id == external_id
         )
     )
     if u is None:
+        return False
+    if not force and (row := live_mapping(session, source, external_id)) is not None:
+        log.warning(
+            "crosswalk.review.unmatched_resolve_refused",
+            source=source,
+            external_id=external_id,
+            match_method=row.match_method,
+            player_id=str(row.player_id),
+        )
         return False
     u.resolved = True
     session.flush()

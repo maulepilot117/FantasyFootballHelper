@@ -295,12 +295,33 @@ def test_rung4_birth_date_breaks_tie(db_session, seeded_registry):
     assert _unmatched(db_session) == []
 
 
-def test_rung4_college_breaks_tie(db_session, seeded_registry):
-    _add_fake_player(db_session, "Jaylon Waddle", "WR", "DEN", "FAKE-JW")
+def test_rung4_college_does_not_break_a_tie_against_an_unknown_college(db_session, seeded_registry):
+    """The college leg no longer *evicts* candidates whose stored college is NULL — NULL is
+    no evidence against them. With two equally-similar names and only one college on file
+    the evidence is genuinely inconclusive, so the tie stands and the id goes to the queue
+    rather than becoming a fuzzy suggestion built on an eviction."""
+    _add_fake_player(db_session, "Jaylon Waddle", "WR", "DEN", "FAKE-JW")  # college NULL
     res = resolve(db_session, "sleeper", "7526", "Jaylin Waddle", "WR", "DEN", college="Alabama")
-    assert res is None  # pending review, pointed at the real (Alabama) Waddle
+    assert res is None
+    assert db_session.get(PlayerExternalId, ("sleeper", "7526")) is None
+    assert [(u.source, u.external_id) for u in _unmatched(db_session)] == [("sleeper", "7526")]
+
+
+def test_rung4_college_confirmation_never_evicts_the_better_null_college_candidate(
+    db_session, seeded_registry
+):
+    """`if confirmed: survivors = confirmed` handed the id to a *lower*-similarity
+    candidate whose college happened to be on file, dropping the exact-name candidate
+    purely because its college is unknown. NULL is not a contradiction."""
+    fake = _add_fake_player(db_session, "Jaylin Waddel", "WR", "DEN", "FAKE-JW")  # college NULL
+    assert db_session.get(Player, seeded_registry["00-0036613"]).college == "Alabama"
+    # 'jaylin waddle' matches the fake at 0.9846 and the real Waddle at 0.9692 — outside
+    # the 0.01 tie margin — but only the real one confirms the supplied college.
+    res = resolve(db_session, "sleeper", "7526", "Jaylin Waddle", "WR", "DEN", college="Alabama")
+    assert res is None  # rung 4 is always pending review …
     row = db_session.get(PlayerExternalId, ("sleeper", "7526"))
-    assert row.player_id == seeded_registry["00-0036613"]
+    assert row is not None and row.match_method == "fuzzy"
+    assert row.player_id == fake.player_id  # … pointed at the better name match, not evicted
     assert _unmatched(db_session) == []
 
 
@@ -604,20 +625,20 @@ def test_rung1_upgrade_displaces_an_unverified_incumbent(db_session, seeded_regi
 
 def test_human_decision_conflict_lands_on_the_gate(db_session, seeded_registry):
     """The lock stands (a sync never overwrites a human decision) — but the dispute is
-    no longer log-only: the key is queued so `ffh crosswalk report` exits 1 on it."""
+    no longer log-only: the key is queued so `ffh crosswalk report` exits 1 on it.
+
+    The manual row is built with `map_mapping`, i.e. the ONLY thing that writes one:
+    `manual`, confidence 1.0, verified. A hand-written 0.95 `manual` row is not a state
+    the system can reach, and gating the contradiction check on `confidence < 1.0` made
+    this gate unreachable for every real human decision.
+    """
     from ffh.crosswalk.report import coverage_report
+    from ffh.crosswalk.review import map_mapping
 
     mahomes, chase = seeded_registry["00-0033873"], seeded_registry["00-0036900"]
-    db_session.add(
-        PlayerExternalId(
-            player_id=chase,
-            source="sleeper",
-            external_id="4046",
-            confidence=0.95,
-            match_method="manual",
-        )
-    )
-    db_session.flush()
+    assert map_mapping(db_session, "sleeper", "4046", chase).ok is True
+    row = db_session.get(PlayerExternalId, ("sleeper", "4046"))
+    assert float(row.confidence) == 1.0 and row.verified_at is not None
     with structlog.testing.capture_logs() as logs:
         res = resolve(db_session, "sleeper", "4046", gsis_id="00-0033873")
     assert res is not None and res.player_id == chase  # the human decision still stands
@@ -631,19 +652,12 @@ def test_human_decision_conflict_lands_on_the_gate(db_session, seeded_registry):
 
 def test_confirming_gsis_on_a_human_row_is_not_a_conflict(db_session, seeded_registry):
     """A gsis id that AGREES with the human decision must not put it on the gate."""
+    from ffh.crosswalk.review import map_mapping
+
     mahomes = seeded_registry["00-0033873"]
-    db_session.add(
-        PlayerExternalId(
-            player_id=mahomes,
-            source="sleeper",
-            external_id="4046",
-            confidence=0.95,
-            match_method="manual",
-        )
-    )
-    db_session.flush()
+    assert map_mapping(db_session, "sleeper", "4046", mahomes).ok is True
     res = resolve(db_session, "sleeper", "4046", gsis_id="00-0033873")
-    assert res is not None and res.player_id == mahomes
+    assert res is not None and res.player_id == mahomes and res.method == "manual"
     assert _unmatched(db_session) == []
 
 
@@ -810,3 +824,153 @@ def test_displacement_preserves_the_queued_raw_context(db_session, seeded_regist
     (u,) = [u for u in _unmatched(db_session) if u.external_id == "GUESS"]
     assert (u.raw_name, u.raw_position, u.raw_team) == ("Pat Mahomes", "QB", "KC")
     assert u.resolved is False
+
+
+# ---------------------------------------------------------------------------
+# Fix wave A: gate integrity, queue lifecycle, ladder ordering.
+# ---------------------------------------------------------------------------
+
+
+def test_source_gsis_rung2_hit_closes_its_queue_entry(db_session):
+    """Rung 2 deliberately skips `_persist` for `source == "gsis"` (the row would
+    duplicate `players.gsis_id`) — but `close_unmatched` lived inside `_persist`, so an id
+    queued before the player was seeded resolved at 1.0 and stayed on the gate forever."""
+    from ffh.crosswalk.report import coverage_report
+    from tests.crosswalk.conftest import seed_fixture_registry
+
+    # Rung 5 first: the player does not exist yet, so the gsis id is queued.
+    assert resolve(db_session, "gsis", "00-0033873", "Patrick Mahomes", "QB", "KC") is None
+    (u,) = _unmatched(db_session)
+    assert (u.source, u.external_id) == ("gsis", "00-0033873") and u.resolved is False
+
+    ids = seed_fixture_registry(db_session)
+    # …and a second source so the crosswalk is not "empty" (report.CoverageReport.seeded).
+    assert resolve(db_session, "sleeper", "4046", "Patrick Mahomes", "QB", "KC") is not None
+
+    with structlog.testing.capture_logs() as logs:
+        res = resolve(db_session, "gsis", "00-0033873", "Patrick Mahomes", "QB", "KC")
+    assert res == Resolution(ids["00-0033873"], "gsis", 1.0)
+    assert db_session.get(PlayerExternalId, ("gsis", "00-0033873")) is None  # still no row
+    db_session.refresh(u)
+    assert u.resolved is True
+    assert any(e["event"] == "crosswalk.resolve.unmatched_closed" for e in logs)
+    assert coverage_report(db_session).ok is True
+
+
+def test_resolve_many_is_order_independent_a_fuzzy_never_steals_an_exact_players_slot(
+    db_session, seeded_registry
+):
+    """Rungs 3-4 persist and both exclude players already mapped for the source, so a
+    rung-4 *guess* listed first claimed the player a later rung-3 *exact* wanted — and the
+    exact match was pushed onto the review queue. The ladder now runs in priority passes:
+    every rung-1/2/3 claim settles batch-wide before any fuzzy guess is written."""
+    lamar = seeded_registry["00-0034796"]
+    rows = [
+        ResolveInput("sleeper", "FUZZY", "Lamarr Jackson", "QB", "BAL"),  # JW ≈ 0.9857, first
+        ResolveInput("sleeper", "EXACT", "Lamar Jackson", "QB", "BAL"),  # the real thing
+    ]
+    rep = resolve_many(db_session, rows)
+    assert rep.resolved[("sleeper", "EXACT")] == Resolution(
+        lamar, "exact_name", pytest.approx(EXACT_CONFIDENCE)
+    )
+    assert ("sleeper", "FUZZY") not in rep.resolved
+    exact_row = db_session.get(PlayerExternalId, ("sleeper", "EXACT"))
+    assert exact_row.player_id == lamar and exact_row.match_method == "exact_name"
+    # The guess never took the slot, and its id is on the gate rather than silently gone.
+    assert db_session.get(PlayerExternalId, ("sleeper", "FUZZY")) is None
+    assert [(u.source, u.external_id) for u in _unmatched(db_session)] == [("sleeper", "FUZZY")]
+    # Single-id resolve() is unchanged: one input has no batch to be ordered against.
+    assert resolve(db_session, "espn", "F2", "Lamarr Jackson", "QB", "BAL") is None
+    assert db_session.get(PlayerExternalId, ("espn", "F2")).match_method == "fuzzy"
+
+
+def test_rung3_refuses_a_homonym_the_existing_mapping_exclusion_made_unique(
+    db_session, seeded_registry
+):
+    """Two Marvin Harrisons, both WR. One already holds a sleeper id, so the "already
+    mapped for this source" exclusion silently reduces the candidate set to one and mints
+    a *usable* 0.95 on the other. The exclusion is a no-duplicate mechanism, not evidence:
+    the id must go red instead."""
+    jr, sr = seeded_registry["00-0039849"], seeded_registry["00-0007024"]
+    db_session.add(
+        PlayerExternalId(
+            player_id=jr,
+            source="sleeper",
+            external_id="11628",
+            confidence=1.0,
+            match_method="dynastyprocess",
+        )
+    )
+    db_session.flush()
+    with structlog.testing.capture_logs() as logs:
+        # No team supplied, so nothing distinguishes the two 'marvin harrison' WRs.
+        res = resolve(db_session, "sleeper", "MH-2", "Marvin Harrison", "WR", None)
+    assert res is None
+    assert db_session.get(PlayerExternalId, ("sleeper", "MH-2")) is None  # no 0.95 on the elder
+    assert [(u.source, u.external_id) for u in _unmatched(db_session)] == [("sleeper", "MH-2")]
+    assert [e["reason"] for e in logs if e["event"] == "crosswalk.resolve.unmatched"] == [
+        "homonym_blocked_by_existing_mapping"
+    ]
+    assert sr != jr
+    # A team still disambiguates: that is real evidence, not an artefact of the exclusion.
+    res_sr = resolve(db_session, "sleeper", "MH-3", "Marvin Harrison", "WR", "IND")
+    assert res_sr is not None and res_sr.player_id == sr and res_sr.method == "exact_name"
+
+
+def test_resolve_unmatched_refuses_while_a_contradicted_mapping_is_still_live(
+    db_session, seeded_registry
+):
+    """The `upgrade_conflict` state parks the key in BOTH tables on purpose: the sub-1.0
+    row stays live and usable while `resolve` refuses to return it. Closing the queue row
+    greens the gate on exactly that — the command silences the only signal while every
+    consumer keeps getting the contradicted mapping."""
+    from ffh.crosswalk.report import coverage_report
+    from ffh.crosswalk.review import mark_unmatched_resolved
+
+    mahomes, chase = seeded_registry["00-0033873"], seeded_registry["00-0036900"]
+    db_session.add(
+        PlayerExternalId(
+            player_id=mahomes,
+            source="sleeper",
+            external_id="E1",
+            confidence=0.95,
+            match_method="exact_name",
+        )
+    )
+    db_session.add(
+        PlayerExternalId(
+            player_id=chase,
+            source="sleeper",
+            external_id="E2",
+            confidence=1.0,
+            match_method="dynastyprocess",
+        )
+    )
+    db_session.flush()
+    assert resolve(db_session, "sleeper", "E1", gsis_id="00-0036900") is None
+    assert db_session.get(PlayerExternalId, ("sleeper", "E1")).player_id == mahomes
+
+    with structlog.testing.capture_logs() as logs:
+        assert mark_unmatched_resolved(db_session, "sleeper", "E1") is False
+    assert any(e["event"] == "crosswalk.review.unmatched_resolve_refused" for e in logs)
+    assert coverage_report(db_session).ok is False
+
+    # `--force` is the escape hatch for the case the command is for; and rejecting the
+    # disputed row (making the id genuinely unmapped) unblocks the normal path too.
+    assert mark_unmatched_resolved(db_session, "sleeper", "E1", force=True) is True
+    assert coverage_report(db_session).ok is True
+
+
+def test_resolve_unmatched_still_closes_an_id_with_no_mapping_or_only_a_tombstone(
+    db_session, seeded_registry
+):
+    """The guard must not break the command's actual job: a rung-5 id (no row at all) and
+    a rejected id (a tombstone is not a mapping) both still close."""
+    from ffh.crosswalk.review import mark_unmatched_resolved, reject_mapping
+
+    assert resolve(db_session, "sleeper", "99999", "Nobody Nowhere", "QB", "FA") is None
+    assert mark_unmatched_resolved(db_session, "sleeper", "99999") is True
+
+    resolve(db_session, "sleeper", "4881", "Lamarr Jackson", "QB", "BAL")  # fuzzy pending
+    assert reject_mapping(db_session, "sleeper", "4881") is True
+    assert mark_unmatched_resolved(db_session, "sleeper", "4881") is True

@@ -10,6 +10,7 @@ from datetime import UTC, datetime
 
 import polars as pl
 import pytest
+import structlog.testing
 from sqlalchemy import func, select
 
 from ffh.crosswalk.dynastyprocess import (
@@ -163,6 +164,10 @@ def test_apply_raises_on_conflicting_existing_mapping(db_session, seeded_registr
     # were created before the conflict scan ("raises before any write" is literal).
     assert _count_ids(db_session) == 1
     assert _count_players(db_session) == players_before == 14 + 32
+    # …and that includes crosswalk_unmatched. The ambiguity pass used to queue the glitch
+    # ids BEFORE the scan, so an aborted seed left review rows behind for a run that never
+    # happened — the invariant the docstring claims was never actually pinned.
+    assert db_session.scalar(select(func.count()).select_from(CrosswalkUnmatched)) == 0
 
 
 def test_apply_routes_second_id_per_source_and_player_to_ambiguous(
@@ -464,3 +469,111 @@ def test_dp_displacement_preserves_the_queued_raw_context(db_session, seeded_reg
     )
     assert (u.raw_name, u.raw_position, u.raw_team) == ("Pat Mahomes", "QB", "KC")
     assert u.resolved is False
+
+
+# ---------------------------------------------------------------------------
+# Fix wave A: one stale guess must not abort the seed, the conflict scan runs
+# before any write, and permanently-glitched ids stop re-opening every seed.
+# ---------------------------------------------------------------------------
+
+
+def test_apply_repoints_a_displaceable_stale_guess_instead_of_aborting_the_seed(
+    db_session, seeded_registry, dp_frame
+):
+    """`(sleeper, 4046)` is Mahomes in DP but an unverified `exact_name` 0.95 guess points
+    it at Chase. That guess is exactly what rung 1's upgrade path re-points without
+    complaint — raising on it aborted the ENTIRE seed (the CLI exits before
+    `session.commit()`, so `seed_players` is discarded too) over one stale ladder row."""
+    mahomes, chase = seeded_registry["00-0033873"], seeded_registry["00-0036900"]
+    db_session.add(
+        PlayerExternalId(
+            player_id=chase,
+            source="sleeper",
+            external_id="4046",
+            confidence=0.95,
+            match_method="exact_name",
+        )
+    )
+    db_session.flush()
+
+    report = apply_playerids(db_session, dp_frame)  # completes; no CrosswalkConflictError
+
+    row = db_session.get(PlayerExternalId, ("sleeper", "4046"))
+    db_session.refresh(row)
+    assert row.player_id == mahomes and row.match_method == "dynastyprocess"
+    assert row.confidence == 1.0 and row.verified_at is None
+    # Chase keeps his own DP sleeper id — the repoint freed the slot the guess squatted.
+    assert db_session.get(PlayerExternalId, ("sleeper", "7564")).player_id == chase
+    assert report.inserted == 60 and report.updated == 1
+    assert _count_ids(db_session) == 61
+
+
+@pytest.mark.parametrize(
+    ("method", "confidence", "verified"),
+    [("manual", 1.0, False), ("dynastyprocess", 1.0, False), ("fuzzy", 0.89, True)],
+)
+def test_apply_still_raises_for_a_protected_incumbent(
+    db_session, seeded_registry, dp_frame, method, confidence, verified
+):
+    """The hard error stands where it belongs: a human decision, a DP row, or a verified
+    row pointing somewhere else is not something an automated re-point may overrule."""
+    db_session.add(
+        PlayerExternalId(
+            player_id=seeded_registry["00-0036900"],
+            source="sleeper",
+            external_id="4046",
+            confidence=confidence,
+            match_method=method,
+            verified_at=datetime.now(UTC) if verified else None,
+        )
+    )
+    db_session.flush()
+    with pytest.raises(CrosswalkConflictError):
+        apply_playerids(db_session, dp_frame)
+
+
+def test_resolved_glitch_id_stays_closed_across_seeds(db_session, seeded_registry, dp_frame):
+    """The full cycle for the permanently-glitched DynastyProcess ids (DATA_SOURCES.md §5):
+    seed queues them, the operator rules once, and the next seed must NOT re-open the
+    entry — the file asserts the same glitch verbatim every week, so a gate that re-opens
+    on every seed can never be green."""
+    from ffh.crosswalk.review import mark_unmatched_resolved
+
+    apply_playerids(db_session, dp_frame)
+    assert _open_queue(db_session) == [("rotowire", "10167"), ("rotowire", "9898")]
+
+    for source, ext in list(_open_queue(db_session)):
+        assert mark_unmatched_resolved(db_session, source, ext) is True
+    assert _open_queue(db_session) == []
+    assert coverage_report(db_session).ok is True
+
+    report = apply_playerids(db_session, dp_frame)
+    # Still reported as file-ambiguous — visibility never depended on the queue …
+    assert report.ambiguous_in_file == (("rotowire", "10167"), ("rotowire", "9898"))
+    # … but the operator's ruling stands and the gate stays green.
+    assert _open_queue(db_session) == []
+    assert coverage_report(db_session).ok is True
+
+
+def test_apply_never_queues_an_ambiguous_id_that_is_already_mapped(
+    db_session, seeded_registry, dp_frame
+):
+    """An ambiguous key with a live mapping IS mapped: queueing it says "unmapped" about
+    an id `resolve` answers at 1.0, and re-opens an entry every seed. It stays in the
+    `ambiguous_in_file` report bucket only."""
+    apply_playerids(db_session, dp_frame)
+    # Map one of the glitch ids by hand — the operator's ruling on the ambiguity.
+    pid = db_session.scalar(select(Player.player_id).where(Player.gsis_id == "00-0031320"))
+    from ffh.crosswalk.review import map_mapping
+
+    assert map_mapping(db_session, "rotowire", "9898", pid).ok is True
+
+    with structlog.testing.capture_logs() as logs:
+        report = apply_playerids(db_session, dp_frame)
+    assert ("rotowire", "9898") in report.ambiguous_in_file
+    assert ("rotowire", "9898") not in _open_queue(db_session)
+    assert any(
+        e["event"] == "crosswalk.dynastyprocess.ambiguous_but_mapped" and e["external_id"] == "9898"
+        for e in logs
+    )
+    assert db_session.get(PlayerExternalId, ("rotowire", "9898")).match_method == "manual"

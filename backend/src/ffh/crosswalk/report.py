@@ -49,12 +49,28 @@ class CoverageReport:
     unmatched: tuple[UnmatchedRow, ...]
 
     @property
+    def seeded(self) -> bool:
+        """False on a crosswalk that was never populated — no players, or no external ids
+        at all. Emptiness is the state where *every* downstream lookup silently finds no
+        player, and it produces zero unmatched and zero unverified rows, so without this
+        floor `ffh crosswalk report` exits 0 on it: green because nothing was ever tried."""
+        return self.players_total > 0 and bool(self.ids_by_source)
+
+    @property
     def ok(self) -> bool:
-        return not self.unverified_low_confidence and not self.unmatched
+        return self.seeded and not self.unverified_low_confidence and not self.unmatched
+
+    def gate_ok(self, *, allow_empty: bool = False) -> bool:
+        """The exit-code rule. ``allow_empty`` opts out of the emptiness floor for a
+        legitimate pre-seed invocation (`ffh crosswalk report --allow-empty`)."""
+        if allow_empty:
+            return not self.unverified_low_confidence and not self.unmatched
+        return self.ok
 
     def to_dict(self) -> dict[str, object]:
         d = asdict(self)
         d["ok"] = self.ok
+        d["seeded"] = self.seeded
         # Sort the count maps: SQL GROUP BY order is unspecified, and `--json` output
         # must be deterministic across identical databases (render() already sorts).
         d["players_by_position"] = dict(sorted(self.players_by_position.items()))
@@ -91,6 +107,12 @@ class CoverageReport:
             lines.append(
                 f"  {r.source}:{r.external_id} {r.raw_name!r} {r.raw_position} {r.raw_team} "
                 f"first={r.first_seen:%Y-%m-%d} last={r.last_seen:%Y-%m-%d}"
+            )
+        if not self.seeded:
+            lines.append(
+                "NOT SEEDED: the crosswalk is empty "
+                f"(players={self.players_total}, sources with ids={len(self.ids_by_source)}) "
+                "— run `ffh crosswalk seed`, or pass --allow-empty if that is expected"
             )
         lines.append("OK" if self.ok else "ATTENTION REQUIRED")
         return "\n".join(lines)

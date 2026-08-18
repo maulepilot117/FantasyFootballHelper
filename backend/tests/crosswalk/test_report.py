@@ -17,13 +17,31 @@ FIXTURE = (
 )
 
 
-def test_report_on_empty_db_is_ok(db_session):
+def test_report_on_empty_db_is_not_ok(db_session):
+    """An empty crosswalk has nothing unmatched and nothing awaiting review, so every
+    other rule says "green" — on the one database state where every downstream lookup
+    silently finds no player. The emptiness floor is what keeps the gate honest, and
+    `--allow-empty` is the opt-out for a deliberate pre-seed invocation."""
     rep = coverage_report(db_session)
     assert isinstance(rep, CoverageReport)
-    assert rep.ok and rep.players_total == 0 and rep.unmatched == ()
+    assert rep.players_total == 0 and rep.unmatched == ()
     assert rep.unverified_low_confidence == ()
-    assert "unmatched: 0" in rep.render()
-    json.dumps(rep.to_dict())  # serializable
+    assert rep.seeded is False and rep.ok is False
+    assert rep.gate_ok(allow_empty=True) is True
+    assert "NOT SEEDED" in rep.render() and "unmatched: 0" in rep.render()
+    assert json.loads(json.dumps(rep.to_dict()))["seeded"] is False  # serializable
+
+
+def test_report_with_players_but_no_ids_is_not_ok(db_session, seeded_registry):
+    """Half-seeded is still not seeded: a players registry with zero external ids maps
+    nothing at all, and reads as green under the pre-fix rule."""
+    rep = coverage_report(db_session)
+    assert rep.players_total > 0 and rep.ids_by_source == {}
+    assert rep.seeded is False and rep.ok is False
+
+    resolve(db_session, "sleeper", "4046", "Patrick Mahomes", "QB", "KC")  # one real mapping
+    rep = coverage_report(db_session)
+    assert rep.seeded is True and rep.ok is True
 
 
 def test_report_counts_and_flags(db_session, seeded_registry):
@@ -229,7 +247,13 @@ def test_mark_unmatched_resolved(db_session):
     )
     assert u is not None and u.resolved is True
     assert mark_unmatched_resolved(db_session, "sleeper", "nope") is False
-    # a resolved id that reappears unmatched re-opens for review
+    # The SAME id described the SAME way is not new information: the operator's ruling
+    # stands. (Before the fix every re-seed re-opened it, so an id DynastyProcess asserts
+    # verbatim every week — the permanently-glitched ones — could never leave the gate.)
     upsert_unmatched(db_session, "sleeper", "424242", raw_name="Ghost Man")
     db_session.refresh(u)
-    assert u.resolved is False
+    assert u.resolved is True
+    # …but a *different* description is a reappearance worth another look.
+    upsert_unmatched(db_session, "sleeper", "424242", raw_name="Ghost Man", raw_team="KC")
+    db_session.refresh(u)
+    assert u.resolved is False and u.raw_team == "KC"
