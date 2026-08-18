@@ -8,27 +8,29 @@ at the bottom of the module — the ingest job that fetches the CSV into the lak
 from __future__ import annotations
 
 import uuid
+from collections.abc import Callable
 from dataclasses import asdict, dataclass
 from datetime import date
-from typing import ClassVar
+from typing import Any, ClassVar
 
 import polars as pl
 import structlog
-from sqlalchemy import select, update
+from sqlalchemy import Row, bindparam, delete, select, update
 from sqlalchemy.orm import Session
 
 from ffh.crosswalk.normalize import (
     FANTASY_POSITIONS,
-    normalize_dst,
+    canonical_dst_key,
     normalize_name,
     normalize_position,
     normalize_team,
 )
 from ffh.crosswalk.registry import iter_gsis_to_player_id
 from ffh.crosswalk.resolve import (
+    CONFIDENCE_EPSILON,
     REJECTED_METHOD,
     close_unmatched,
-    displaceable,
+    is_displaceable,
     queued_raw_context,
     upsert_unmatched,
 )
@@ -66,7 +68,52 @@ DP_REQUIRED_COLUMNS: frozenset[str] = frozenset(
 DP_METHOD = "dynastyprocess"
 DP_CONFIDENCE = 1.0
 
-_PLACEHOLDER_PREFIXES = ("gsis:", "mfl:")
+# A DP row with no registry player yet is carried through the pipeline under a synthetic
+# *person key* instead of a UUID. The prefixes are named constants and every site that
+# mints, tests or strips one derives from them: a third prefix added by hand to only two
+# of the three sites leaves the odd one out feeding `uuid.UUID(player_key)` a string like
+# "mfl:17471" — mid-apply, after placeholder `players` rows have already been flushed.
+_GSIS_PREFIX = "gsis:"
+_MFL_PREFIX = "mfl:"
+_PLACEHOLDER_PREFIXES: tuple[str, ...] = (_GSIS_PREFIX, _MFL_PREFIX)
+
+
+def _placeholder_key(gsis_id: str | None, mfl_id: str | None) -> str:
+    """The synthetic person key for a DP row that matches no registry player.
+
+    Callers must have established that at least one of the two ids is present
+    (``_validate`` drops rows with neither — their key would be the literal ``"mfl:None"``,
+    shared by every such row).
+    """
+    return f"{_GSIS_PREFIX}{gsis_id}" if gsis_id else f"{_MFL_PREFIX}{mfl_id}"
+
+
+def _is_placeholder_key(key: str) -> bool:
+    return key.startswith(_PLACEHOLDER_PREFIXES)
+
+
+def _placeholder_expr(column: str) -> pl.Expr:
+    """The Polars predicate for ``_is_placeholder_key``, derived from the same constant."""
+    return pl.any_horizontal([pl.col(column).str.starts_with(p) for p in _PLACEHOLDER_PREFIXES])
+
+
+#: The Core table, used for the batched write statements. `session.execute` with a parameter
+#: LIST against an ORM *entity* is read as an ORM bulk-update-by-primary-key; the Table is a
+#: plain Core executemany, matching the `inserts` call.
+_PEI = PlayerExternalId.__table__
+
+#: Exactly the columns `apply_playerids` reads off `player_external_ids`. Selected as Row
+#: tuples: materializing the whole crosswalk as ORM entities costs an identity-map entry and
+#: a full instance per row for a table that grows with every source, and nothing here needs
+#: a persistent instance (every write below is a Core `insert`/`update`/`delete` by key).
+_CROSSWALK_COLUMNS = (
+    PlayerExternalId.source,
+    PlayerExternalId.external_id,
+    PlayerExternalId.player_id,
+    PlayerExternalId.match_method,
+    PlayerExternalId.confidence,
+    PlayerExternalId.verified_at,
+)
 
 
 class DynastyProcessError(RuntimeError):
@@ -102,6 +149,9 @@ class CrosswalkApplyReport:
     updated: int
     unchanged: int
     created_players: int
+    #: Placeholder `players` rows (gsis_id NULL, minted by an earlier apply) folded into the
+    #: real registry player once nflverse published that person's gsis_id.
+    merged_placeholders: int
     skipped_no_ids: int
     skipped_position: int
     skipped_dst: int
@@ -190,6 +240,144 @@ def _parse_date(raw: object) -> date | None:
         return None
 
 
+def _load_crosswalk(session: Session) -> list[Row[Any]]:
+    """The DP-owned slice of ``player_external_ids`` as Row tuples (see _CROSSWALK_COLUMNS)."""
+    return list(
+        session.execute(
+            select(*_CROSSWALK_COLUMNS).where(
+                PlayerExternalId.source.in_(sorted(DP_ID_COLUMNS.values()))
+            )
+        ).all()
+    )
+
+
+def _index_crosswalk(
+    rows: list[Row[Any]],
+) -> tuple[
+    dict[tuple[str, str], Row[Any]],
+    dict[tuple[str, str], Row[Any]],
+    dict[tuple[str, uuid.UUID], Row[Any]],
+]:
+    """``(tombstones, existing, held_by_player)`` — the three lookups step 3-7 rule with.
+
+    Tombstones (``match_method='rejected'``) are NOT mappings: they must not satisfy an id
+    lookup, must not trip the conflict scan, and must not occupy the player's one slot for
+    the source (the unique index is partial on the same predicate). What they DO is veto
+    re-minting the exact pairing a human rejected.
+    """
+    tombstones = {(r.source, r.external_id): r for r in rows if r.match_method == REJECTED_METHOD}
+    live = [r for r in rows if r.match_method != REJECTED_METHOD]
+    existing = {(r.source, r.external_id): r for r in live}
+    # (source, player_id) → the row already holding that slot: the DB enforces one id per
+    # source per player (player_external_ids_source_player_uidx), so this map is well-defined.
+    held_by_player = {(r.source, r.player_id): r for r in live}
+    return tombstones, existing, held_by_player
+
+
+def _merge_placeholder_player(
+    session: Session, placeholder_id: uuid.UUID, keeper_id: uuid.UUID
+) -> list[tuple[str, str]]:
+    """Fold a placeholder ``players`` row into the registry player for the same human.
+
+    Repoints every ``player_external_ids`` row (tombstones included — the rejection was
+    about this person) and deletes the placeholder. Returns the keys that could NOT be
+    carried over because the keeper already holds a live id for that source; they are
+    deleted with the placeholder and the caller MUST queue them (Global Constraint: an id a
+    writer refuses to map is never dropped).
+    """
+    keeper_sources = set(
+        session.scalars(
+            select(PlayerExternalId.source).where(
+                PlayerExternalId.player_id == keeper_id,
+                PlayerExternalId.match_method != REJECTED_METHOD,
+            )
+        )
+    )
+    orphaned: list[tuple[str, str]] = []
+    rows = session.execute(
+        select(
+            PlayerExternalId.source, PlayerExternalId.external_id, PlayerExternalId.match_method
+        ).where(PlayerExternalId.player_id == placeholder_id)
+    ).all()
+    for source, external_id, match_method in rows:
+        key_filter = (
+            PlayerExternalId.source == source,
+            PlayerExternalId.external_id == external_id,
+        )
+        if match_method != REJECTED_METHOD and source in keeper_sources:
+            # The keeper's one slot for this source is taken by a different id.
+            orphaned.append((source, external_id))
+            session.execute(delete(PlayerExternalId).where(*key_filter))
+            continue
+        if match_method != REJECTED_METHOD:
+            keeper_sources.add(source)
+        session.execute(update(PlayerExternalId).where(*key_filter).values(player_id=keeper_id))
+    session.execute(delete(Player).where(Player.player_id == placeholder_id))
+    session.flush()
+    return orphaned
+
+
+def _reconcile_placeholders(
+    session: Session,
+    rows: pl.DataFrame,
+    gsis_to_pid: dict[str, uuid.UUID],
+    id_hit: Callable[[dict[str, object]], str | None],
+    queue: Callable[[str, str], None],
+) -> int:
+    """Fold yesterday's ``mfl:`` placeholders into today's real registry players.
+
+    A DP row with no ``gsis_id`` mints a placeholder ``players`` row carrying
+    ``gsis_id = NULL``. When nflverse later publishes that player, ``seed_players``' ON
+    CONFLICT is on ``gsis_id`` — NULL conflicts with nothing — so it inserts a **second**
+    ``players`` row for the same human. From then on the two writers disagree forever: the
+    DP row now resolves by gsis to the new row while its ids still point at the placeholder,
+    so the conflict scan raises on every run (the incumbent is `dynastyprocess`, which
+    outranks DP and is therefore never re-pointed), and rung 3 sees two
+    ``(normalized_name, position)`` candidates and returns None.
+
+    This pre-pass is the repair: the placeholder's ids are repointed at the gsis player and
+    the placeholder row is deleted. It is deliberately the FIRST write in ``apply_playerids``
+    so the step-5 conflict scan (and everything after it) reads the repointed rows.
+    """
+    merged = 0
+    seen: set[uuid.UUID] = set()
+    for row in rows.iter_rows(named=True):
+        gsis = row["gsis_id"]
+        keeper = gsis_to_pid.get(gsis) if gsis else None
+        if keeper is None:
+            continue
+        hit = id_hit(row)
+        if hit is None:
+            continue
+        placeholder_id = uuid.UUID(hit)
+        if placeholder_id == keeper or placeholder_id in seen:
+            continue
+        player = session.get(Player, placeholder_id)
+        # `gsis_id IS NULL` is what identifies a placeholder. DST rows are excluded
+        # explicitly: the 32 seeded defenses also carry a NULL gsis_id and must never be
+        # merged into a person.
+        if player is None or player.gsis_id is not None or player.position == "DST":
+            continue
+        seen.add(placeholder_id)
+        log.warning(
+            "crosswalk.dynastyprocess.placeholder_merged",
+            placeholder_player_id=str(placeholder_id),
+            keeper_player_id=str(keeper),
+            gsis_id=gsis,
+            name=row["name"],
+        )
+        for source, external_id in _merge_placeholder_player(session, placeholder_id, keeper):
+            log.warning(
+                "crosswalk.dynastyprocess.placeholder_merge_orphaned_id",
+                source=source,
+                external_id=external_id,
+                keeper_player_id=str(keeper),
+            )
+            queue(source, external_id)
+        merged += 1
+    return merged
+
+
 def apply_playerids(session: Session, df: pl.DataFrame) -> CrosswalkApplyReport:
     """Populate ``player_external_ids`` at confidence 1.0 / ``dynastyprocess`` from a DP frame.
 
@@ -197,6 +385,11 @@ def apply_playerids(session: Session, df: pl.DataFrame) -> CrosswalkApplyReport:
     transaction; a ``CrosswalkConflictError`` is raised before any write — placeholder
     ``players`` rows AND ``crosswalk_unmatched`` queueing both happen only after the
     conflict scan passes, so an aborted seed leaves nothing behind in either table.
+
+    The one deliberate exception is step 3a, ``_reconcile_placeholders``: a duplicate
+    ``players`` row for a human nflverse has since published makes the conflict scan raise
+    on *every* run, so the repair has to run before the scan it unblocks. It touches only
+    the two rows for that one person, and the CLI still commits nothing if the scan raises.
     """
     df, skipped_no_person_key = _validate(df)
     n_in = df.height
@@ -225,24 +418,7 @@ def apply_playerids(session: Session, df: pl.DataFrame) -> CrosswalkApplyReport:
             select(Player.normalized_name, Player.player_id).where(Player.position == "DST")
         ).all()
     )
-    existing_rows = session.scalars(
-        select(PlayerExternalId).where(PlayerExternalId.source.in_(sorted(DP_ID_COLUMNS.values())))
-    ).all()
-    # Tombstones (`match_method='rejected'`) are NOT mappings: they must not satisfy an
-    # id lookup, must not trip the conflict scan, and must not occupy the player's one
-    # slot for the source (the unique index is partial on the same predicate). What they
-    # DO is veto re-minting the exact pairing a human rejected.
-    tombstones: dict[tuple[str, str], PlayerExternalId] = {
-        (r.source, r.external_id): r for r in existing_rows if r.match_method == REJECTED_METHOD
-    }
-    existing: dict[tuple[str, str], PlayerExternalId] = {
-        (r.source, r.external_id): r for r in existing_rows if r.match_method != REJECTED_METHOD
-    }
-    # (source, player_id) → the row already holding that slot: the DB enforces one id per
-    # source per player (player_external_ids_source_player_uidx), so this map is well-defined.
-    held_by_player: dict[tuple[str, uuid.UUID], PlayerExternalId] = {
-        (r.source, r.player_id): r for r in existing_rows if r.match_method != REJECTED_METHOD
-    }
+    tombstones, existing, held_by_player = _index_crosswalk(_load_crosswalk(session))
     # Slots claimed during THIS apply (by an insert or a displacement).
     claimed: set[tuple[str, uuid.UUID]] = set()
 
@@ -293,6 +469,16 @@ def apply_playerids(session: Session, df: pl.DataFrame) -> CrosswalkApplyReport:
         )
         upsert_unmatched(session, source, external_id, **fields)
 
+    # 3a. Reconcile duplicate `players` rows for one human BEFORE anything reads `existing`
+    # for real. This is the one write that precedes the conflict scan, and it exists
+    # precisely so the scan stops raising forever on a placeholder nflverse has since
+    # published (see `_reconcile_placeholders`). The three lookups are re-derived after it.
+    merged_placeholders = _reconcile_placeholders(
+        session, with_ids, gsis_to_pid, _existing_id_hit, _queue
+    )
+    if merged_placeholders:
+        tombstones, existing, held_by_player = _index_crosswalk(_load_crosswalk(session))
+
     player_key: list[str | None] = []  # str(uuid) known / "gsis:…"/"mfl:…" placeholders
     skipped_dst = 0
     for row in with_ids.iter_rows(named=True):
@@ -301,7 +487,11 @@ def apply_playerids(session: Session, df: pl.DataFrame) -> CrosswalkApplyReport:
             # Defenses come only from seed_dst_players. A DST row that maps to neither a
             # seeded DST player nor an already-crosswalked id is counted and skipped —
             # it must NEVER fall through to the placeholder path and create a player.
-            nn = normalize_dst(row["team"]) or normalize_dst(row["name"])
+            # NAME first, then team — the same argument order `resolve._canonical_name`
+            # passes. When the two disagree ("Kansas City Chiefs" listed at DEN) the two
+            # writers used to canonicalize the row to different defenses depending on which
+            # one saw it first (DATABASE.md §3, DST canonicalization precedence).
+            nn = canonical_dst_key(row["name"], row["team"])
             pid = dst_to_pid.get(nn) if nn else None
             key = str(pid) if pid is not None else _existing_id_hit(row)
             if key is None:
@@ -319,7 +509,7 @@ def apply_playerids(session: Session, df: pl.DataFrame) -> CrosswalkApplyReport:
             if key is None:
                 key = _existing_id_hit(row)
             if key is None:
-                key = f"gsis:{row['gsis_id']}" if row["gsis_id"] else f"mfl:{row['mfl_id']}"
+                key = _placeholder_key(row["gsis_id"], row["mfl_id"])
         player_key.append(key)
     with_ids = with_ids.with_columns(pl.Series("player_key", player_key, dtype=pl.Utf8))
     mapped = with_ids.filter(pl.col("player_key").is_not_null())
@@ -398,14 +588,14 @@ def apply_playerids(session: Session, df: pl.DataFrame) -> CrosswalkApplyReport:
     # `ffh crosswalk seed` exits before `session.commit()`, discarding `seed_players` too —
     # over one stale ladder guess. Those keys are re-pointed in place instead (step 7).
     conflicts: list[tuple[str, str, uuid.UUID, uuid.UUID]] = []
-    stale_guesses: dict[tuple[str, str], PlayerExternalId] = {}
+    stale_guesses: dict[tuple[str, str], Row[Any]] = {}
     for r in clean.iter_rows(named=True):
-        if r["player_key"].startswith(_PLACEHOLDER_PREFIXES):
+        if _is_placeholder_key(r["player_key"]):
             continue
         pid = uuid.UUID(r["player_key"])
         ex = existing.get((r["source"], r["external_id"]))
         if ex is not None and ex.player_id != pid:
-            if displaceable(ex):
+            if is_displaceable(ex.match_method, ex.verified_at):
                 stale_guesses[(r["source"], r["external_id"])] = ex
             else:
                 conflicts.append((r["source"], r["external_id"], ex.player_id, pid))
@@ -446,9 +636,7 @@ def apply_playerids(session: Session, df: pl.DataFrame) -> CrosswalkApplyReport:
         _queue(source, ext)
 
     # 6. create players for placeholders that still hold ≥ 1 id
-    is_placeholder = pl.col("player_key").str.starts_with("gsis:") | pl.col(
-        "player_key"
-    ).str.starts_with("mfl:")
+    is_placeholder = _placeholder_expr("player_key")
     needed = sorted(set(clean.filter(is_placeholder)["player_key"].to_list()))
     created: dict[str, uuid.UUID] = {}
     # keep="first" in CSV order: a glitch pair sharing one placeholder key is named
@@ -503,7 +691,10 @@ def apply_playerids(session: Session, df: pl.DataFrame) -> CrosswalkApplyReport:
         ex = existing.get((source, ext))
         if ex is not None:
             # ex.player_id == pid here: step 5 raised on any mismatch.
-            if ex.match_method == DP_METHOD and ex.confidence == DP_CONFIDENCE:
+            if (
+                ex.match_method == DP_METHOD
+                and abs(float(ex.confidence) - DP_CONFIDENCE) <= CONFIDENCE_EPSILON
+            ):
                 unchanged += 1
             else:
                 updates.append((source, ext))
@@ -512,7 +703,7 @@ def apply_playerids(session: Session, df: pl.DataFrame) -> CrosswalkApplyReport:
         if held is not None or (source, pid) in claimed:
             # The player already holds a different id from this source (unique index
             # player_external_ids_source_player_uidx forbids a second).
-            if held is not None and displaceable(held):
+            if held is not None and is_displaceable(held.match_method, held.verified_at):
                 # AUTHORITY RULE: DP's 1.0 fact outranks an unverified `exact_name` 0.95 /
                 # `fuzzy` 0.89 *guess* — the same ruling rung 1's upgrade path already
                 # makes. The guess is evicted and ITS id goes back on the review queue;
@@ -526,7 +717,12 @@ def apply_playerids(session: Session, df: pl.DataFrame) -> CrosswalkApplyReport:
                     player_id=str(pid),
                 )
                 displaced.append((source, held.external_id))
-                session.delete(held)
+                session.execute(
+                    delete(PlayerExternalId).where(
+                        PlayerExternalId.source == source,
+                        PlayerExternalId.external_id == held.external_id,
+                    )
+                )
                 session.flush()
                 del held_by_player[(source, pid)]
                 existing.pop((source, held.external_id), None)
@@ -577,22 +773,32 @@ def apply_playerids(session: Session, df: pl.DataFrame) -> CrosswalkApplyReport:
     # Repoints run BEFORE the inserts: a repointed row still occupies its old
     # (source, player_id) slot, and this batch may be inserting a different id for that
     # old player — the partial unique index would refuse it in the other order.
-    for source, ext, pid in repoints:
+    # One statement per batch, not per row: the live file is ~12.5k rows and a first seed
+    # against a partially-populated crosswalk can repoint/update thousands of them.
+    key_match = (
+        _PEI.c.source == bindparam("b_source"),
+        _PEI.c.external_id == bindparam("b_external_id"),
+    )
+    if repoints:
         session.execute(
-            update(PlayerExternalId)
-            .where(PlayerExternalId.source == source, PlayerExternalId.external_id == ext)
+            update(_PEI)
+            .where(*key_match)
             .values(
-                player_id=pid,
+                player_id=bindparam("b_player_id"),
                 match_method=DP_METHOD,
                 confidence=DP_CONFIDENCE,
                 verified_at=None,
-            )
+            ),
+            [
+                {"b_source": source, "b_external_id": ext, "b_player_id": pid}
+                for source, ext, pid in repoints
+            ],
         )
-        close_unmatched(session, source, ext)
-    if repoints:
         session.flush()
+        for source, ext, _pid in repoints:
+            close_unmatched(session, source, ext)
     if inserts:
-        session.execute(PlayerExternalId.__table__.insert(), inserts)
+        session.execute(_PEI.insert(), inserts)
         # Every inserted key now has a mapping row: close its review-queue entry if one
         # is open (a rung-5-queued id that DP later maps). Intersect against the open
         # queue rows first — the queue is small, the insert batch can be tens of
@@ -609,11 +815,10 @@ def apply_playerids(session: Session, df: pl.DataFrame) -> CrosswalkApplyReport:
         }
         for source, ext in sorted(open_keys & inserted_keys):
             close_unmatched(session, source, ext)
-    for source, ext in updates:
+    if updates:
         session.execute(
-            update(PlayerExternalId)
-            .where(PlayerExternalId.source == source, PlayerExternalId.external_id == ext)
-            .values(match_method=DP_METHOD, confidence=DP_CONFIDENCE)
+            update(_PEI).where(*key_match).values(match_method=DP_METHOD, confidence=DP_CONFIDENCE),
+            [{"b_source": source, "b_external_id": ext} for source, ext in updates],
         )
     session.flush()
 
@@ -622,6 +827,7 @@ def apply_playerids(session: Session, df: pl.DataFrame) -> CrosswalkApplyReport:
         updated=len(updates) + len(repoints),
         unchanged=unchanged,
         created_players=len(created),
+        merged_placeholders=merged_placeholders,
         skipped_no_ids=skipped_no_ids,
         skipped_position=skipped_position,
         skipped_dst=skipped_dst,
@@ -641,6 +847,13 @@ def apply_playerids(session: Session, df: pl.DataFrame) -> CrosswalkApplyReport:
 
 #: DATA_SOURCES.md §5, verified live 2026-08-16 (12,472 rows, 35 cols, ``NA`` = null).
 DP_URL = "https://raw.githubusercontent.com/dynastyprocess/data/master/files/db_playerids.csv"
+#: Row-count floor for a landable snapshot. `validate` only ever rejected an EMPTY frame, so
+#: a truncated upstream file — 200 rows of the usual ~12.5k — landed as a *successful*
+#: partition; and because the lake never overwrites a partition (`PartitionExistsError` →
+#: `skipped`), that day could not be cleanly re-landed once the file recovered. The floor is
+#: well under the live count so normal shrinkage (a source dropping retired players) is not
+#: an outage, but far above anything a truncation produces.
+DP_MIN_ROWS = 8000
 
 
 @register
@@ -671,6 +884,12 @@ class DynastyProcessPlayerIdsJob(HttpIngestJob):
     def validate(self, df: pl.DataFrame) -> None:
         # The base checks REQUIRED_COLUMNS and the empty frame (both IngestValidationError).
         super().validate(df)
+        # …but "not empty" is not "not truncated": see DP_MIN_ROWS.
+        if df.height < DP_MIN_ROWS:
+            raise IngestValidationError(
+                f"{type(self).name}: {df.height} rows is below the {DP_MIN_ROWS}-row floor; "
+                "the upstream snapshot looks truncated and must not land"
+            )
         # Ids must land as text so the Parquet round-trip that `ffh crosswalk seed` reads
         # back can never hand `_validate` a float: 4046.0 -> "4046.0" would be silent
         # corruption, and a UUID/alphanumeric id (sportradar_id, pfr_id) is not numeric at all.

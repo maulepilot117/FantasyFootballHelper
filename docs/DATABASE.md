@@ -119,7 +119,8 @@ CREATE TABLE player_external_ids (
     PRIMARY KEY (source, external_id)
 );
 CREATE INDEX player_external_ids_player_idx ON player_external_ids (player_id);
-CREATE UNIQUE INDEX player_external_ids_source_player_uidx ON player_external_ids (source, player_id);
+CREATE UNIQUE INDEX player_external_ids_source_player_uidx ON player_external_ids (source, player_id)
+    WHERE match_method <> 'rejected';   -- PARTIAL: a tombstone is not a mapping (§3)
 ```
 
 *Phase 0 note (PR ④, migration `0002_players_team_abbr`):* `player_external_ids_source_player_uidx`
@@ -130,6 +131,8 @@ and `apply_playerids` can each attempt to insert a second id for a source agains
 that already holds one. Both writers MUST pre-check `(source, player_id)` before insert and
 route the loser to `crosswalk_unmatched` / the ambiguity report — this index is a backstop,
 not their conflict policy; they must not rely on catching the resulting `IntegrityError`.
+The index is **partial** (`WHERE match_method <> 'rejected'`); migration `0003` is what
+guarantees that predicate on databases already stamped at `0002` (deviation 20 in §3).
 
 ```sql
 CREATE TABLE nfl_teams (
@@ -269,6 +272,19 @@ team table carries every PFR spelling, including the five that look nothing like
 (`KC`, `KC DST`, `Chiefs D/ST`, `Kansas City`, `KCC`, `KAN`, `LAR`, `WSH`, `Bucs`, …)
 canonicalizes through `normalize_dst`, including a **bare** team abbreviation. Position
 aliases: `DEF`/`D/ST`→`DST`, `PK`→`K`, `FB`/`HB`→`RB`; anything non-fantasy → `None`.
+
+**DST canonicalization precedence — name, then team, then external id.** A source row
+carries several fields that could name a defense and they can *disagree* (a row named
+`Kansas City Chiefs` listed at `DEN`). The precedence is a single explicit argument list,
+`normalize.canonical_dst_key(*candidates)` — first candidate that resolves to a team wins —
+and **both writers call it with the name first**: `resolve._canonical_name` passes
+`(raw_name, raw_team, external_id)`, `dynastyprocess.apply_playerids` passes `(name, team)`.
+The name is what the row is *about*; the team column is a mutable weekly attribute. Before
+this the two writers inlined their own `or` chains in opposite orders, so the same row
+canonicalized to a different defense depending on which writer saw it first — a silently
+wrong mapping, the one failure mode the crosswalk exists to prevent. (Rung 3 additionally
+weighs `players.team_abbr`, so a *ladder* lookup whose `raw_team` contradicts the seeded
+defense still falls through to rung 4 — that is the team rule, not the canonical key.)
 
 **Rungs 1–2 and what persists.** Rung 1 is a lookup of the existing
 `(source, external_id)` row and writes nothing new. **Rungs 2–4 persist** their result, so
@@ -528,8 +544,8 @@ rather than silently mangled (`4046.0` must never become `"4046.0"`).
     re-opened by a later `upsert_unmatched` only when a `raw_*` field changed.
 11. **`CrosswalkApplyReport.skipped_dst`** — DynastyProcess rows whose position normalizes
     to DST/DEF **do** get mapped: the row resolves to the seeded `<abbr> dst` player via
-    `normalize_dst(team) or normalize_dst(name)`, or failing that to whatever player one of
-    its ids is already crosswalked to. Only a row matching *neither* is counted in
+    `canonical_dst_key(name, team)` (name-first — see the DST canonicalization precedence
+    above), or failing that to whatever player one of its ids is already crosswalked to. Only a row matching *neither* is counted in
     `skipped_dst` and skipped — counted and logged, never silently dropped. What a DST row
     can never do is fall through to the placeholder path and mint a `players` row: defenses
     exist only as the 32 rows `seed_dst_players` creates. (The live file has no DST rows
@@ -547,7 +563,12 @@ rather than silently mangled (`4046.0` must never become `"4046.0"`).
     claim the player a later rung-3 exact match wanted. Pass 1 walks the whole batch with
     rung 4 deferred (persisting nothing for those inputs), pass 2 re-runs only the deferred
     ones. The gsis-first ordering inside pass 1 is unchanged; single-id `resolve()` is
-    unaffected.
+    unaffected. Both passes share one rung-4 **candidate-pool cache** keyed on
+    `(source, position)`, so "every unmapped same-position player" is selected once per
+    key for the whole batch instead of once per input; `_persist` drops a player from the
+    cached pools the moment it claims his slot (what the reload's
+    `NOT IN (mapped for source)` filter would have excluded), and the rarer paths that
+    *free* a player invalidate the pools for that source. `resolve()` passes no cache.
 15. **`ffh crosswalk seed` / `report` exit 3 on operational failure** and the report has an
     **emptiness floor** plus `--allow-empty` (both above). §3 defined only the green/red
     gate, which silently conflated "the crosswalk has a gap" with "the run never happened",
@@ -560,6 +581,39 @@ rather than silently mangled (`4046.0` must never become `"4046.0"`).
     deleting non-ASCII letters, and rung 4's college leg is symmetric. Both were silent
     wrong-answer bugs: `Andrés Peña` could never match `Andres Pena`, and `"Ohio St."`
     eliminated the candidate stored as `"Ohio State"`.
+18. **`apply_playerids` reconciles placeholder duplicates before anything else**
+    (`CrosswalkApplyReport.merged_placeholders`, `crosswalk.dynastyprocess.placeholder_merged`).
+    A DP row with no `gsis_id` mints a placeholder `players` row carrying `gsis_id NULL`;
+    when nflverse later publishes that person, `seed_players`' ON CONFLICT is on `gsis_id`
+    and **NULL conflicts with nothing**, so it inserts a *second* `players` row for the same
+    human. Every later seed then failed permanently: the DP row resolves by gsis to the new
+    row while its ids still point at the placeholder, and the incumbent is `dynastyprocess`
+    — protected, never re-pointed — so the conflict scan raised on every run; rung 3 saw two
+    `(normalized_name, position)` candidates and returned `None`. The pre-pass repoints the
+    placeholder's `player_external_ids` rows (tombstones included) at the gsis player and
+    deletes the placeholder. It is the **one write that precedes the conflict scan**,
+    because it is the repair that unblocks that scan; an id it cannot carry over (the
+    keeper already holds a live id for that source) is deleted and queued, never dropped.
+    Seeded DST rows are excluded explicitly — they also carry a NULL `gsis_id`.
+19. **The crosswalk write commands take a Postgres advisory lock** —
+    `ffh crosswalk seed` / `map` / `verify` wrap their session in
+    `ffh.db.lock.advisory_lock(session, "ffh.crosswalk/apply")` (the same helper
+    `ffh.ingest.base` uses, lifted into `ffh.db` so there is exactly one implementation).
+    All three read `player_external_ids`, decide `(source, player_id)` slot ownership, then
+    write — `apply_playerids` for ~12.5k rows at a time — and that plan is TOCTOU: two
+    concurrent runs (a cron overlapping a manual re-run) can both pass the same pre-check.
+20. **Migration `0003` re-creates `player_external_ids_source_player_uidx`.** The partial
+    predicate was added to `0002` *after* that revision had already been applied somewhere,
+    and Alembic records revisions rather than their content — so a database stamped at 0002
+    silently kept the non-partial index while a freshly created one got the partial form.
+    `0003` drops and recreates it unconditionally. Both migrations' docstrings carry the
+    duplicate pre-flight scan and the `pg_indexes` post-deploy verification query, because
+    `CREATE UNIQUE INDEX` fails the deploy outright on pre-existing duplicates and
+    `alembic check` is blind to a missing predicate.
+21. **`DynastyProcessPlayerIdsJob` enforces a row-count floor** (`DP_MIN_ROWS = 8000`
+    against a live file of ~12,472). `validate` previously rejected only an *empty* frame,
+    so a truncated upstream snapshot landed as a successful partition — and since the lake
+    never overwrites a partition, that day could not then be cleanly re-landed.
 
 ### Mandatory tests — these are not optional
 

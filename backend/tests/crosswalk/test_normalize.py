@@ -4,6 +4,7 @@ from ffh.crosswalk.normalize import (
     ALIASES,
     FANTASY_POSITIONS,
     TEAMS,
+    canonical_dst_key,
     dst_full_name,
     normalize_dst,
     normalize_name,
@@ -274,3 +275,35 @@ def test_normalize_position(raw: str | None, expected: str | None) -> None:
     assert normalize_position(raw) == expected
     if expected is not None:
         assert expected in FANTASY_POSITIONS
+
+
+# ---------------------------------------------------------------------------
+# canonical_dst_key — one helper both crosswalk writers call, so DST precedence
+# is an explicit argument list instead of two inlined `or` chains that disagreed.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("candidates", "expected"),
+    [
+        # First candidate that names a team wins — that is the whole contract.
+        (("Kansas City Chiefs", "DEN"), "kc dst"),
+        (("DEN", "Kansas City Chiefs"), "den dst"),
+        # …and a candidate that names no team is skipped, not treated as an answer.
+        ((None, "KC"), "kc dst"),
+        (("", "KC"), "kc dst"),
+        (("Nobody At All", "KC"), "kc dst"),
+        (("FA", "Chiefs D/ST"), "kc dst"),
+        ((None, None, "SEA"), "sea dst"),
+        ((None, None, None), None),
+        (("Nobody", "Nowhere"), None),
+        ((), None),
+    ],
+)
+def test_canonical_dst_key_precedence(candidates, expected):
+    assert canonical_dst_key(*candidates) == expected
+
+
+def test_canonical_dst_key_matches_normalize_dst_for_a_single_candidate():
+    for abbr, _city, _nick, _aliases in TEAMS:
+        assert canonical_dst_key(abbr) == normalize_dst(abbr)

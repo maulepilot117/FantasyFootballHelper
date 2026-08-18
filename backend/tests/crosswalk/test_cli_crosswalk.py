@@ -121,12 +121,55 @@ def test_seed_without_players_and_empty_lake_exits_3(monkeypatch, tmp_path):
     assert "ffh ingest run nflverse_players" in result.output
 
 
+class _FakeResult:
+    def scalar(self):
+        return True  # pg_advisory_unlock returned true: the lock really was ours
+
+
+class _FakeConn:
+    """Just enough of a Connection for `ffh.db.lock.advisory_lock` to run off-database."""
+
+    def __init__(self, statements):
+        self._statements = statements
+
+    def execute(self, statement, params=None):
+        self._statements.append((str(statement), dict(params or {})))
+        return _FakeResult()
+
+    def commit(self):
+        pass
+
+    def close(self):
+        pass
+
+
+class _FakeEngine:
+    def __init__(self, statements):
+        self._statements = statements
+
+    def connect(self):
+        return _FakeConn(self._statements)
+
+
+class _FakeBind:
+    def __init__(self, statements):
+        self.engine = _FakeEngine(statements)
+
+
 class _FakeSession:
     def __init__(self):
         self.commits = 0
+        #: (sql, params) executed on the advisory-lock connection.
+        self.lock_statements: list[tuple[str, dict]] = []
+
+    def get_bind(self):
+        return _FakeBind(self.lock_statements)
 
     def commit(self):
         self.commits += 1
+
+    def lock_keys(self, verb: str) -> list[str]:
+        return [p["key"] for sql, p in self.lock_statements if f"pg_advisory_{verb}(" in sql]
 
 
 def _fake_scope(session):
@@ -443,3 +486,123 @@ def test_cli_resolve_unmatched_refuses_a_contradicted_live_mapping(
     assert forced.exit_code == 0, forced.output
     db_session.refresh(u)
     assert u.resolved is True
+
+
+# ---------------------------------------------------------------------------
+# Fix wave B: the crosswalk WRITE commands serialize on a Postgres advisory lock.
+# `apply_playerids` reads the crosswalk, decides `(source, player_id)` slot ownership
+# for ~12.5k rows, then writes — a read-then-write plan two concurrent runs can both
+# pass. The ingest framework already serializes its lifecycle this way.
+# ---------------------------------------------------------------------------
+
+
+def test_seed_takes_and_releases_the_crosswalk_lock(monkeypatch, tmp_path):
+    session = _FakeSession()
+    monkeypatch.setattr(cli, "_session_scope", _fake_scope(session))
+    monkeypatch.setattr("ffh.crosswalk.registry.seed_players", lambda s, frame: 46)
+
+    result = runner.invoke(
+        cli.app, ["crosswalk", "seed", "--players", str(_players_parquet(tmp_path))]
+    )
+
+    assert result.exit_code == 0, result.output
+    assert session.lock_keys("lock") == [cli.CROSSWALK_LOCK_KEY]
+    assert session.lock_keys("unlock") == [cli.CROSSWALK_LOCK_KEY]
+
+
+def test_seed_releases_the_lock_even_when_the_command_fails(monkeypatch, tmp_path):
+    """A held lock outliving a crashed seed would wedge every later run."""
+    session = _FakeSession()
+    monkeypatch.setattr(cli, "_session_scope", _fake_scope(session))
+
+    def boom(s, frame):
+        raise CrosswalkConflictError([("sleeper", "4046", uuid.uuid4(), uuid.uuid4())])
+
+    monkeypatch.setattr("ffh.crosswalk.registry.seed_players", lambda s, frame: 46)
+    monkeypatch.setattr("ffh.crosswalk.dynastyprocess.apply_playerids", boom)
+
+    result = runner.invoke(
+        cli.app,
+        [
+            "crosswalk",
+            "seed",
+            "--players",
+            str(_players_parquet(tmp_path)),
+            "--playerids",
+            str(FIXTURE),
+        ],
+    )
+
+    assert result.exit_code == cli.EXIT_CONFLICT
+    assert session.lock_keys("unlock") == [cli.CROSSWALK_LOCK_KEY]
+
+
+def test_verify_takes_the_crosswalk_lock(monkeypatch):
+    session = _FakeSession()
+    monkeypatch.setattr(cli, "_session_scope", _fake_scope(session))
+    monkeypatch.setattr("ffh.crosswalk.review.verify_mapping", lambda s, src, ext: True)
+    monkeypatch.setattr(
+        "ffh.crosswalk.review.mark_unmatched_resolved", lambda s, src, ext, force=False: True
+    )
+
+    result = runner.invoke(cli.app, ["crosswalk", "verify", "sleeper", "4046"])
+
+    assert result.exit_code == 0, result.output
+    assert session.lock_keys("lock") == [cli.CROSSWALK_LOCK_KEY]
+    assert session.lock_keys("unlock") == [cli.CROSSWALK_LOCK_KEY]
+
+
+def test_map_takes_the_crosswalk_lock(monkeypatch):
+    from ffh.crosswalk.review import MapResult
+
+    session = _FakeSession()
+    monkeypatch.setattr(cli, "_session_scope", _fake_scope(session))
+    monkeypatch.setattr(
+        "ffh.crosswalk.review.map_mapping",
+        lambda s, src, ext, pid: MapResult(status="created"),
+    )
+
+    result = runner.invoke(cli.app, ["crosswalk", "map", "sleeper", "4046", str(uuid.uuid4())])
+
+    assert result.exit_code == 0, result.output
+    assert session.lock_keys("lock") == [cli.CROSSWALK_LOCK_KEY]
+    assert session.lock_keys("unlock") == [cli.CROSSWALK_LOCK_KEY]
+
+
+@pytest.mark.db
+def test_seed_really_holds_the_lock_against_another_connection(
+    monkeypatch, db_session, migrated_engine, tmp_path
+):
+    """The fake-session tests prove the statements are issued; this proves they mean
+    something. A second backend must NOT be able to take the key while the seed's
+    read-then-write plan is in flight, and must be able to the moment it returns."""
+    from sqlalchemy import text
+
+    key = cli.CROSSWALK_LOCK_KEY
+    probes: list[bool] = []
+
+    def probing_seed(session, frame):
+        with migrated_engine.connect() as other:
+            got = other.execute(
+                text("SELECT pg_try_advisory_lock(hashtext(:k))"), {"k": key}
+            ).scalar()
+            if got:  # should not happen; release it so later tests are not poisoned
+                other.execute(text("SELECT pg_advisory_unlock(hashtext(:k))"), {"k": key})
+            probes.append(bool(got))
+        return 46
+
+    monkeypatch.setattr(cli, "_session_scope", _fake_scope(db_session))
+    monkeypatch.setattr("ffh.crosswalk.registry.seed_players", probing_seed)
+
+    result = runner.invoke(
+        cli.app, ["crosswalk", "seed", "--players", str(_players_parquet(tmp_path))]
+    )
+
+    assert result.exit_code == 0, result.output
+    assert probes == [False], "another connection took the crosswalk lock mid-seed"
+    with migrated_engine.connect() as other:
+        assert other.execute(
+            text("SELECT pg_try_advisory_lock(hashtext(:k))"), {"k": key}
+        ).scalar(), "the lock was not released when the command returned"
+        other.execute(text("SELECT pg_advisory_unlock(hashtext(:k))"), {"k": key})
+        other.commit()

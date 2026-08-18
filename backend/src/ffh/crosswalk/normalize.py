@@ -193,6 +193,25 @@ def normalize_dst(raw: str | None) -> str | None:
     return f"{abbr.lower()} dst" if abbr else None
 
 
+def canonical_dst_key(*candidates: str | None) -> str | None:
+    """The DST key for the FIRST candidate that names a team — precedence is the argument
+    order, and every writer must pass the same order.
+
+    Both crosswalk writers used to inline their own fallback chain and they disagreed:
+    ``apply_playerids`` tried team-then-name, ``resolve._canonical_name`` name-then-team.
+    A row whose name and team point at *different* defenses ("Kansas City Chiefs" listed at
+    "DEN") therefore canonicalized to a different player depending on which writer saw it
+    first — a silently wrong mapping, which is exactly what the crosswalk exists to prevent.
+    The agreed precedence is **name first** (DATABASE.md §3): the name is what the row is
+    *about*, while the team column is a mutable weekly attribute.
+    """
+    for candidate in candidates:
+        key = normalize_dst(candidate)
+        if key is not None:
+            return key
+    return None
+
+
 def dst_full_name(abbr: str) -> str:
     city, nickname = _TEAM_BY_ABBR[abbr]
     return f"{city} {nickname} DST"

@@ -1,11 +1,12 @@
 """Task 5 — the five-rung resolution ladder (DATABASE.md §3), strictly in order."""
 
 import struct
+from contextlib import contextmanager
 from datetime import UTC, date, datetime
 
 import pytest
 import structlog.testing
-from sqlalchemy import func, select
+from sqlalchemy import event, func, select
 
 from ffh.crosswalk.resolve import (
     CONFIDENCE_EPSILON,
@@ -974,3 +975,89 @@ def test_resolve_unmatched_still_closes_an_id_with_no_mapping_or_only_a_tombston
     resolve(db_session, "sleeper", "4881", "Lamarr Jackson", "QB", "BAL")  # fuzzy pending
     assert reject_mapping(db_session, "sleeper", "4881") is True
     assert mark_unmatched_resolved(db_session, "sleeper", "4881") is True
+
+
+# ---------------------------------------------------------------------------
+# Fix wave B: rung 4's candidate pool is loaded once per batch, not once per input.
+# ---------------------------------------------------------------------------
+
+#: The rung-4 pool query and nothing else: `_exact` selects (player_id, team_abbr), and the
+#: registry upserts name every column.
+_FUZZY_POOL_SQL = "players.birth_date, players.college"
+
+
+@contextmanager
+def _count_statements(session, needle: str):
+    seen: list[str] = []
+
+    def _hook(conn, cursor, statement, parameters, context, executemany):
+        if needle in " ".join(statement.split()):
+            seen.append(statement)
+
+    bind = session.get_bind()
+    event.listen(bind, "before_cursor_execute", _hook)
+    try:
+        yield seen
+    finally:
+        event.remove(bind, "before_cursor_execute", _hook)
+
+
+def test_resolve_many_loads_the_fuzzy_candidate_pool_once_per_source_and_position(
+    db_session, seeded_registry
+):
+    """Rung 4 re-selected every unmapped same-position player and rebuilt the rapidfuzz
+    choice map on EVERY call — and `resolve_many`'s two passes call it for every input that
+    misses rungs 1-3, so a batch of a few hundred rostered players ran that query a few
+    hundred times over a table that barely moves within the batch.
+
+    Five QB inputs, one `(source, position)` key: one query.
+    """
+    rows = [
+        ResolveInput("sleeper", "F1", "Lamarr Jackson", "QB", "BAL"),  # a real fuzzy hit
+        ResolveInput("sleeper", "M1", "Zzz Aaa Oneee", "QB", "BAL"),
+        ResolveInput("sleeper", "M2", "Zzz Bbb Twooo", "QB", "BAL"),
+        ResolveInput("sleeper", "M3", "Zzz Ccc Threee", "QB", "BAL"),
+        ResolveInput("sleeper", "M4", "Zzz Ddd Fourrr", "QB", "BAL"),
+    ]
+    with _count_statements(db_session, _FUZZY_POOL_SQL) as statements:
+        rep = resolve_many(db_session, rows)
+
+    assert len(statements) == 1, statements
+    # …and the outcomes are exactly what the per-call query produced.
+    assert rep.pending_review == [("sleeper", "F1")]
+    assert sorted(rep.unmatched) == [("sleeper", f"M{i}") for i in range(1, 5)]
+    assert db_session.get(PlayerExternalId, ("sleeper", "F1")).match_method == "fuzzy"
+
+
+def test_the_cached_pool_drops_a_player_as_soon_as_the_batch_claims_him(
+    db_session, seeded_registry
+):
+    """The cache must behave exactly like the reload it replaces: rung 4 excludes players
+    already mapped for the source, so a player claimed earlier in the batch has to leave
+    the pool. Two near-identical spellings of one QB — the second must NOT get him."""
+    lamar = seeded_registry["00-0034796"]
+    rows = [
+        ResolveInput("sleeper", "F1", "Lamarr Jackson", "QB", "BAL"),
+        ResolveInput("sleeper", "F2", "Lamar Jacksonn", "QB", "BAL"),
+    ]
+    rep = resolve_many(db_session, rows)
+
+    claimed = [
+        (r.source, r.external_id)
+        for r in _ids(db_session)
+        if r.player_id == lamar and r.match_method == "fuzzy"
+    ]
+    assert len(claimed) == 1, claimed
+    assert len(rep.pending_review) == 1
+    assert len(rep.unmatched) == 1
+    # The loser is on the gate, not silently dropped.
+    assert {(u.source, u.external_id) for u in _unmatched(db_session)} == set(rep.unmatched)
+
+
+def test_single_resolve_still_queries_per_call(db_session, seeded_registry):
+    """`resolve()` has no batch to amortize over and keeps today's path — the cache is a
+    `resolve_many` concern and must not leak into the single-id API's behaviour."""
+    with _count_statements(db_session, _FUZZY_POOL_SQL) as statements:
+        assert resolve(db_session, "sleeper", "F1", "Lamarr Jackson", "QB", "BAL") is None
+        assert resolve(db_session, "espn", "F2", "Lamarr Jackson", "QB", "BAL") is None
+    assert len(statements) == 2, statements

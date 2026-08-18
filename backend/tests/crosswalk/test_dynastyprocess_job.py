@@ -13,7 +13,9 @@ import pytest
 import respx
 from sqlalchemy import select
 
+import ffh.crosswalk.dynastyprocess as dp
 from ffh.crosswalk.dynastyprocess import (
+    DP_MIN_ROWS,
     DP_REQUIRED_COLUMNS,
     DP_TEXT_COLUMNS,
     DP_URL,
@@ -36,6 +38,17 @@ def _body() -> bytes:
 
 def _job() -> DynastyProcessPlayerIdsJob:
     return DynastyProcessPlayerIdsJob()
+
+
+@pytest.fixture
+def sample_sized_floor(monkeypatch):
+    """Drop `DP_MIN_ROWS` for the tests that land the 13-row sample.
+
+    The floor is deliberately a *live-file* number (see `DP_MIN_ROWS`), so a fixture
+    exercising the lifecycle has to opt out of it. Requested explicitly, never autouse:
+    a test that silently disabled the guard it is meant to protect would be worthless.
+    """
+    monkeypatch.setattr(dp, "DP_MIN_ROWS", 1)
 
 
 # --- registration / identity ---------------------------------------------------------
@@ -75,7 +88,7 @@ def test_parse_reads_every_id_column_as_text():
     assert df.filter(pl.col("mfl_id") == "13116")["sleeper_id"].item() == "4046"
 
 
-def test_validate_accepts_the_sample_and_rejects_short_or_retyped_frames():
+def test_validate_accepts_the_sample_and_rejects_short_or_retyped_frames(sample_sized_floor):
     job = _job()
     df = job.parse(_body())
     job.validate(df)  # the happy path must not raise
@@ -94,7 +107,9 @@ def test_validate_accepts_the_sample_and_rejects_short_or_retyped_frames():
 
 @pytest.mark.db
 @respx.mock
-def test_run_lands_one_partition_then_304_is_skipped(db_session, tmp_path: Path):
+def test_run_lands_one_partition_then_304_is_skipped(
+    db_session, tmp_path: Path, sample_sized_floor
+):
     route = respx.get(DP_URL).mock(
         side_effect=[
             httpx.Response(200, content=_body(), headers={"ETag": '"dp-v1"'}),
@@ -179,7 +194,7 @@ def test_a_fetch_missing_a_required_column_fails_the_run(db_session, tmp_path: P
 @pytest.mark.db
 @respx.mock
 def test_the_landed_parquet_feeds_apply_playerids_without_float_mangled_ids(
-    db_session, seeded_registry: dict[str, uuid.UUID], tmp_path: Path
+    db_session, seeded_registry: dict[str, uuid.UUID], tmp_path: Path, sample_sized_floor
 ):
     """`ffh crosswalk seed --playerids <landed>.parquet` reads Parquet, not CSV.
 
@@ -208,3 +223,34 @@ def test_the_landed_parquet_feeds_apply_playerids_without_float_mangled_ids(
         )
     )
     assert sportradar_id == "11cad59d-90dd-449c-a839-dddaba4fe16c"
+
+
+# --- row-count floor -----------------------------------------------------------------
+
+
+def test_validate_rejects_a_valid_but_shrunken_snapshot():
+    """A truncated upstream file is *valid* — right columns, right dtypes, non-empty — and
+    used to land as a successful partition. The lake never overwrites a partition, so that
+    day could not then be cleanly re-landed once the file recovered."""
+    df = _job().parse(_body())
+    shrunken = pl.concat([df] * 16)  # 208 rows, far under the floor and far over zero
+    assert 0 < shrunken.height < DP_MIN_ROWS
+    with pytest.raises(IngestValidationError, match=f"below the {DP_MIN_ROWS}-row floor"):
+        _job().validate(shrunken)
+
+    # …and a snapshot at the floor still lands: the guard is a floor, not a fixed size.
+    full = pl.concat([df] * ((DP_MIN_ROWS // df.height) + 1))
+    assert full.height >= DP_MIN_ROWS
+    _job().validate(full)
+
+
+@pytest.mark.db
+@respx.mock
+def test_a_shrunken_fetch_fails_the_run_and_lands_nothing(db_session, tmp_path: Path):
+    """End to end: the floor has to reject inside `run()`, before `write_parquet` claims
+    today's partition — a landed truncation is the state that cannot be repaired."""
+    respx.get(DP_URL).mock(return_value=httpx.Response(200, content=_body()))
+    result = _job().run(db_session, tmp_path)
+    assert result.status == "failed"
+    assert f"below the {DP_MIN_ROWS}-row floor" in result.error
+    assert not list(tmp_path.rglob("*.parquet"))

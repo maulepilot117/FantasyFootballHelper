@@ -14,18 +14,18 @@ from collections import Counter
 from collections.abc import Iterable
 from dataclasses import dataclass, field
 from datetime import date, datetime
-from typing import Literal
+from typing import Any, Literal
 
 import structlog
 from rapidfuzz import process
 from rapidfuzz.distance import JaroWinkler
-from sqlalchemy import Select, case, func, select, update
+from sqlalchemy import Row, Select, case, func, select, update
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.orm import Session
 
 from ffh.crosswalk.normalize import (
+    canonical_dst_key,
     fold_accents,
-    normalize_dst,
     normalize_name,
     normalize_position,
     normalize_team,
@@ -143,8 +143,13 @@ def resolve_many(session: Session, rows: Iterable[ResolveInput]) -> ResolveManyR
     (settling every rung-1/2/3 claim batch-wide, gsis-bearing inputs first), pass 2 re-runs
     only the deferred inputs with rung 4 enabled. ``resolve()`` — one id, no batch to be
     ordered against — is unaffected.
+
+    Both passes share one ``_CandidateCache``, so rung 4's "every unmapped same-position
+    player" query runs once per ``(source, position)`` for the whole batch instead of once
+    per input. The cache is kept current by the writers, never by re-querying.
     """
     report = ResolveManyReport()
+    cache = _CandidateCache()
 
     def _record(inp: ResolveInput, res: Resolution | None, outcome: Outcome) -> None:
         if res is not None:
@@ -165,13 +170,13 @@ def resolve_many(session: Session, rows: Iterable[ResolveInput]) -> ResolveManyR
     ordered += [r for r in batch if r.gsis_id is None and r.source != "gsis"]
     deferred: list[ResolveInput] = []
     for inp in ordered:
-        res, outcome = _resolve(session, inp, defer_fuzzy=True)
+        res, outcome = _resolve(session, inp, defer_fuzzy=True, cache=cache)
         if outcome == "deferred":
             deferred.append(inp)
             continue
         _record(inp, res, outcome)
     for inp in deferred:
-        _record(inp, *_resolve(session, inp))
+        _record(inp, *_resolve(session, inp, cache=cache))
     log.info(
         "crosswalk.resolve_many",
         resolved=len(report.resolved),
@@ -289,11 +294,18 @@ def close_unmatched(session: Session, source: str, external_id: str) -> bool:
 
 
 def _resolve(
-    session: Session, inp: ResolveInput, *, defer_fuzzy: bool = False
+    session: Session,
+    inp: ResolveInput,
+    *,
+    defer_fuzzy: bool = False,
+    cache: _CandidateCache | None = None,
 ) -> tuple[Resolution | None, Outcome]:
     """One id down the ladder. ``defer_fuzzy`` (``resolve_many`` pass 1 only) makes rung 4
     return ``(None, "deferred")`` and persist nothing, so the batch settles every
-    higher-rung claim before any fuzzy guess takes a player's slot for the source."""
+    higher-rung claim before any fuzzy guess takes a player's slot for the source.
+
+    ``cache`` is ``resolve_many``'s rung-4 candidate pool, threaded down so a batch loads
+    each ``(source, position)`` pool once instead of once per input."""
     # Rung 1 — an existing crosswalk row (dynastyprocess, gsis, exact_name, verified fuzzy,
     # manual). Every row is re-checked against a caller-supplied gsis_id: a stale sub-1.0
     # guess is corrected rather than enshrined, and a 1.0 row the gsis fact contradicts is
@@ -310,7 +322,7 @@ def _resolve(
             # Gating this on `confidence < 1.0` made the contradiction check unreachable
             # for the rows `map_mapping` actually writes (`manual`, confidence 1.0,
             # verified): a human decision the gsis fact disputes was silently returned.
-            handled = _upgrade_from_gsis(session, inp, row)
+            handled = _upgrade_from_gsis(session, inp, row, cache=cache)
             if handled is not None:
                 return handled
         if is_usable(float(row.confidence), row.verified_at, row.match_method):
@@ -329,7 +341,7 @@ def _resolve(
                 # resolved, so close any queue entry from a miss before the player existed.
                 # `close_unmatched` lives inside `_persist`, which this branch skips.
                 close_unmatched(session, inp.source, inp.external_id)
-            elif not _persist(session, inp, pid, "gsis", 1.0):
+            elif not _persist(session, inp, pid, "gsis", 1.0, cache=cache):
                 return None, "unmatched"
             log.info("crosswalk.resolve.gsis", source=inp.source, external_id=inp.external_id)
             return Resolution(pid, "gsis", 1.0), "resolved"
@@ -350,7 +362,7 @@ def _resolve(
         _record_unmatched(session, inp, reason="homonym_blocked_by_existing_mapping")
         return None, "unmatched"
     if pid is not None:
-        if not _persist(session, inp, pid, "exact_name", EXACT_CONFIDENCE):
+        if not _persist(session, inp, pid, "exact_name", EXACT_CONFIDENCE, cache=cache):
             return None, "unmatched"
         log.info(
             "crosswalk.resolve.exact", source=inp.source, external_id=inp.external_id, name=name
@@ -358,14 +370,14 @@ def _resolve(
         return Resolution(pid, "exact_name", EXACT_CONFIDENCE), "resolved"
 
     # Rung 4 — Jaro-Winkler ≥ 0.92, persisted for review, never returned unverified
-    fuzzy, fuzzy_reason = _fuzzy(session, inp, name, position)
+    fuzzy, fuzzy_reason = _fuzzy(session, inp, name, position, cache=cache)
     if fuzzy is not None:
         if defer_fuzzy:
             # Pass 1 of resolve_many: persist nothing, claim nothing — the same input is
             # re-run in pass 2 once every higher-rung claim in the batch has settled.
             return None, "deferred"
         pid, similarity = fuzzy
-        if not _persist(session, inp, pid, "fuzzy", min(similarity, FUZZY_CAP)):
+        if not _persist(session, inp, pid, "fuzzy", min(similarity, FUZZY_CAP), cache=cache):
             return None, "unmatched"
         log.info(
             "crosswalk.resolve.fuzzy_pending",
@@ -384,7 +396,11 @@ def _resolve(
 
 
 def _upgrade_from_gsis(
-    session: Session, inp: ResolveInput, row: PlayerExternalId
+    session: Session,
+    inp: ResolveInput,
+    row: PlayerExternalId,
+    *,
+    cache: _CandidateCache | None = None,
 ) -> tuple[Resolution | None, Outcome] | None:
     """Rung-1 upgrade path: the caller supplies a gsis_id worth 1.0 for a stored row.
 
@@ -465,6 +481,10 @@ def _upgrade_from_gsis(
     # above and never reach here, so this only pins the invariant for future edits.
     row.verified_at = None
     session.flush()
+    if cache is not None:
+        # A repoint can FREE the old player's slot for this source, so the cached pools
+        # (which only ever shrink via `claim`) may now be missing a legitimate candidate.
+        cache.invalidate(inp.source)
     log.info(
         "crosswalk.resolve.upgraded",
         source=inp.source,
@@ -478,11 +498,10 @@ def _upgrade_from_gsis(
 
 def _canonical_name(inp: ResolveInput, position: str | None) -> str | None:
     if position == "DST":
-        return (
-            normalize_dst(inp.raw_name)
-            or normalize_dst(inp.raw_team)
-            or normalize_dst(inp.external_id)
-        )
+        # Precedence lives in `canonical_dst_key`'s argument list, and `apply_playerids`
+        # passes the identical order — the two writers must not disagree about which
+        # defense a row whose name and team contradict each other is about.
+        return canonical_dst_key(inp.raw_name, inp.raw_team, inp.external_id)
     return normalize_name(inp.raw_name) if inp.raw_name else None
 
 
@@ -576,16 +595,69 @@ def colleges_agree(a: str, b: str) -> bool:
     return bool(ta & tb)
 
 
+def _load_candidates(session: Session, source: str, position: str) -> list[Row[Any]]:
+    """Rung 4's candidate pool: same-position players not already mapped for ``source``."""
+    return list(
+        session.execute(
+            select(
+                Player.player_id, Player.normalized_name, Player.birth_date, Player.college
+            ).where(
+                Player.position == position,
+                Player.player_id.not_in(_mapped_for_source(source)),
+            )
+        ).all()
+    )
+
+
+class _CandidateCache:
+    """One ``resolve_many`` batch's rung-4 pools, keyed on ``(source, position)``.
+
+    Rung 4 reloads *every* unmapped same-position player and rebuilds the rapidfuzz choice
+    map on each call, so a batch of a few hundred rostered players re-ran that query a few
+    hundred times over a table that barely changes within the batch. The pool is loaded
+    once per key and kept current in place: ``claim`` drops a player the moment ``_persist``
+    takes his slot for the source (exactly what the ``not_in(_mapped_for_source)`` filter
+    would have excluded on a reload), and the rarer paths that *free* a player drop the
+    pools for that source outright. Single-call ``resolve()`` passes no cache and keeps
+    today's query-per-call path.
+    """
+
+    def __init__(self) -> None:
+        self._pools: dict[tuple[str, str], list[Row[Any]]] = {}
+
+    def pool(self, session: Session, source: str, position: str) -> list[Row[Any]]:
+        key = (source, position)
+        pool = self._pools.get(key)
+        if pool is None:
+            pool = _load_candidates(session, source, position)
+            self._pools[key] = pool
+        return pool
+
+    def claim(self, source: str, player_id: uuid.UUID) -> None:
+        """A player now holds an id for ``source``: he leaves every cached pool for it."""
+        for (src, _position), pool in self._pools.items():
+            if src == source:
+                pool[:] = [r for r in pool if r.player_id != player_id]
+
+    def invalidate(self, source: str) -> None:
+        """A mapping for ``source`` moved or vanished — a player may be free again."""
+        for key in [k for k in self._pools if k[0] == source]:
+            del self._pools[key]
+
+
 def _fuzzy(
-    session: Session, inp: ResolveInput, name: str, position: str
+    session: Session,
+    inp: ResolveInput,
+    name: str,
+    position: str,
+    cache: _CandidateCache | None = None,
 ) -> tuple[tuple[uuid.UUID, float] | None, str]:
     """``((player_id, similarity) | None, reason)`` — the reason names rung 5's outcome."""
-    rows = session.execute(
-        select(Player.player_id, Player.normalized_name, Player.birth_date, Player.college).where(
-            Player.position == position,
-            Player.player_id.not_in(_mapped_for_source(inp.source)),
-        )
-    ).all()
+    rows = (
+        cache.pool(session, inp.source, position)
+        if cache is not None
+        else _load_candidates(session, inp.source, position)
+    )
     if not rows:
         return None, "no_candidate"
     meta = {r.player_id: (r.birth_date, r.college) for r in rows}
@@ -665,13 +737,22 @@ def is_authoritative(method: str, confidence: float) -> bool:
     )
 
 
-def displaceable(row: PlayerExternalId) -> bool:
-    """True when a 1.0 fact may take this row's ``(source, player_id)`` slot.
+def is_displaceable(match_method: str, verified_at: datetime | None) -> bool:
+    """True when a 1.0 fact may take a ``(source, player_id)`` slot held by such a row.
 
     Only unverified, non-human, non-DP, non-tombstone rows — i.e. an ``exact_name`` 0.95
     or ``fuzzy`` 0.89 *guess*. Anything else holds its slot and the incoming id loses.
+
+    Takes the two fields rather than an ORM entity so a caller that selected Row tuples
+    (``apply_playerids``, which must not materialize the whole crosswalk as entities) rules
+    on exactly the same predicate as one holding a ``PlayerExternalId``.
     """
-    return row.match_method not in PROTECTED_METHODS and row.verified_at is None
+    return match_method not in PROTECTED_METHODS and verified_at is None
+
+
+def displaceable(row: PlayerExternalId) -> bool:
+    """``is_displaceable`` for a loaded ``PlayerExternalId``."""
+    return is_displaceable(row.match_method, row.verified_at)
 
 
 def _take_slot(
@@ -713,7 +794,13 @@ def _slot_holder(session: Session, source: str, pid: uuid.UUID) -> PlayerExterna
 
 
 def _persist(
-    session: Session, inp: ResolveInput, pid: uuid.UUID, method: str, confidence: float
+    session: Session,
+    inp: ResolveInput,
+    pid: uuid.UUID,
+    method: str,
+    confidence: float,
+    *,
+    cache: _CandidateCache | None = None,
 ) -> bool:
     """Insert the ``(source, external_id) → player`` row for rungs 2-4.
 
@@ -781,6 +868,11 @@ def _persist(
             )
         )
     session.flush()
+    if cache is not None:
+        # The player now holds an id for this source, so rung 4's
+        # `not_in(_mapped_for_source)` filter would exclude him on a reload: drop him from
+        # the cached pools instead of paying for that reload.
+        cache.claim(inp.source, pid)
     # A mapping row now exists for this key: close any open review-queue entry (e.g. an
     # id that hit rung 5 on an earlier sync and resolves now that new data arrived).
     close_unmatched(session, inp.source, inp.external_id)

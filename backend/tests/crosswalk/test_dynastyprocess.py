@@ -6,13 +6,15 @@ tests/fixtures/dynastyprocess/db_playerids_sample.csv via FIXTURE_DIR).
 """
 
 import uuid
+from contextlib import contextmanager
 from datetime import UTC, datetime
 
 import polars as pl
 import pytest
 import structlog.testing
-from sqlalchemy import func, select
+from sqlalchemy import event, func, select
 
+import ffh.crosswalk.dynastyprocess as dp
 from ffh.crosswalk.dynastyprocess import (
     DP_ID_COLUMNS,
     CrosswalkApplyReport,
@@ -68,6 +70,7 @@ def test_apply_populates_external_ids(db_session, seeded_registry, dp_frame):
         updated=0,
         unchanged=0,
         created_players=2,
+        merged_placeholders=0,
         skipped_no_ids=1,
         skipped_position=1,
         skipped_dst=0,
@@ -577,3 +580,291 @@ def test_apply_never_queues_an_ambiguous_id_that_is_already_mapped(
         for e in logs
     )
     assert db_session.get(PlayerExternalId, ("rotowire", "9898")).match_method == "manual"
+
+
+# ---------------------------------------------------------------------------
+# Fix wave B: placeholder-key hygiene, placeholder reconciliation, DST
+# canonicalization parity, the epsilon rule, and query cost.
+# ---------------------------------------------------------------------------
+
+PAVIA_GSIS = "00-0041999"  # FAKE: a plausible gsis nflverse would assign him
+
+
+def test_placeholder_prefixes_are_derived_from_the_constant(
+    monkeypatch, db_session, seeded_registry, dp_frame
+):
+    """`_PLACEHOLDER_PREFIXES` is the single source of truth for all three sites (mint,
+    conflict-scan skip, "create a player for this key").
+
+    Hand-written `starts_with("mfl:")` literals meant a third prefix — or a renamed one —
+    silently broke exactly one of the three: the key would be minted, skipped by the
+    conflict scan, then *missed* by the create-players step and fed straight into
+    `uuid.UUID(player_key)` — mid-apply, after placeholder rows had already been flushed.
+    Renaming the prefix here is the cheapest way to prove no site hard-codes it.
+    """
+    monkeypatch.setattr(dp, "_MFL_PREFIX", "mflx:")
+    monkeypatch.setattr(dp, "_PLACEHOLDER_PREFIXES", (dp._GSIS_PREFIX, "mflx:"))
+
+    report = apply_playerids(db_session, dp_frame)
+
+    assert report.created_players == 2  # Pavia (mfl-keyed) + the glitch pair (gsis-keyed)
+    pavia = db_session.scalar(select(Player).where(Player.normalized_name == "diego pavia"))
+    assert pavia is not None and pavia.gsis_id is None
+    assert db_session.get(PlayerExternalId, ("sleeper", "13427")).player_id == pavia.player_id
+
+
+def test_apply_treats_a_float4_neighbour_of_dp_confidence_as_unchanged(
+    db_session, seeded_registry, dp_frame
+):
+    """`confidence` is Postgres REAL, so exact float equality is the wrong comparison —
+    the project's own epsilon rule (DATABASE.md section 3 consumer filter,
+    `resolve.is_usable`) exists for precisely this column. An exact `== 1.0` rewrites a row
+    that is already a DynastyProcess 1.0 fact on every seed and reports it as `updated`."""
+    neighbour = 0.99999994  # the float4 immediately below 1.0
+    db_session.add(
+        PlayerExternalId(
+            player_id=seeded_registry["00-0033873"],
+            source="sleeper",
+            external_id="4046",
+            confidence=neighbour,
+            match_method="dynastyprocess",
+        )
+    )
+    db_session.flush()
+
+    report = apply_playerids(db_session, dp_frame)
+
+    assert report.unchanged == 1 and report.updated == 0
+    assert report.inserted == 60
+
+
+def test_apply_reads_the_crosswalk_as_rows_not_orm_entities(db_session, seeded_registry, dp_frame):
+    """The whole DP-owned slice of `player_external_ids` was materialized as ORM entities
+    into three dicts — a full instance per row for a table that grows with every source and
+    every season, when six columns are read. `created_at` is the tell: an entity load
+    selects every mapped column, the Row-tuple load selects only what step 3-7 rule with.
+
+    Nothing needs a persistent instance, so the displacement below is a Core `delete` by
+    key — and it must still leave the session consistent."""
+    mahomes, chase = seeded_registry["00-0033873"], seeded_registry["00-0036900"]
+    # Core inserts: the rows exist in the database and NOT in the identity map, so any
+    # entity found there afterwards was loaded by apply_playerids itself. One row is
+    # displaced by the apply, one (a tombstone for an id DP never mentions) is only ever
+    # *read* — the read path is the one this test is about.
+    db_session.execute(
+        PlayerExternalId.__table__.insert(),
+        [
+            {
+                "player_id": mahomes,
+                "source": "sleeper",
+                "external_id": "GUESS",
+                "confidence": 0.95,
+                "match_method": "exact_name",
+            },
+            {
+                "player_id": chase,
+                "source": "sleeper",
+                "external_id": "TOMB1",
+                "confidence": 0.0,
+                "match_method": "rejected",
+            },
+        ],
+    )
+    db_session.flush()
+
+    with _statements_matching(db_session, "player_external_ids.created_at") as entity_loads:
+        report = apply_playerids(db_session, dp_frame)
+
+    assert entity_loads == [], "the crosswalk was loaded as whole ORM entities"
+    # …and the displacement still happened, by key, with the session left consistent.
+    assert report.displaced == (("sleeper", "GUESS"),)
+    assert db_session.get(PlayerExternalId, ("sleeper", "GUESS")) is None
+    assert db_session.get(PlayerExternalId, ("sleeper", "4046")).player_id == mahomes
+
+
+@contextmanager
+def _statements_matching(session, needle: str):
+    """Collect every SQL statement issued on ``session``'s connection containing ``needle``."""
+    seen: list[str] = []
+
+    def _hook(conn, cursor, statement, parameters, context, executemany):
+        if needle in " ".join(statement.split()):
+            seen.append(statement)
+
+    bind = session.get_bind()
+    event.listen(bind, "before_cursor_execute", _hook)
+    try:
+        yield seen
+    finally:
+        event.remove(bind, "before_cursor_execute", _hook)
+
+
+def test_apply_updates_existing_rows_in_one_statement(db_session, seeded_registry, dp_frame):
+    """One `UPDATE` per row against a 12,472-row file, where the `inserts` call right above
+    it is already a single executemany. Behaviour is unchanged; the statement count is not."""
+    mahomes = seeded_registry["00-0033873"]
+    keys = (("sleeper", "4046"), ("espn", "3139477"), ("yahoo", "30123"))
+    db_session.execute(
+        PlayerExternalId.__table__.insert(),
+        [
+            {
+                "player_id": mahomes,
+                "source": source,
+                "external_id": external_id,
+                "confidence": 0.95,
+                "match_method": "exact_name",
+            }
+            for source, external_id in keys
+        ],
+    )
+    db_session.flush()
+
+    with _statements_matching(db_session, "UPDATE player_external_ids") as statements:
+        report = apply_playerids(db_session, dp_frame)
+
+    assert report.updated == 3
+    assert len(statements) == 1, statements
+    for source, external_id in keys:
+        row = db_session.get(PlayerExternalId, (source, external_id))
+        db_session.refresh(row)
+        assert row.match_method == "dynastyprocess" and row.confidence == 1.0
+        assert row.player_id == mahomes
+
+
+def test_both_writers_agree_when_a_dst_row_name_and_team_disagree(
+    db_session, seeded_registry, dp_frame
+):
+    """The fabricated Chiefs DEF row, listed at DEN. `apply_playerids` used to canonicalize
+    team-first and `resolve._canonical_name` name-first, so the SAME row landed on a
+    different defense depending on which writer saw it first — the silent wrong mapping the
+    crosswalk exists to prevent. Both now call `canonical_dst_key(name, team, ...)`.
+
+    The assertion is on the canonical KEY each writer derives, because that is the whole
+    disagreement: what the ladder then does with the key (rung 3 also weighs
+    `players.team_abbr`, which a contradicting `raw_team` legitimately fails) is a separate
+    rule, and reading the final player would hide the bug behind it.
+    """
+    from ffh.crosswalk.resolve import ResolveInput, _canonical_name
+
+    doctored = dp_frame.with_columns(
+        pl.when(pl.col("mfl_id") == "99901")
+        .then(pl.lit("DEN"))
+        .otherwise(pl.col("team"))
+        .alias("team")
+    )
+    report = apply_playerids(db_session, doctored)
+    assert report.skipped_dst == 0
+
+    # The apply side: the row canonicalized to KC, not DEN, and mapped to the KC defense.
+    kc_dst = seeded_registry["kc dst"]
+    assert db_session.get(PlayerExternalId, ("sleeper", "KC")).player_id == kc_dst
+    assert db_session.get(PlayerExternalId, ("espn", "-16012")).player_id == kc_dst
+
+    # The ladder side, same row, same precedence.
+    ladder_key = _canonical_name(
+        ResolveInput("espn", "-16012", raw_name="Kansas City Chiefs", raw_team="DEN"), "DST"
+    )
+    assert ladder_key == db_session.get(Player, kc_dst).normalized_name == "kc dst"
+
+
+def _pavia_players_frame() -> pl.DataFrame:
+    """The nflverse fixture frame plus the Diego Pavia row nflverse "has now published"."""
+    from tests.crosswalk.conftest import PLAYERS_ROWS, build_players_frame
+
+    pavia = {
+        "gsis_id": PAVIA_GSIS,
+        "display_name": "Diego Pavia",
+        "first_name": "Diego",
+        "last_name": "Pavia",
+        "position": "QB",
+        "birth_date": "2002-02-16",
+        "rookie_season": 2026,
+        "height": 72,
+        "weight": 200,
+        "college_name": "Vanderbilt",
+        "status": "ACT",
+        "latest_team": "FA",
+    }
+    return pl.DataFrame([*PLAYERS_ROWS, pavia], schema=build_players_frame().schema)
+
+
+def test_a_placeholder_is_reconciled_once_nflverse_publishes_its_gsis(
+    db_session, seeded_registry, dp_frame
+):
+    """The full three-step sequence that used to end in a permanent hard failure.
+
+    1. DP has no gsis for Diego Pavia -> a placeholder `players` row with `gsis_id NULL`.
+    2. nflverse publishes him -> `seed_players` ON CONFLICT is on `gsis_id`, and NULL
+       conflicts with nothing, so it inserts a SECOND `players` row for the same human.
+    3. The next seed: the DP row now resolves by gsis to the new row while its ids still
+       point at the placeholder. The incumbent is `dynastyprocess` — protected, never
+       re-pointed — so the conflict scan raised, on every single run, forever. Rung 3 was
+       equally stuck: two `(normalized_name, position)` candidates and no way to choose.
+    """
+    from ffh.crosswalk.registry import seed_players
+
+    apply_playerids(db_session, dp_frame)
+    placeholder = db_session.scalar(select(Player).where(Player.normalized_name == "diego pavia"))
+    assert placeholder is not None and placeholder.gsis_id is None
+
+    seed_players(db_session, _pavia_players_frame())
+    assert (
+        db_session.scalar(
+            select(func.count()).select_from(Player).where(Player.normalized_name == "diego pavia")
+        )
+        == 2
+    ), "precondition: the duplicate `players` row is what this test repairs"
+
+    published = dp_frame.with_columns(
+        pl.when(pl.col("mfl_id") == "17471")
+        .then(pl.lit(PAVIA_GSIS))
+        .otherwise(pl.col("gsis_id"))
+        .alias("gsis_id")
+    )
+    report = apply_playerids(db_session, published)  # completes; no CrosswalkConflictError
+
+    assert report.merged_placeholders == 1
+    assert report.created_players == 0
+    # Exactly one row survives …
+    pavia = db_session.scalars(select(Player).where(Player.normalized_name == "diego pavia")).one()
+    assert pavia.gsis_id == PAVIA_GSIS  # … and it is the real registry row
+    assert db_session.get(Player, placeholder.player_id) is None
+    for source, external_id in (
+        ("sleeper", "13427"),
+        ("espn", "5084180"),
+        ("fantasypros", "28082"),
+        ("rotowire", "19290"),
+    ):
+        row = db_session.get(PlayerExternalId, (source, external_id))
+        db_session.refresh(row)
+        assert row.player_id == pavia.player_id, (source, external_id)
+
+    # …and the repair is idempotent: a third seed finds nothing left to merge.
+    again = apply_playerids(db_session, published)
+    assert again.merged_placeholders == 0 and again.inserted == 0
+
+
+def test_reconciliation_never_merges_a_seeded_dst_player(db_session, seeded_registry, dp_frame):
+    """The 32 seeded defenses also carry `gsis_id IS NULL`. "NULL gsis" alone must not be
+    the merge test, or a DST row sharing an id with a person would delete a defense."""
+    apply_playerids(db_session, dp_frame)
+    kc_dst = seeded_registry["kc dst"]
+    # Give the Chiefs DST an id the Mahomes DP row also carries, then re-apply.
+    db_session.execute(
+        PlayerExternalId.__table__.insert(),
+        [
+            {
+                "player_id": kc_dst,
+                "source": "rotowire",
+                "external_id": "10422",
+                "confidence": 1.0,
+                "match_method": "manual",
+            }
+        ],
+    )
+    db_session.flush()
+
+    report = apply_playerids(db_session, dp_frame)
+
+    assert report.merged_placeholders == 0
+    assert db_session.get(Player, kc_dst) is not None

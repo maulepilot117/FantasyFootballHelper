@@ -16,6 +16,7 @@ from ffh.config import get_settings
 # rather than with the ffh.ingest block below.
 from ffh.crosswalk import dynastyprocess as _dynastyprocess  # noqa: F401
 from ffh.db.engine import make_engine, make_session_factory
+from ffh.db.lock import advisory_lock
 from ffh.ingest import games as _games  # noqa: F401
 from ffh.ingest import nflverse as _nflverse  # noqa: F401
 from ffh.ingest import reference as _reference  # noqa: F401
@@ -30,6 +31,15 @@ from ffh.ingest.reference import StadiumsJob, seed_generic_league, seed_nfl_team
 EXIT_GATE_RED = 1
 EXIT_CONFLICT = 2
 EXIT_OPERATIONAL = 3
+
+#: Every crosswalk command that WRITES serializes on this Postgres advisory lock. All three
+#: read `player_external_ids`, decide who owns a `(source, player_id)` slot, then write —
+#: `apply_playerids` does it for ~12.5k rows at a time. Those plans are TOCTOU: two
+#: concurrent `ffh crosswalk seed` runs (a cron overlapping a manual re-run) can both pass
+#: the same pre-check and race into the unique index, or worse, both mint a placeholder
+#: `players` row for the same rookie. The ingest framework already serializes its lifecycle
+#: this way; the crosswalk — the highest-risk component in the system — was not.
+CROSSWALK_LOCK_KEY = "ffh.crosswalk/apply"
 
 app = typer.Typer(no_args_is_help=True, help="FantasyFootballHelper CLI.")
 ingest_app = typer.Typer(no_args_is_help=True, help="Run ingest jobs.")
@@ -225,7 +235,7 @@ def crosswalk_seed(
     # failures, and letting them escape as exit 1 makes them indistinguishable from a
     # crosswalk gap to any cron wrapper reading the exit code.
     try:
-        with _session_scope() as session:
+        with _session_scope() as session, advisory_lock(session, CROSSWALK_LOCK_KEY):
             n = seed_players(session, pl.read_parquet(players))
             typer.echo(f"players upserted (incl. 32 DST): {n}")
             if playerids is not None:
@@ -261,7 +271,7 @@ def crosswalk_verify(
     """Human review of a crosswalk row: mark verified (default) or reject."""
     from ffh.crosswalk.review import mark_unmatched_resolved, reject_mapping, verify_mapping
 
-    with _session_scope() as session:
+    with _session_scope() as session, advisory_lock(session, CROSSWALK_LOCK_KEY):
         ok = (reject_mapping if reject else verify_mapping)(session, source, external_id)
         if ok:
             if not reject:
@@ -304,7 +314,7 @@ def crosswalk_map(
     """
     from ffh.crosswalk.review import map_mapping
 
-    with _session_scope() as session:
+    with _session_scope() as session, advisory_lock(session, CROSSWALK_LOCK_KEY):
         result = map_mapping(session, source, external_id, player_id)
         if result.ok:
             session.commit()
