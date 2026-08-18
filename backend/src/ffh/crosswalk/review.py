@@ -67,4 +67,5 @@ def mark_unmatched_resolved(session: Session, source: str, external_id: str) -> 
         return False
     u.resolved = True
     session.flush()
+    log.info("crosswalk.review.unmatched_resolved", source=source, external_id=external_id)
     return True

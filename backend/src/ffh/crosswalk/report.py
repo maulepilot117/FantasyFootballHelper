@@ -55,6 +55,14 @@ class CoverageReport:
     def to_dict(self) -> dict[str, object]:
         d = asdict(self)
         d["ok"] = self.ok
+        # Sort the count maps: SQL GROUP BY order is unspecified, and `--json` output
+        # must be deterministic across identical databases (render() already sorts).
+        d["players_by_position"] = dict(sorted(self.players_by_position.items()))
+        d["ids_by_source"] = dict(sorted(self.ids_by_source.items()))
+        d["ids_by_source_method"] = {
+            source: dict(sorted(methods.items()))
+            for source, methods in sorted(self.ids_by_source_method.items())
+        }
         for key in ("unverified_low_confidence", "unmatched"):
             d[key] = [
                 {k: (str(v) if isinstance(v, uuid.UUID | datetime) else v) for k, v in row.items()}
@@ -137,7 +145,18 @@ def coverage_report(session: Session) -> CoverageReport:
         )
         for u in session.scalars(
             select(CrosswalkUnmatched)
-            .where(CrosswalkUnmatched.resolved.is_(False))
+            .where(
+                CrosswalkUnmatched.resolved.is_(False),
+                # Reflect reality, not the queue's bookkeeping: the ladder never flips
+                # `resolved` when a queued id later maps (e.g. a newly-arrived gsis_id),
+                # so a queue row whose key now has a mapping must not latch the gate red.
+                ~select(PlayerExternalId.source)
+                .where(
+                    PlayerExternalId.source == CrosswalkUnmatched.source,
+                    PlayerExternalId.external_id == CrosswalkUnmatched.external_id,
+                )
+                .exists(),
+            )
             .order_by(CrosswalkUnmatched.source, CrosswalkUnmatched.external_id)
         )
     )

@@ -11,7 +11,7 @@ from typer.testing import CliRunner
 
 import ffh.cli as cli
 from ffh.crosswalk.dynastyprocess import CrosswalkConflictError
-from ffh.crosswalk.report import CoverageReport, UnmatchedRow
+from ffh.crosswalk.report import CoverageReport, UnmatchedRow, UnverifiedRow
 
 runner = CliRunner()
 
@@ -57,10 +57,30 @@ def test_report_json(monkeypatch):
     assert payload["ok"] is False and len(payload["unmatched"]) == 1
 
 
+def test_report_exit_1_when_unverified_only(monkeypatch):
+    """`ok` must consider unverified low-confidence rows even with zero unmatched rows."""
+    rep = CoverageReport(
+        players_total=1,
+        players_by_position={"QB": 1},
+        ids_by_source={"sleeper": 1},
+        ids_by_source_method={"sleeper": {"fuzzy": 1}},
+        unverified_low_confidence=(
+            UnverifiedRow(
+                "sleeper", "4881", uuid.uuid4(), "Lamar Jackson", "QB", 0.89, datetime.now(UTC)
+            ),
+        ),
+        unmatched=(),
+    )
+    monkeypatch.setattr(cli, "_coverage_report_for_cli", lambda: rep)
+    result = runner.invoke(cli.app, ["crosswalk", "report"])
+    assert result.exit_code == 1
+    assert "unverified low-confidence: 1" in result.output
+
+
 def test_crosswalk_help_lists_commands():
     result = runner.invoke(cli.app, ["crosswalk", "--help"])
     assert result.exit_code == 0
-    for cmd in ("report", "seed", "verify"):
+    for cmd in ("report", "seed", "verify", "resolve-unmatched"):
         assert cmd in result.output
 
 
@@ -153,9 +173,9 @@ def test_cli_verify_marks_queue_entry_resolved(monkeypatch, db_session, seeded_r
 
 @pytest.mark.db
 def test_cli_verify_reject_round_trip(monkeypatch, db_session, seeded_registry):
-    """Controller ruling: the Task-5 conflict path leaves one key in BOTH tables.
-    `ffh crosswalk verify --reject` must delete the disputed mapping AND close the
-    review-queue entry, or the two tables drift permanently."""
+    """`ffh crosswalk verify --reject` deletes the disputed mapping but leaves the
+    review-queue entry OPEN — the id is now unmapped and still needs attention
+    (fix-round-1 ruling; the positive `verify` path is what closes the entry)."""
     from ffh.crosswalk.resolve import resolve, upsert_unmatched
     from ffh.db.models import CrosswalkUnmatched, PlayerExternalId
 
@@ -170,4 +190,34 @@ def test_cli_verify_reject_round_trip(monkeypatch, db_session, seeded_registry):
     u = db_session.scalar(
         select(CrosswalkUnmatched).where(CrosswalkUnmatched.external_id == "4881")
     )
-    assert u is not None and u.raw_name == "Lamarr Jackson" and u.resolved is True
+    assert u is not None and u.raw_name == "Lamarr Jackson" and u.resolved is False
+
+
+def test_resolve_unmatched_unknown_entry_exits_1(monkeypatch):
+    monkeypatch.setattr(cli, "_session_scope", _fake_scope(_FakeSession()))
+    monkeypatch.setattr("ffh.crosswalk.review.mark_unmatched_resolved", lambda s, src, ext: False)
+    result = runner.invoke(cli.app, ["crosswalk", "resolve-unmatched", "sleeper", "nope"])
+    assert result.exit_code == 1
+    assert "no crosswalk_unmatched row for sleeper:nope" in result.output
+
+
+@pytest.mark.db
+def test_cli_resolve_unmatched_closes_queue_entry(monkeypatch, db_session):
+    """Rung-5 ids with no mapping row (retired / non-NFL) need an operator path back to
+    exit 0: `ffh crosswalk resolve-unmatched` closes the queue entry directly."""
+    from ffh.crosswalk.report import coverage_report
+    from ffh.crosswalk.resolve import upsert_unmatched
+    from ffh.db.models import CrosswalkUnmatched
+
+    upsert_unmatched(db_session, "sleeper", "99999", raw_name="Nobody Nowhere")
+    assert coverage_report(db_session).ok is False
+    monkeypatch.setattr(cli, "_session_scope", _fake_scope(db_session))
+
+    result = runner.invoke(cli.app, ["crosswalk", "resolve-unmatched", "sleeper", "99999"])
+    assert result.exit_code == 0, result.output
+    assert "resolved unmatched sleeper:99999" in result.output
+    u = db_session.scalar(
+        select(CrosswalkUnmatched).where(CrosswalkUnmatched.external_id == "99999")
+    )
+    assert u is not None and u.resolved is True
+    assert coverage_report(db_session).ok is True

@@ -6,7 +6,7 @@ from sqlalchemy import select
 
 from ffh.crosswalk.dynastyprocess import apply_playerids, read_playerids_csv
 from ffh.crosswalk.report import CoverageReport, coverage_report
-from ffh.crosswalk.resolve import resolve, upsert_unmatched
+from ffh.crosswalk.resolve import USABLE_CONFIDENCE, is_usable, resolve, upsert_unmatched
 from ffh.crosswalk.review import mark_unmatched_resolved, reject_mapping, verify_mapping
 from ffh.db.models import CrosswalkUnmatched, PlayerExternalId
 
@@ -49,6 +49,11 @@ def test_report_counts_and_flags(db_session, seeded_registry):
     assert rep.ok is False
     d = rep.to_dict()
     assert d["ok"] is False and d["unmatched"][0]["external_id"] == "99999"
+    # `--json` determinism: the count maps are key-sorted, not in SQL GROUP BY order
+    assert list(d["players_by_position"]) == sorted(d["players_by_position"])
+    assert list(d["ids_by_source"]) == sorted(d["ids_by_source"])
+    assert list(d["ids_by_source_method"]) == sorted(d["ids_by_source_method"])
+    assert all(list(m) == sorted(m) for m in d["ids_by_source_method"].values())
     text = rep.render()
     assert "unverified low-confidence: 1" in text and "unmatched: 1" in text
     assert "Nobody Nowhere" in text
@@ -92,6 +97,56 @@ def test_reject_preserves_queue_raw_fields(db_session, seeded_registry):
     assert u is not None
     assert (u.raw_name, u.raw_position, u.raw_team) == ("Lamarr Jackson", "QB", "BAL")
     assert u.resolved is False
+
+
+def test_unmatched_drops_off_when_mapping_appears(db_session, seeded_registry):
+    """The ladder never flips `crosswalk_unmatched.resolved` when a queued id later maps
+    (e.g. a newly-arrived gsis_id) — the report must reflect the tables, not the queue's
+    bookkeeping, or the exit-1 gate latches red forever on a fully-mapped id."""
+    resolve(db_session, "sleeper", "12345", "Nobody Yet", "QB", "FA")  # rung 5 -> queued
+    rep = coverage_report(db_session)
+    assert [(r.source, r.external_id) for r in rep.unmatched] == [("sleeper", "12345")]
+    assert rep.ok is False
+
+    assert resolve(db_session, "sleeper", "12345", gsis_id="00-0033873") is not None  # rung 2
+    rep = coverage_report(db_session)
+    assert rep.unmatched == () and rep.ok is True
+    u = db_session.scalar(
+        select(CrosswalkUnmatched).where(CrosswalkUnmatched.external_id == "12345")
+    )
+    assert u is not None and u.resolved is False  # bookkeeping untouched; report ignores it
+
+
+def test_float4_boundary_confidence_is_usable_not_flagged(db_session, seeded_registry):
+    """A stored confidence of exactly 0.9 round-trips through Postgres REAL as
+    0.899999988… — the report's SQL must share resolve's epsilon or it flags usable rows."""
+    pid = seeded_registry["00-0034857"]  # Josh Allen QB
+    db_session.add(
+        PlayerExternalId(
+            player_id=pid,
+            source="sleeper",
+            external_id="4984",
+            confidence=0.9,
+            match_method="manual",
+            verified_at=None,
+        )
+    )
+    db_session.flush()
+    # Server-side, REAL 0.9 promotes to float8 0.89999997… — strictly below the
+    # threshold — so a hardcoded `confidence < 0.9` in the report's SQL would flag
+    # this usable row. Only the shared epsilon keeps SQL and is_usable in agreement.
+    below = db_session.scalar(
+        select(PlayerExternalId.confidence < USABLE_CONFIDENCE).where(
+            PlayerExternalId.source == "sleeper", PlayerExternalId.external_id == "4984"
+        )
+    )
+    assert below is True
+    row = db_session.get(PlayerExternalId, ("sleeper", "4984"))
+    db_session.refresh(row)
+    assert is_usable(float(row.confidence), None) is True
+    assert is_usable(0.9, None) is True
+    rep = coverage_report(db_session)
+    assert rep.unverified_low_confidence == () and rep.ok is True
 
 
 def test_mark_unmatched_resolved(db_session):

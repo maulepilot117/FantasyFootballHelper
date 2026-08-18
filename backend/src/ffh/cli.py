@@ -217,12 +217,34 @@ def crosswalk_verify(
     with _session_scope() as session:
         ok = (reject_mapping if reject else verify_mapping)(session, source, external_id)
         if ok:
-            # The Task-5 conflict path leaves the same key in BOTH player_external_ids
-            # and crosswalk_unmatched. Either human decision closes the queue entry —
-            # otherwise `ffh crosswalk report` exits 1 forever on a stale unmatched row.
-            mark_unmatched_resolved(session, source, external_id)
+            if not reject:
+                # The Task-5 conflict path leaves the same key in BOTH player_external_ids
+                # and crosswalk_unmatched; accepting the mapping closes the queue entry.
+                # `--reject` deliberately leaves it OPEN: the id is now unmapped and still
+                # needs attention (reject_mapping parks it "so it is not forgotten").
+                mark_unmatched_resolved(session, source, external_id)
             session.commit()
     if not ok:
         typer.echo(f"no crosswalk row for {source}:{external_id}", err=True)
         raise typer.Exit(code=1)
     typer.echo(("rejected " if reject else "verified ") + f"{source}:{external_id}")
+
+
+@crosswalk_app.command("resolve-unmatched")
+def crosswalk_resolve_unmatched(
+    source: str = typer.Argument(
+        ..., help="sleeper|espn|yahoo|pfr|fantasypros|sportradar|rotowire"
+    ),
+    external_id: str = typer.Argument(...),
+) -> None:
+    """Close a review-queue entry that has no mapping row (rung-5 ids that will never map)."""
+    from ffh.crosswalk.review import mark_unmatched_resolved
+
+    with _session_scope() as session:
+        ok = mark_unmatched_resolved(session, source, external_id)
+        if ok:
+            session.commit()
+    if not ok:
+        typer.echo(f"no crosswalk_unmatched row for {source}:{external_id}", err=True)
+        raise typer.Exit(code=1)
+    typer.echo(f"resolved unmatched {source}:{external_id}")
