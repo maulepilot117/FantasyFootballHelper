@@ -21,6 +21,7 @@ from ffh.crosswalk.dynastyprocess import (
     read_playerids_csv,
 )
 from ffh.crosswalk.report import coverage_report
+from ffh.crosswalk.resolve import upsert_unmatched
 from ffh.crosswalk.review import reject_mapping
 from ffh.db.models import CrosswalkUnmatched, Player, PlayerExternalId
 from tests.crosswalk.conftest import DP_SAMPLE_CSV
@@ -436,3 +437,30 @@ def test_rejecting_a_rookie_id_does_not_mint_a_duplicate_player_on_the_next_seed
     assert db_session.get(PlayerExternalId, ("sleeper", "13427")).match_method == "rejected"
     assert db_session.get(PlayerExternalId, ("espn", "5084180")).player_id == pavia.player_id
     assert ("sleeper", "13427") in _open_queue(db_session)
+
+
+def test_dp_displacement_preserves_the_queued_raw_context(db_session, seeded_registry, dp_frame):
+    """The displaced incumbent was minted by the ladder, so DynastyProcess has no raw
+    context for it — `_queue` must fall back to what the queue already holds rather than
+    nulling out the operator's only description of the id."""
+    db_session.add(
+        PlayerExternalId(
+            player_id=seeded_registry["00-0033873"],
+            source="sleeper",
+            external_id="GUESS",
+            confidence=0.95,
+            match_method="exact_name",
+        )
+    )
+    db_session.flush()
+    upsert_unmatched(
+        db_session, "sleeper", "GUESS", raw_name="Pat Mahomes", raw_position="QB", raw_team="KC"
+    )
+
+    report = apply_playerids(db_session, dp_frame)
+    assert report.displaced == (("sleeper", "GUESS"),)
+    u = db_session.scalar(
+        select(CrosswalkUnmatched).where(CrosswalkUnmatched.external_id == "GUESS")
+    )
+    assert (u.raw_name, u.raw_position, u.raw_team) == ("Pat Mahomes", "QB", "KC")
+    assert u.resolved is False

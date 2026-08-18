@@ -3076,7 +3076,13 @@ def seed_fixture_players(session: Session) -> None:
     assert created_dst == DST_ROWS, created_dst
     report = apply_playerids(session, playerids_frame())
     assert report.created_players == FIXTURE_HUMANS, report
-    assert report.ambiguous == (), report
+    # PR ④'s final review wave split `ambiguous` into four buckets; every one of them
+    # also queues the id in crosswalk_unmatched, so a non-empty bucket here would make
+    # the fixture's own `ffh crosswalk report` red.
+    assert report.ambiguous_in_file == (), report
+    assert report.blocked_by_existing == (), report
+    assert report.blocked_by_rejection == (), report
+    assert report.displaced == (), report
     session.flush()
 ```
 

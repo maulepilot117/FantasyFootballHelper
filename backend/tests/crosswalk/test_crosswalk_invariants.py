@@ -18,7 +18,7 @@ from ffh.crosswalk.resolve import (
     resolve,
     resolve_many,
 )
-from ffh.crosswalk.review import verify_mapping
+from ffh.crosswalk.review import map_mapping, reject_mapping, verify_mapping
 from ffh.db.models import PlayerExternalId
 from tests.crosswalk.conftest import FIXTURE_DIR
 
@@ -38,6 +38,16 @@ LOW_CONFIDENCE_SQL = """
 """
 LOW_CONFIDENCE_PARAMS = {"threshold": USABLE_CONFIDENCE - CONFIDENCE_EPSILON}
 
+# Direction A of test_crosswalk_no_duplicate_player_ids, mirroring the PARTIAL unique index
+# `player_external_ids_source_player_uidx` exactly (see the comment at its call site).
+DUPLICATE_LIVE_IDS_SQL = """
+    SELECT source, player_id, count(*) AS n
+    FROM player_external_ids
+    WHERE match_method <> 'rejected'
+    GROUP BY source, player_id
+    HAVING count(*) > 1
+"""
+
 
 @pytest.fixture
 def populated(db_session, seeded_registry):
@@ -56,18 +66,18 @@ def populated(db_session, seeded_registry):
 
 def test_crosswalk_no_duplicate_player_ids(db_session, populated):
     """No two external ids from one source map to one player_id, and vice-versa."""
-    # ── Direction A: one id per source per player. Enforced by the unique index added in
-    # migration 0002 AND pre-checked by every writer (resolve._persist, apply_playerids).
-    many_ids_per_player = db_session.execute(
-        text(
-            """
-            SELECT source, player_id, count(*) AS n
-            FROM player_external_ids
-            GROUP BY source, player_id
-            HAVING count(*) > 1
-            """
-        )
-    ).all()
+    # ── Direction A: one *live* id per source per player. Enforced by the PARTIAL unique
+    # index added in migration 0002 (`WHERE match_method <> 'rejected'`) AND pre-checked by
+    # every writer (resolve._persist, apply_playerids, review.map_mapping).
+    #
+    # The `match_method <> 'rejected'` filter is not cosmetic — it is the invariant. A
+    # tombstone is a record of a pairing a human threw out, not a mapping, and deliberately
+    # does NOT occupy the player's slot: `--reject` followed by `ffh crosswalk map` leaves a
+    # rejected row and a live row for one (source, player_id) by design (see
+    # tests/db/test_crosswalk_constraints.py). An unfiltered GROUP BY would fail on that
+    # legal state — it would be stricter than the constraint it claims to mirror, and it
+    # passes here only because this fixture happens to contain no rejection.
+    many_ids_per_player = db_session.execute(text(DUPLICATE_LIVE_IDS_SQL)).all()
     assert many_ids_per_player == [], many_ids_per_player
 
     # ── Direction B: one player per (source, external_id). A `count(DISTINCT player_id)`
@@ -166,6 +176,34 @@ def test_crosswalk_no_duplicate_player_ids(db_session, populated):
         ).scalar_one()
         == 1
     )
+
+    # ── And the legal state the filter exists for: reject a mapping, then map the correct
+    # id to the same player by hand. That leaves a tombstone AND a live row for one
+    # (source, player_id) — permitted by the partial index, and the invariant must hold.
+    chase = populated["00-0036900"]
+    (chase_id,) = db_session.execute(
+        text(
+            "SELECT external_id FROM player_external_ids "
+            "WHERE source='sleeper' AND player_id = :pid"
+        ),
+        {"pid": chase},
+    ).one()
+    assert reject_mapping(db_session, "sleeper", chase_id) is True
+    assert map_mapping(db_session, "sleeper", "chase-corrected", chase).ok is True
+
+    assert db_session.execute(text(DUPLICATE_LIVE_IDS_SQL)).all() == []
+    # …and the filter is load-bearing: without it this legal state fails the invariant.
+    unfiltered = db_session.execute(
+        text(
+            """
+            SELECT source, player_id, count(*) AS n
+            FROM player_external_ids
+            GROUP BY source, player_id
+            HAVING count(*) > 1
+            """
+        )
+    ).all()
+    assert [(s, p) for s, p, _n in unfiltered] == [("sleeper", chase)]
 
 
 def test_crosswalk_low_confidence_reviewed(db_session, populated):

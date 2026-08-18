@@ -359,8 +359,9 @@ supposed to pass. Use the exported `resolve.USABLE_CONFIDENCE` and
 `resolve.CONFIDENCE_EPSILON` (`1e-6`) — `report.py`'s SQL predicate uses the identical pair.
 
 **Review-queue lifecycle.** `crosswalk_unmatched.resolved` is set `true` at every point a
-mapping row is **created** for the key — `resolve._persist` and
-`dynastyprocess.apply_playerids`, and no other mapping-creation path. The human review
+mapping row is **created** for the key — `resolve._persist`,
+`dynastyprocess.apply_playerids` and `review.map_mapping`, and no other mapping-creation
+path. The human review
 commands close it too: `ffh crosswalk verify` closes the entry;
 `ffh crosswalk map <source> <id> <player_id>` creates a `manual` 1.0 verified mapping and
 closes it; `--reject` deliberately leaves it **open** (the id is now unmapped and must stay

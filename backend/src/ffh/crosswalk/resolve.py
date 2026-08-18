@@ -196,12 +196,34 @@ def upsert_unmatched(
     session.flush()
 
 
+def queued_raw_context(session: Session, source: str, external_id: str) -> dict[str, str | None]:
+    """The ``raw_*`` fields already parked in ``crosswalk_unmatched`` for this key.
+
+    ``upsert_unmatched`` refreshes ``raw_*`` from its arguments by design, so a caller with
+    no raw context of its own — a *displaced* incumbent, or an id absent from the
+    DynastyProcess file — must carry the queued values forward or it silently blanks the
+    operator's only description of the id. ``review.reject_mapping`` has always done this;
+    the displacement paths use the same helper.
+    """
+    row = session.scalar(
+        select(CrosswalkUnmatched).where(
+            CrosswalkUnmatched.source == source,
+            CrosswalkUnmatched.external_id == external_id,
+        )
+    )
+    return {
+        "raw_name": row.raw_name if row else None,
+        "raw_position": row.raw_position if row else None,
+        "raw_team": row.raw_team if row else None,
+    }
+
+
 def close_unmatched(session: Session, source: str, external_id: str) -> bool:
     """Flip an open ``crosswalk_unmatched`` row to resolved once its key gains a mapping.
 
     Called at every point a mapping row is *created* for the key (``_persist`` here,
-    ``apply_playerids`` in dynastyprocess): the queue entry means "this id has no
-    mapping", so creating one closes it. Deliberately NOT called on rung-1 hits (no new
+    ``apply_playerids`` in dynastyprocess, ``map_mapping`` in review): the queue entry
+    means "this id has no mapping", so creating one closes it. Deliberately NOT called on rung-1 hits (no new
     mapping) or in ``_upgrade_from_gsis``'s conflict branch (no mapping is created there
     — that entry must stay open so ``ffh crosswalk report`` exits 1 on it).
     """
@@ -536,9 +558,12 @@ def _take_slot(
         player_id=str(incumbent.player_id),
     )
     displaced = incumbent.external_id
+    # Read the queued context BEFORE the delete/upsert: the id may already have a review
+    # row (from an earlier sync) whose raw_* fields are the only description we have of it.
+    carried = queued_raw_context(session, source, displaced)
     session.delete(incumbent)
     session.flush()
-    upsert_unmatched(session, source, displaced)
+    upsert_unmatched(session, source, displaced, **carried)
 
 
 def _slot_holder(session: Session, source: str, pid: uuid.UUID) -> PlayerExternalId | None:

@@ -323,8 +323,10 @@ Gotchas, all confirmed against the live file — these contradict what you would
 - **The file contains duplicate-id glitch rows.** Two rows (`Fred Williams` / `Kevin Smith`,
   both WR) share every id including `gsis_id 00-0031320` but differ on `rotowire_id`;
   `espn_id 2582138` and `pfr_id CartKy01` each appear on two different TEs. This is why
-  `apply_playerids` has an ambiguity policy — such ids are dropped into
-  `CrosswalkApplyReport.ambiguous` and reported, never applied.
+  `apply_playerids` has an ambiguity policy — such ids are reported in
+  `CrosswalkApplyReport.ambiguous_in_file` (the sibling buckets are `blocked_by_existing`,
+  `blocked_by_rejection` and `displaced`) **and queued in `crosswalk_unmatched`** so the
+  gate sees them, never applied.
 
 **Ingest:** job `dynastyprocess_playerids` (`ffh ingest run dynastyprocess_playerids`) —
 weekly full snapshot, ETag-conditional, no `persist()`. It lands

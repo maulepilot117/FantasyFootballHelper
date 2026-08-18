@@ -25,7 +25,13 @@ from ffh.crosswalk.normalize import (
     normalize_team,
 )
 from ffh.crosswalk.registry import iter_gsis_to_player_id
-from ffh.crosswalk.resolve import REJECTED_METHOD, close_unmatched, displaceable, upsert_unmatched
+from ffh.crosswalk.resolve import (
+    REJECTED_METHOD,
+    close_unmatched,
+    displaceable,
+    queued_raw_context,
+    upsert_unmatched,
+)
 from ffh.db.models import CrosswalkUnmatched, Player, PlayerExternalId
 from ffh.ingest.base import HttpIngestJob, IngestValidationError, register
 from ffh.ingest.lake import scrape_date
@@ -265,11 +271,19 @@ def apply_playerids(session: Session, df: pl.DataFrame) -> CrosswalkApplyReport:
         Global Constraint / DATABASE.md §3 rung 5: every unresolved id lands in
         `crosswalk_unmatched`. A report field and a log line are not the gate — without
         this, `ffh crosswalk report` exits 0 while fantasy-relevant ids are unmapped.
+
+        A *displaced* incumbent is usually absent from the DP file (it was minted by the
+        ladder, not by DynastyProcess). `upsert_unmatched` refreshes raw_* from its
+        arguments, so fall back to whatever context the queue already holds instead of
+        blanking it.
         """
-        name, position, team = raw_context.get((source, external_id), (None, None, None))
-        upsert_unmatched(
-            session, source, external_id, raw_name=name, raw_position=position, raw_team=team
+        raw = raw_context.get((source, external_id))
+        fields = (
+            {"raw_name": raw[0], "raw_position": raw[1], "raw_team": raw[2]}
+            if raw is not None
+            else queued_raw_context(session, source, external_id)
         )
+        upsert_unmatched(session, source, external_id, **fields)
 
     player_key: list[str | None] = []  # str(uuid) known / "gsis:…"/"mfl:…" placeholders
     skipped_dst = 0

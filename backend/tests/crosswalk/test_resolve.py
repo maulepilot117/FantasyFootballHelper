@@ -780,3 +780,33 @@ def test_rung5_reasons_distinguish_elimination_from_no_match(db_session, seeded_
     assert [e["reason"] for e in logs if e["event"] == "crosswalk.resolve.unmatched"] == [
         "fuzzy_tie"
     ]
+
+
+def test_displacement_preserves_the_queued_raw_context(db_session, seeded_registry):
+    """`upsert_unmatched` refreshes raw_* by design, so the displacement path must carry
+    the queued context forward — the same regression `reject_mapping` avoids
+    (test_reject_preserves_queue_raw_fields). Blanking it leaves the operator with a bare
+    `sleeper:GUESS` and no way to tell who it was."""
+    mahomes = seeded_registry["00-0033873"]
+    db_session.add(
+        PlayerExternalId(
+            player_id=mahomes,
+            source="sleeper",
+            external_id="GUESS",
+            confidence=0.95,
+            match_method="exact_name",
+        )
+    )
+    db_session.flush()
+    # An earlier sync already described this id in the queue (then it got mapped).
+    upsert_unmatched(
+        db_session, "sleeper", "GUESS", raw_name="Pat Mahomes", raw_position="QB", raw_team="KC"
+    )
+
+    res = resolve(
+        db_session, "sleeper", "4046", "Patrick Mahomes", "QB", "KC", gsis_id="00-0033873"
+    )
+    assert res == Resolution(mahomes, "gsis", 1.0)
+    (u,) = [u for u in _unmatched(db_session) if u.external_id == "GUESS"]
+    assert (u.raw_name, u.raw_position, u.raw_team) == ("Pat Mahomes", "QB", "KC")
+    assert u.resolved is False
