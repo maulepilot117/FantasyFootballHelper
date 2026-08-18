@@ -10,11 +10,16 @@ import pytest
 from sqlalchemy import text
 from sqlalchemy.exc import IntegrityError
 
+from ffh.crosswalk.resolve import REJECTED_METHOD
 from ffh.db.models import Player, PlayerExternalId
 
 UIDX = "player_external_ids_source_player_uidx"
 #: The one predicate that defines "a tombstone is not a mapping" at the DB level.
-UIDX_PREDICATE = "match_method <> 'rejected'"
+#: Interpolated from `resolve.REJECTED_METHOD` rather than re-typed: the model and the
+#: migrations state this predicate as raw SQL, which no rename can reach. Pinning it here
+#: means renaming the constant fails loudly instead of silently un-partialling the index
+#: (every tombstone would then squat its player's one slot for that source).
+UIDX_PREDICATE = f"match_method <> '{REJECTED_METHOD}'"
 
 pytestmark = pytest.mark.db
 

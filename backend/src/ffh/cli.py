@@ -2,6 +2,7 @@ import json
 import uuid
 from collections.abc import Iterator
 from contextlib import contextmanager
+from dataclasses import asdict
 from pathlib import Path
 from typing import Annotated
 
@@ -15,6 +16,7 @@ from ffh.config import get_settings
 # isort orders these by module path, so the one crosswalk-owned job sits above ffh.db here
 # rather than with the ffh.ingest block below.
 from ffh.crosswalk import dynastyprocess as _dynastyprocess  # noqa: F401
+from ffh.crosswalk.dynastyprocess import DP_ID_COLUMNS
 from ffh.db.engine import make_engine, make_session_factory
 from ffh.db.lock import advisory_lock
 from ffh.ingest import games as _games  # noqa: F401
@@ -40,6 +42,12 @@ EXIT_OPERATIONAL = 3
 #: `players` row for the same rookie. The ingest framework already serializes its lifecycle
 #: this way; the crosswalk — the highest-risk component in the system — was not.
 CROSSWALK_LOCK_KEY = "ffh.crosswalk/apply"
+
+#: The crosswalk `source` vocabulary, built ONCE from the DynastyProcess column map that
+#: defines it. It was hand-listed in three `--help` strings, so adding an eighth source to
+#: `DP_ID_COLUMNS` left the CLI advertising seven forever — and the operator reading
+#: `ffh crosswalk map --help` is exactly the person who needs the real list.
+SOURCE_HELP = "|".join(sorted(DP_ID_COLUMNS.values()))
 
 app = typer.Typer(no_args_is_help=True, help="FantasyFootballHelper CLI.")
 ingest_app = typer.Typer(no_args_is_help=True, help="Run ingest jobs.")
@@ -237,7 +245,10 @@ def crosswalk_seed(
     try:
         with _session_scope() as session, advisory_lock(session, CROSSWALK_LOCK_KEY):
             n = seed_players(session, pl.read_parquet(players))
-            typer.echo(f"players upserted (incl. 32 DST): {n}")
+            # stderr: `--playerids` writes the apply report to stdout as JSON, and a human
+            # prose line on the same stream makes that output unparseable for any wrapper
+            # piping it to `jq`. Progress goes to stderr, data goes to stdout.
+            typer.echo(f"players upserted (incl. 32 DST): {n}", err=True)
             if playerids is not None:
                 frame = (
                     read_playerids_csv(playerids.read_bytes())
@@ -251,7 +262,10 @@ def crosswalk_seed(
                     # session is closed without commit so nothing partial lands.
                     typer.echo(str(exc), err=True)
                     raise typer.Exit(code=EXIT_CONFLICT) from exc
-                typer.echo(json.dumps(report.__dict__, indent=2))
+                # `asdict`, not `__dict__`: the report is a frozen dataclass today and
+                # `__dict__` would vanish the day it gains `slots=True` — silently, as an
+                # AttributeError inside the one command that writes the crosswalk.
+                typer.echo(json.dumps(asdict(report), indent=2, default=str))
             session.commit()
     except (DynastyProcessError, RegistryError, OSError, PolarsError, SQLAlchemyError) as exc:
         typer.echo(f"crosswalk seed failed: {type(exc).__name__}: {exc}", err=True)
@@ -260,9 +274,7 @@ def crosswalk_seed(
 
 @crosswalk_app.command("verify")
 def crosswalk_verify(
-    source: str = typer.Argument(
-        ..., help="sleeper|espn|yahoo|pfr|fantasypros|sportradar|rotowire"
-    ),
+    source: str = typer.Argument(..., help=SOURCE_HELP),
     external_id: str = typer.Argument(...),
     reject: bool = typer.Option(
         False, "--reject", help="Tombstone the mapping instead of verifying it."
@@ -301,9 +313,7 @@ def crosswalk_verify(
 
 @crosswalk_app.command("map")
 def crosswalk_map(
-    source: Annotated[
-        str, typer.Argument(help="sleeper|espn|yahoo|pfr|fantasypros|sportradar|rotowire")
-    ],
+    source: Annotated[str, typer.Argument(help=SOURCE_HELP)],
     external_id: Annotated[str, typer.Argument()],
     player_id: Annotated[uuid.UUID, typer.Argument(help="players.player_id (UUID).")],
 ) -> None:
@@ -326,9 +336,7 @@ def crosswalk_map(
 
 @crosswalk_app.command("resolve-unmatched")
 def crosswalk_resolve_unmatched(
-    source: str = typer.Argument(
-        ..., help="sleeper|espn|yahoo|pfr|fantasypros|sportradar|rotowire"
-    ),
+    source: str = typer.Argument(..., help=SOURCE_HELP),
     external_id: str = typer.Argument(...),
     force: bool = typer.Option(
         False,

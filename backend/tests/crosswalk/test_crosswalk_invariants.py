@@ -12,6 +12,7 @@ from ffh.crosswalk.dynastyprocess import apply_playerids, read_playerids_csv
 from ffh.crosswalk.report import coverage_report
 from ffh.crosswalk.resolve import (
     CONFIDENCE_EPSILON,
+    REJECTED_METHOD,
     USABLE_CONFIDENCE,
     ResolveInput,
     is_usable,
@@ -26,17 +27,34 @@ pytestmark = pytest.mark.db
 
 FIXTURE = FIXTURE_DIR / "dynastyprocess" / "db_playerids_sample.csv"
 
-# The usability rule is `confidence >= 0.9 - epsilon OR verified_at IS NOT NULL`
-# (resolve.is_usable). Never hardcode 0.9 in SQL here: confidence is Postgres REAL, so a
-# stored 0.9 reads back as 0.899999976… and a bare `< 0.9` predicate would sweep usable
-# rows into the "needs review" bucket. Report and ladder share the same epsilon.
+# The usability rule is
+# `match_method <> 'rejected' AND (confidence >= 0.9 - epsilon OR verified_at IS NOT NULL)`
+# (resolve.is_usable / DATABASE.md §3), so its complement — "rows awaiting review" — must
+# carry the tombstone clause too, exactly as report.py does. Without it every
+# `reject_mapping` (confidence 0.0, verified_at NULL by construction) shows up here as a
+# row "awaiting review" and breaks this test for a reason that has nothing to do with the
+# invariant. The sibling DUPLICATE_LIVE_IDS_SQL below already carries the same clause.
+#
+# Never hardcode 0.9 in SQL here either: confidence is Postgres REAL, so a stored 0.9 reads
+# back as 0.899999976… and a bare `< 0.9` predicate would sweep usable rows into the
+# "needs review" bucket. Report and ladder share the same epsilon.
 LOW_CONFIDENCE_SQL = """
     SELECT source, external_id, player_id
+    FROM player_external_ids
+    WHERE match_method <> :rejected AND confidence < :threshold AND verified_at IS NULL
+    ORDER BY source, external_id
+"""
+#: Same query without the tombstone clause — used once, to prove the clause is load-bearing.
+LOW_CONFIDENCE_SQL_NO_TOMBSTONE_CLAUSE = """
+    SELECT source, external_id
     FROM player_external_ids
     WHERE confidence < :threshold AND verified_at IS NULL
     ORDER BY source, external_id
 """
-LOW_CONFIDENCE_PARAMS = {"threshold": USABLE_CONFIDENCE - CONFIDENCE_EPSILON}
+LOW_CONFIDENCE_PARAMS = {
+    "threshold": USABLE_CONFIDENCE - CONFIDENCE_EPSILON,
+    "rejected": REJECTED_METHOD,
+}
 
 # Direction A of test_crosswalk_no_duplicate_player_ids, mirroring the PARTIAL unique index
 # `player_external_ids_source_player_uidx` exactly (see the comment at its call site).
@@ -208,7 +226,20 @@ def test_crosswalk_no_duplicate_player_ids(db_session, populated):
 
 def test_crosswalk_low_confidence_reviewed(db_session, populated):
     """No confidence < 0.9 row is used unverified: resolve never returns one."""
+    # A tombstone in the fixture makes the `match_method <> 'rejected'` clause load-bearing:
+    # `reject_mapping` writes confidence 0.0 / verified_at NULL, so without the clause this
+    # 1.0 DynastyProcess mapping a human just threw out would count as a row *awaiting
+    # review* and the assertion below would fail for a reason unrelated to the invariant.
+    assert reject_mapping(db_session, "sleeper", "4046") is True
+
     unverified = db_session.execute(text(LOW_CONFIDENCE_SQL), LOW_CONFIDENCE_PARAMS).all()
+    assert ("sleeper", "4046") not in [(s, e) for s, e, _ in unverified]
+    # …and it IS what the clause removes — not a row that was never selected anyway.
+    assert ("sleeper", "4046") in db_session.execute(
+        text(LOW_CONFIDENCE_SQL_NO_TOMBSTONE_CLAUSE), LOW_CONFIDENCE_PARAMS
+    ).all()
+    # A tombstone is not a mapping: the ladder returns nothing for it either.
+    assert resolve(db_session, "sleeper", "4046") is None
     # Exactly one: the batch mints a single rung-4 row (sleeper:4881). `>= 1` would let a
     # regression that starts minting extra sub-threshold mappings slip through.
     assert len(unverified) == 1, unverified

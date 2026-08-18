@@ -9,9 +9,18 @@ import structlog.testing
 from sqlalchemy import event, func, select
 
 from ffh.crosswalk.resolve import (
+    AUTHORITATIVE_METHODS,
     CONFIDENCE_EPSILON,
+    DP_METHOD,
     EXACT_CONFIDENCE,
+    EXACT_METHOD,
     FUZZY_CAP,
+    FUZZY_METHOD,
+    GSIS_METHOD,
+    MANUAL_METHOD,
+    MATCH_METHODS,
+    PROTECTED_METHODS,
+    REJECTED_METHOD,
     USABLE_CONFIDENCE,
     Resolution,
     ResolveInput,
@@ -49,17 +58,31 @@ def _add_fake_player(session, name: str, position: str, team: str | None, gsis: 
 
 
 def test_is_usable_rule():
-    assert is_usable(1.0, None) and is_usable(0.95, None) and is_usable(0.9, None)
-    assert not is_usable(0.89, None)
-    assert is_usable(0.89, datetime.now(UTC))
+    assert is_usable(1.0, None, GSIS_METHOD)
+    assert is_usable(0.95, None, EXACT_METHOD)
+    assert is_usable(0.9, None, MANUAL_METHOD)
+    assert not is_usable(0.89, None, FUZZY_METHOD)
+    assert is_usable(0.89, datetime.now(UTC), FUZZY_METHOD)
+
+
+def test_is_usable_requires_the_match_method():
+    """`player_external_ids.match_method` is NOT NULL, so no legitimate caller can be
+    missing it — and a default made every 2-arg call skip the tombstone check silently,
+    which is the pre-tombstone rule DATABASE.md §3 now explicitly calls wrong."""
+    import inspect
+
+    param = inspect.signature(is_usable).parameters["match_method"]
+    assert param.default is inspect.Parameter.empty
+    with pytest.raises(TypeError):
+        is_usable(1.0, None)  # type: ignore[call-arg]
 
 
 def test_is_usable_tolerates_float4_roundtrip():
     # player_external_ids.confidence is Postgres REAL: 0.9 comes back as float32(0.9).
     f32_09 = struct.unpack("f", struct.pack("f", 0.9))[0]
     assert f32_09 < USABLE_CONFIDENCE  # the raw comparison would wrongly fail …
-    assert is_usable(f32_09, None)  # … and the epsilon absorbs it
-    assert not is_usable(USABLE_CONFIDENCE - 2 * CONFIDENCE_EPSILON, None)
+    assert is_usable(f32_09, None, MANUAL_METHOD)  # … and the epsilon absorbs it
+    assert not is_usable(USABLE_CONFIDENCE - 2 * CONFIDENCE_EPSILON, None, FUZZY_METHOD)
 
 
 def test_rung1_existing_row_wins_over_everything(db_session, seeded_registry):
@@ -1061,3 +1084,128 @@ def test_single_resolve_still_queries_per_call(db_session, seeded_registry):
         assert resolve(db_session, "sleeper", "F1", "Lamarr Jackson", "QB", "BAL") is None
         assert resolve(db_session, "espn", "F2", "Lamarr Jackson", "QB", "BAL") is None
     assert len(statements) == 2, statements
+
+
+# ---------------------------------------------------------------------------
+# Fix wave C: the `match_method` vocabulary and the tombstone-exclusion clause each
+# live in exactly ONE place. This component's recurring defect is a constant created
+# to hold a rule and then bypassed by a re-typed literal three modules away.
+# ---------------------------------------------------------------------------
+
+#: The `ffh.crosswalk` modules that consume the vocabulary but must never define it.
+_VOCABULARY_CONSUMERS = ("dynastyprocess", "review", "report")
+
+
+def _module_source(name: str) -> str:
+    import importlib
+    import pathlib
+
+    return pathlib.Path(importlib.import_module(f"ffh.crosswalk.{name}").__file__).read_text(
+        encoding="utf-8"
+    )
+
+
+def test_match_method_vocabulary_values_are_pinned():
+    """The six strings that may appear in `player_external_ids.match_method`.
+
+    Pinned literally: these values are written to a table, compared in raw SQL (the partial
+    unique index, report.py's queries, the DATABASE.md §3 consumer rule) and read back by
+    every consumer, so a rename is a data migration — not a refactor. If this assertion
+    fails, the change needs a migration and a docs pass, not a new expected value here.
+    """
+    assert (
+        GSIS_METHOD,
+        DP_METHOD,
+        MANUAL_METHOD,
+        EXACT_METHOD,
+        FUZZY_METHOD,
+        REJECTED_METHOD,
+    ) == ("gsis", "dynastyprocess", "manual", "exact_name", "fuzzy", "rejected")
+    assert MATCH_METHODS == {
+        GSIS_METHOD,
+        DP_METHOD,
+        MANUAL_METHOD,
+        EXACT_METHOD,
+        FUZZY_METHOD,
+        REJECTED_METHOD,
+    }
+    # The two derived sets are BUILT from those names, never re-typed as literals.
+    assert AUTHORITATIVE_METHODS == {GSIS_METHOD, DP_METHOD, MANUAL_METHOD}
+    assert PROTECTED_METHODS == {DP_METHOD, MANUAL_METHOD, REJECTED_METHOD}
+    assert AUTHORITATIVE_METHODS < MATCH_METHODS and PROTECTED_METHODS < MATCH_METHODS
+    # …and the rulings actually read them.
+    from ffh.crosswalk.resolve import is_authoritative, is_displaceable
+
+    for method in AUTHORITATIVE_METHODS:
+        assert is_authoritative(method, 1.0) is True
+    assert is_authoritative(EXACT_METHOD, 1.0) is False
+    for method in PROTECTED_METHODS:
+        assert is_displaceable(method, None) is False
+    assert is_displaceable(EXACT_METHOD, None) is True
+
+
+def test_no_crosswalk_module_redefines_a_match_method_literal():
+    """`dynastyprocess.DP_METHOD` and `review.MANUAL_METHOD` used to be module-level
+    literals in modules that already *import* `resolve` — three copies of one vocabulary.
+    Python interns short strings, so an identity check proves nothing; read the source.
+
+    Scoped to module-level bindings, so the DynastyProcess *ingest job*'s unrelated
+    `source: ClassVar[str] = "dynastyprocess"` (a lake source name, not a match method)
+    is not a false positive.
+    """
+    import ast
+
+    offenders: list[tuple[str, str, str]] = []
+    for name in _VOCABULARY_CONSUMERS:
+        tree = ast.parse(_module_source(name))
+        for node in tree.body:  # module level only
+            targets = (
+                node.targets
+                if isinstance(node, ast.Assign)
+                else [node.target]
+                if isinstance(node, ast.AnnAssign)
+                else []
+            )
+            value = getattr(node, "value", None)
+            if not targets or not isinstance(value, ast.Constant):
+                continue
+            if isinstance(value.value, str) and value.value in MATCH_METHODS:
+                bound = getattr(targets[0], "id", "?")
+                offenders.append((name, bound, value.value))
+    assert offenders == [], f"{offenders} — import the constant from ffh.crosswalk.resolve instead"
+
+
+def test_the_tombstone_clause_is_written_once():
+    """`match_method != REJECTED_METHOD` as a SQL clause was copy-pasted at seven query
+    sites across four modules. It is now `resolve.LIVE_MAPPING`; the raw form may appear
+    exactly once, on the line that defines it."""
+    from ffh.crosswalk.resolve import LIVE_MAPPING
+
+    raw = "PlayerExternalId.match_method != REJECTED_METHOD"
+    assert _module_source("resolve").count(raw) == 1, "LIVE_MAPPING is not the only copy"
+    for name in _VOCABULARY_CONSUMERS:
+        assert raw not in _module_source(name), f"{name} re-typed the tombstone clause"
+    # And it really is the predicate, not just a name.
+    assert "match_method" in str(LIVE_MAPPING) and "!=" in str(LIVE_MAPPING)
+
+
+def test_every_method_the_writers_persist_is_in_the_vocabulary(db_session, seeded_registry):
+    """The end-to-end drift guard: run all five writers and assert the column only ever
+    holds a value the vocabulary knows about."""
+    from ffh.crosswalk.dynastyprocess import apply_playerids, read_playerids_csv
+    from ffh.crosswalk.review import map_mapping, reject_mapping
+    from tests.crosswalk.conftest import DP_SAMPLE_CSV
+
+    apply_playerids(db_session, read_playerids_csv(DP_SAMPLE_CSV.read_bytes()))  # dynastyprocess
+    resolve(db_session, "espn", "3916387", "Lamar Jackson", "QB", "BAL")  # exact_name
+    resolve(db_session, "yahoo", "4881", "Lamarr Jackson", "QB", "BAL")  # fuzzy
+    # A source DynastyProcess does not carry, so the player's slot for it is free.
+    resolve(db_session, "custom", "PM", "Patrick Mahomes", "QB", "KC", gsis_id="00-0033873")
+    assert map_mapping(db_session, "sleeper", "MANUAL", seeded_registry["00-0036963"]).ok
+    # One of the many `dynastyprocess` rows — the others keep that rung represented.
+    assert reject_mapping(db_session, "sleeper", "4046") is True  # rejected
+
+    stored = set(db_session.scalars(select(PlayerExternalId.match_method)))
+    assert stored <= MATCH_METHODS, stored - MATCH_METHODS
+    # …and every rung is actually represented, so the assertion is not vacuous.
+    assert stored == MATCH_METHODS, MATCH_METHODS - stored

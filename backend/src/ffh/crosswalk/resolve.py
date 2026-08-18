@@ -2,8 +2,15 @@
 
 Consumers (platform_sync in PR ⑤, ADP ingest in PR ⑥) call ``resolve`` / ``resolve_many``
 and never touch ``player_external_ids`` directly. If you must query the table in SQL, apply
-``confidence >= 0.9 - epsilon OR verified_at IS NOT NULL`` (see ``is_usable`` /
-``CONFIDENCE_EPSILON`` — the column is float4, so 0.9 round-trips as 0.899999976…).
+DATABASE.md §3's canonical consumer filter rule verbatim::
+
+    match_method <> 'rejected' AND (confidence >= 0.9 - epsilon OR verified_at IS NOT NULL)
+
+— see ``is_usable`` (the Python form), ``LIVE_MAPPING`` (the first conjunct as a reusable
+clause) and ``CONFIDENCE_EPSILON`` (the column is float4, so 0.9 round-trips as
+0.899999976…). Dropping the tombstone conjunct hands the caller exactly the pairings a
+human threw out: ``reject_mapping`` writes confidence 0.0 / ``verified_at`` NULL, so a
+``verified_at IS NOT NULL`` stamp on such a row would otherwise make it "usable".
 """
 
 from __future__ import annotations
@@ -39,6 +46,26 @@ FUZZY_THRESHOLD = 0.92
 FUZZY_CAP = 0.89
 FUZZY_TIE_MARGIN = 0.01
 USABLE_CONFIDENCE = 0.9
+
+# ---------------------------------------------------------------------------
+# ★ The `player_external_ids.match_method` vocabulary — defined ONCE, here. ★
+#
+# `ffh.crosswalk.dynastyprocess` and `ffh.crosswalk.review` import these names; they must
+# never re-type the strings. Three modules each holding their own literal for the same
+# rung is how the ladder, the DynastyProcess writer and the review flow drift apart on
+# what "manual" (or "rejected") means — and a drift there is a silently wrong mapping,
+# not a crash.
+# ---------------------------------------------------------------------------
+#: Rung 2 — an nflverse gsis_id matched directly. Confidence 1.0.
+GSIS_METHOD = "gsis"
+#: Rung 1's own writer: `apply_playerids`, straight from DynastyProcess. Confidence 1.0.
+DP_METHOD = "dynastyprocess"
+#: `ffh crosswalk map` — a human decision. Confidence 1.0, verified by construction.
+MANUAL_METHOD = "manual"
+#: Rung 3 — exact (normalized_name, position[, team]). Confidence EXACT_CONFIDENCE.
+EXACT_METHOD = "exact_name"
+#: Rung 4 — Jaro-Winkler guess, never usable until a human verifies it.
+FUZZY_METHOD = "fuzzy"
 # `ffh crosswalk verify --reject` does not delete the row: it leaves a TOMBSTONE
 # (match_method='rejected', confidence 0.0) recording the pairing a human threw out, so
 # the next sync cannot re-mint it. A tombstone is NOT a mapping — rung 1 refuses to
@@ -46,10 +73,22 @@ USABLE_CONFIDENCE = 0.9
 # (source, player_id) incumbency check skips it (the unique index is partial for the same
 # reason: a tombstone must not squat the player's one slot for that source).
 REJECTED_METHOD = "rejected"
+#: Every value `match_method` may legally carry — the closed vocabulary above.
+MATCH_METHODS: frozenset[str] = frozenset(
+    {GSIS_METHOD, DP_METHOD, MANUAL_METHOD, EXACT_METHOD, FUZZY_METHOD, REJECTED_METHOD}
+)
+#: The 1.0 *facts* (as opposed to name guesses) — see `is_authoritative`.
+AUTHORITATIVE_METHODS: frozenset[str] = frozenset({GSIS_METHOD, DP_METHOD, MANUAL_METHOD})
 # Rows a higher-authority (1.0) fact must NOT displace: a human decision, a
 # DynastyProcess row (itself 1.0), or a tombstone. Everything else — an unverified
 # `exact_name` 0.95 or `fuzzy` 0.89 guess — loses to a 1.0 fact.
-PROTECTED_METHODS: frozenset[str] = frozenset({"dynastyprocess", "manual", REJECTED_METHOD})
+PROTECTED_METHODS: frozenset[str] = frozenset({DP_METHOD, MANUAL_METHOD, REJECTED_METHOD})
+#: THE tombstone-exclusion clause. Every Python query that means "live mappings only"
+#: uses this one object instead of re-typing `match_method != 'rejected'` — the predicate
+#: was copy-pasted at seven sites across four modules, and the partial unique index
+#: `player_external_ids_source_player_uidx` is built on the identical rule. One of those
+#: copies quietly reverting is a tombstone that starts satisfying id lookups again.
+LIVE_MAPPING = PlayerExternalId.match_method != REJECTED_METHOD
 # player_external_ids.confidence is Postgres REAL (float4): a stored 0.9 reads back as
 # 0.899999976…, so every threshold comparison allows this slack. Task 7's SQL variant of
 # the usability rule must use the identical epsilon.
@@ -97,13 +136,16 @@ class ResolveManyReport:
     by_method: Counter[str] = field(default_factory=Counter)
 
 
-def is_usable(
-    confidence: float, verified_at: datetime | None, match_method: str | None = None
-) -> bool:
+def is_usable(confidence: float, verified_at: datetime | None, match_method: str) -> bool:
     """DATABASE.md §3: confidence < 0.9 rows require human review before use.
 
     A ``rejected`` tombstone is never usable — not even with a ``verified_at`` stamp,
     which is why the method is checked *before* the confidence/verification rule.
+
+    ``match_method`` is **mandatory**: the column is NOT NULL, so no legitimate caller can
+    be missing it, and an optional third argument silently turned every two-argument call
+    into the pre-tombstone rule (`confidence >= 0.9 OR verified_at IS NOT NULL`) — which
+    says a rejected pairing is usable the moment anything stamps `verified_at` on it.
     """
     if match_method == REJECTED_METHOD:
         return False
@@ -341,10 +383,10 @@ def _resolve(
                 # resolved, so close any queue entry from a miss before the player existed.
                 # `close_unmatched` lives inside `_persist`, which this branch skips.
                 close_unmatched(session, inp.source, inp.external_id)
-            elif not _persist(session, inp, pid, "gsis", 1.0, cache=cache):
+            elif not _persist(session, inp, pid, GSIS_METHOD, 1.0, cache=cache):
                 return None, "unmatched"
             log.info("crosswalk.resolve.gsis", source=inp.source, external_id=inp.external_id)
-            return Resolution(pid, "gsis", 1.0), "resolved"
+            return Resolution(pid, GSIS_METHOD, 1.0), "resolved"
 
     position = normalize_position(inp.raw_position)
     name = _canonical_name(inp, position)
@@ -362,12 +404,12 @@ def _resolve(
         _record_unmatched(session, inp, reason="homonym_blocked_by_existing_mapping")
         return None, "unmatched"
     if pid is not None:
-        if not _persist(session, inp, pid, "exact_name", EXACT_CONFIDENCE, cache=cache):
+        if not _persist(session, inp, pid, EXACT_METHOD, EXACT_CONFIDENCE, cache=cache):
             return None, "unmatched"
         log.info(
             "crosswalk.resolve.exact", source=inp.source, external_id=inp.external_id, name=name
         )
-        return Resolution(pid, "exact_name", EXACT_CONFIDENCE), "resolved"
+        return Resolution(pid, EXACT_METHOD, EXACT_CONFIDENCE), "resolved"
 
     # Rung 4 — Jaro-Winkler ≥ 0.92, persisted for review, never returned unverified
     fuzzy, fuzzy_reason = _fuzzy(session, inp, name, position, cache=cache)
@@ -377,7 +419,7 @@ def _resolve(
             # re-run in pass 2 once every higher-rung claim in the batch has settled.
             return None, "deferred"
         pid, similarity = fuzzy
-        if not _persist(session, inp, pid, "fuzzy", min(similarity, FUZZY_CAP), cache=cache):
+        if not _persist(session, inp, pid, FUZZY_METHOD, min(similarity, FUZZY_CAP), cache=cache):
             return None, "unmatched"
         log.info(
             "crosswalk.resolve.fuzzy_pending",
@@ -431,7 +473,7 @@ def _upgrade_from_gsis(
             )
             _record_unmatched(session, inp, reason="human_decision_conflict")
         return None
-    if row.verified_at is not None or row.match_method == "manual":
+    if row.verified_at is not None or row.match_method == MANUAL_METHOD:
         # A human owns this mapping; a sync's gsis_id must not rewrite it. But a dispute
         # is not a non-event: the key also goes on the gate (same precedent as
         # upgrade_conflict below — in BOTH tables), so `ffh crosswalk report` exits 1
@@ -475,7 +517,7 @@ def _upgrade_from_gsis(
             return None, "unmatched"
     old_pid, old_method, old_confidence = row.player_id, row.match_method, float(row.confidence)
     row.player_id = pid
-    row.match_method = "gsis"
+    row.match_method = GSIS_METHOD
     row.confidence = 1.0
     # A repoint invalidates any prior verification. Defensive: verified rows are locked
     # above and never reach here, so this only pins the invariant for future edits.
@@ -493,7 +535,7 @@ def _upgrade_from_gsis(
         old_confidence=round(old_confidence, 4),
         corrected=old_pid != pid,
     )
-    return Resolution(pid, "gsis", 1.0), "resolved"
+    return Resolution(pid, GSIS_METHOD, 1.0), "resolved"
 
 
 def _canonical_name(inp: ResolveInput, position: str | None) -> str | None:
@@ -510,7 +552,7 @@ def _mapped_for_source(source: str) -> Select[tuple[uuid.UUID]]:
     a rejected pairing leaves the player free to be claimed by the correct id."""
     return select(PlayerExternalId.player_id).where(
         PlayerExternalId.source == source,
-        PlayerExternalId.match_method != REJECTED_METHOD,
+        LIVE_MAPPING,
     )
 
 
@@ -539,7 +581,7 @@ def _exact(
         session.scalars(
             select(PlayerExternalId.player_id).where(
                 PlayerExternalId.source == inp.source,
-                PlayerExternalId.match_method != REJECTED_METHOD,
+                LIVE_MAPPING,
                 PlayerExternalId.player_id.in_([c.player_id for c in cands_all]),
             )
         )
@@ -732,9 +774,7 @@ def _fuzzy(
 
 def is_authoritative(method: str, confidence: float) -> bool:
     """A 1.0 fact (``gsis``, ``dynastyprocess``, ``manual``) — not a name guess."""
-    return method in {"gsis", "dynastyprocess", "manual"} and (
-        confidence >= 1.0 - CONFIDENCE_EPSILON
-    )
+    return method in AUTHORITATIVE_METHODS and confidence >= 1.0 - CONFIDENCE_EPSILON
 
 
 def is_displaceable(match_method: str, verified_at: datetime | None) -> bool:
@@ -788,7 +828,7 @@ def _slot_holder(session: Session, source: str, pid: uuid.UUID) -> PlayerExterna
         select(PlayerExternalId).where(
             PlayerExternalId.source == source,
             PlayerExternalId.player_id == pid,
-            PlayerExternalId.match_method != REJECTED_METHOD,
+            LIVE_MAPPING,
         )
     )
 

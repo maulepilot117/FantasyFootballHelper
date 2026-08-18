@@ -6,6 +6,7 @@ from pathlib import Path
 
 import polars as pl
 import pytest
+import structlog.testing
 from sqlalchemy import select
 from typer.testing import CliRunner
 
@@ -606,3 +607,106 @@ def test_seed_really_holds_the_lock_against_another_connection(
         ).scalar(), "the lock was not released when the command returned"
         other.execute(text("SELECT pg_advisory_unlock(hashtext(:k))"), {"k": key})
         other.commit()
+
+
+# ---------------------------------------------------------------------------
+# Fix wave C: the `--playerids` success path, machine-readable stdout, and the source
+# vocabulary in `--help`. Neither `--playerids` arm (.csv or .parquet) had ever run to
+# completion in a test — every existing case monkeypatched `apply_playerids` to raise.
+# ---------------------------------------------------------------------------
+
+
+def _nflverse_players_parquet(tmp_path: Path) -> Path:
+    """The real 17-row nflverse-shaped fixture, so `seed_players` runs for real."""
+    from tests.crosswalk.conftest import build_players_frame
+
+    path = tmp_path / "nflverse_players.parquet"
+    build_players_frame().write_parquet(path)
+    return path
+
+
+def _playerids_file(tmp_path: Path, suffix: str) -> Path:
+    if suffix == ".csv":
+        return FIXTURE
+    # What the ingest job actually lands: `read_playerids_csv` -> Parquet, ids still text.
+    from ffh.crosswalk.dynastyprocess import read_playerids_csv
+
+    path = tmp_path / "playerids.parquet"
+    read_playerids_csv(FIXTURE.read_bytes()).write_parquet(path)
+    return path
+
+
+@pytest.mark.db
+@pytest.mark.parametrize("suffix", [".parquet", ".csv"])
+def test_cli_seed_with_playerids_applies_the_crosswalk(monkeypatch, db_session, tmp_path, suffix):
+    """The whole command end-to-end: seed the registry, apply DynastyProcess, commit.
+
+    `.parquet` first — that is the arm `ffh ingest run dynastyprocess_playerids` produces
+    and therefore the one the homelab cron actually exercises.
+
+    `capture_logs` silences structlog, whose *default* sink is stdout; the assertion below
+    is about what the COMMAND writes to stdout, which must be the JSON report and nothing
+    else (the human progress line goes to stderr).
+    """
+    from sqlalchemy import func
+
+    from ffh.db.models import Player, PlayerExternalId
+
+    monkeypatch.setattr(cli, "_session_scope", _fake_scope(db_session))
+    with structlog.testing.capture_logs():
+        result = runner.invoke(
+            cli.app,
+            [
+                "crosswalk",
+                "seed",
+                "--players",
+                str(_nflverse_players_parquet(tmp_path)),
+                "--playerids",
+                str(_playerids_file(tmp_path, suffix)),
+            ],
+        )
+
+    assert result.exit_code == 0, result.output
+    # ── stdout is parseable JSON and nothing else, so `ffh crosswalk seed ... | jq` works.
+    # `asdict(report)`, not `report.__dict__` (which breaks the day the dataclass gains
+    # `slots=True`) — the field set below is the contract that proves it.
+    payload = json.loads(result.stdout)
+    assert "players upserted" in result.stderr and "players upserted" not in result.stdout
+    assert payload["inserted"] == 61 and payload["created_players"] == 2
+    assert payload["ambiguous_in_file"] == [["rotowire", "10167"], ["rotowire", "9898"]]
+    assert payload["blocked_by_existing"] == [] and payload["blocked_by_rejection"] == []
+    assert payload["displaced"] == [] and payload["merged_placeholders"] == 0
+    assert payload["updated"] == 0 and payload["unchanged"] == 0
+
+    # ── and the ids really landed, at dynastyprocess/1.0, for every source in the file.
+    assert db_session.scalar(select(func.count()).select_from(PlayerExternalId)) == 61
+    mahomes = db_session.scalar(select(Player.player_id).where(Player.gsis_id == "00-0033873"))
+    row = db_session.get(PlayerExternalId, ("sleeper", "4046"))
+    assert row.player_id == mahomes
+    assert row.match_method == "dynastyprocess" and row.confidence == pytest.approx(1.0)
+    assert set(db_session.scalars(select(PlayerExternalId.source).distinct())) == {
+        "sleeper",
+        "espn",
+        "yahoo",
+        "pfr",
+        "fantasypros",
+        "sportradar",
+        "rotowire",
+    }
+
+
+def test_crosswalk_source_help_is_built_from_dp_id_columns():
+    """The seven sources were hand-listed in three `--help` strings; an eighth source in
+    `DP_ID_COLUMNS` left all three advertising the old set. Read the parameter help off
+    the click command rather than the rendered page — the panel is width-truncated."""
+    import typer.main
+
+    from ffh.crosswalk.dynastyprocess import DP_ID_COLUMNS
+
+    assert cli.SOURCE_HELP == "|".join(sorted(DP_ID_COLUMNS.values()))
+    crosswalk = typer.main.get_command(cli.app).commands["crosswalk"]
+    for name in ("verify", "map", "resolve-unmatched"):
+        param = next(p for p in crosswalk.commands[name].params if p.name == "source")
+        assert param.help == cli.SOURCE_HELP, (name, param.help)
+        for source in DP_ID_COLUMNS.values():
+            assert source in param.help, (name, source)

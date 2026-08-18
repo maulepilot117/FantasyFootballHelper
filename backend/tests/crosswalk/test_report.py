@@ -233,8 +233,8 @@ def test_float4_boundary_confidence_is_usable_not_flagged(db_session, seeded_reg
     assert below is True
     row = db_session.get(PlayerExternalId, ("sleeper", "4984"))
     db_session.refresh(row)
-    assert is_usable(float(row.confidence), None) is True
-    assert is_usable(0.9, None) is True
+    assert is_usable(float(row.confidence), None, row.match_method) is True
+    assert is_usable(0.9, None, "manual") is True
     rep = coverage_report(db_session)
     assert rep.unverified_low_confidence == () and rep.ok is True
 

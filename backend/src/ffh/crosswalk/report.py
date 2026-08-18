@@ -13,7 +13,7 @@ from sqlalchemy.orm import Session
 # player_external_ids.confidence is Postgres REAL (float4), so a stored 0.9 reads back
 # as 0.899999976… — the shared epsilon keeps the report and the ladder in agreement
 # about which rows are usable versus awaiting review.
-from ffh.crosswalk.resolve import CONFIDENCE_EPSILON, REJECTED_METHOD, USABLE_CONFIDENCE
+from ffh.crosswalk.resolve import CONFIDENCE_EPSILON, LIVE_MAPPING, USABLE_CONFIDENCE
 from ffh.db.models import CrosswalkUnmatched, Player, PlayerExternalId
 
 
@@ -154,8 +154,9 @@ def coverage_report(session: Session) -> CoverageReport:
                 # `rejected` tombstones are 0.0 by construction and are NOT rows awaiting
                 # review — they are decisions already taken. Their gate signal is the open
                 # crosswalk_unmatched row for the same key; counting them here too would
-                # latch the report red forever after any rejection.
-                PlayerExternalId.match_method != REJECTED_METHOD,
+                # latch the report red forever after any rejection. The clause is
+                # `resolve.LIVE_MAPPING` — the same object every other live-rows query uses.
+                LIVE_MAPPING,
             )
             .order_by(PlayerExternalId.source, PlayerExternalId.external_id)
         )

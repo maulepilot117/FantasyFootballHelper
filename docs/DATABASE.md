@@ -113,7 +113,7 @@ CREATE TABLE player_external_ids (
     source       TEXT NOT NULL,   -- sleeper|espn|yahoo|pfr|fantasypros|sportradar|rotowire
     external_id  TEXT NOT NULL,
     confidence   REAL NOT NULL DEFAULT 1.0,   -- <1.0 means fuzzy-matched; review these
-    match_method TEXT NOT NULL,               -- dynastyprocess|gsis|exact_name|fuzzy|manual
+    match_method TEXT NOT NULL,               -- dynastyprocess|gsis|exact_name|fuzzy|manual|rejected (tombstone, not a mapping — see §3)
     verified_at  TIMESTAMPTZ,
     created_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
     PRIMARY KEY (source, external_id)

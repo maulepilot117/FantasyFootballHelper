@@ -32,7 +32,11 @@ Nothing works without this. No shortcuts here.
 - [x] CI on `ubuntu-24.04-arm`: lint → test → build → push GHCR. **No QEMU.**
 - [x] Postgres schema + initial Alembic migration ([`DATABASE.md`](DATABASE.md))
 - [x] **★ Player ID crosswalk ★** — DynastyProcess ingest, resolution ladder, unmatched
-      table, `ffh crosswalk report|seed|verify|resolve-unmatched`.
+      table, `ffh crosswalk report|seed|verify|map|resolve-unmatched`. `map` is the only
+      path from `crosswalk_unmatched` to *mapped* and the only escape from a
+      `verify --reject` tombstone; `report --allow-empty` opts out of the never-seeded
+      floor for a legitimate pre-seed invocation, and `resolve-unmatched --force` closes a
+      queue entry whose id still has a live mapping row.
       **Highest-risk component; do it first.** Two of the four mandatory coverage tests
       ship with it; `test_crosswalk_covers_all_rostered_players` lands with the Sleeper
       adapter and `test_crosswalk_covers_top_300_adp` with ADP ingest (see

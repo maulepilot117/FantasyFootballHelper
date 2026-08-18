@@ -12,6 +12,8 @@ from sqlalchemy.orm import Session
 # Single writer for crosswalk_unmatched (controller ruling): reuse resolve's upsert so
 # the review flow and rung 5 can never drift apart on the conflict-set payload.
 from ffh.crosswalk.resolve import (
+    LIVE_MAPPING,
+    MANUAL_METHOD,
     REJECTED_METHOD,
     close_unmatched,
     queued_raw_context,
@@ -19,7 +21,9 @@ from ffh.crosswalk.resolve import (
 )
 from ffh.db.models import CrosswalkUnmatched, Player, PlayerExternalId
 
-MANUAL_METHOD = "manual"
+#: `MANUAL_METHOD` comes from `resolve`, which owns the whole `match_method` vocabulary.
+#: Re-typing `"manual"` here is what let the ladder's authority rule and this module's
+#: writer drift — `resolve` locks `manual` rows against a gsis upgrade by name.
 MANUAL_CONFIDENCE = 1.0
 
 log = structlog.get_logger(__name__)
@@ -157,7 +161,7 @@ def map_mapping(session: Session, source: str, external_id: str, player_id: uuid
         select(PlayerExternalId).where(
             PlayerExternalId.source == source,
             PlayerExternalId.player_id == player_id,
-            PlayerExternalId.match_method != REJECTED_METHOD,
+            LIVE_MAPPING,
             PlayerExternalId.external_id != external_id,
         )
     )

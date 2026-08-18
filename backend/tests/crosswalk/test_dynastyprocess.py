@@ -868,3 +868,95 @@ def test_reconciliation_never_merges_a_seeded_dst_player(db_session, seeded_regi
 
     assert report.merged_placeholders == 0
     assert db_session.get(Player, kc_dst) is not None
+
+
+# ---------------------------------------------------------------------------
+# Fix wave C: the tombstone-REPOINT branch of step 7. A tombstone vetoes re-minting the
+# exact pairing a human threw out; it does NOT veto pointing that id at a DIFFERENT
+# player — that correction is precisely what the rejection asked for. The primary key
+# (source, external_id) is already taken, so the row is repointed in place rather than
+# inserted; an insert here would be an IntegrityError on the PK.
+# ---------------------------------------------------------------------------
+
+
+def test_apply_repoints_a_tombstone_at_the_player_dp_names(db_session, seeded_registry, dp_frame):
+    """Reject `sleeper:4046 -> Chase`, then let DynastyProcess say it is Mahomes.
+
+    The tombstone is about the *pairing*, not the id: the correction must land, the row
+    must come back as a live `dynastyprocess`/1.0 mapping with `verified_at` cleared, it
+    must NOT be reported as blocked_by_rejection, and the rejection's queue entry — which
+    `reject_mapping` opened — must close, or the gate stays red on a now-mapped id.
+    """
+    mahomes, chase = seeded_registry["00-0033873"], seeded_registry["00-0036900"]
+    db_session.add(
+        PlayerExternalId(
+            player_id=chase,
+            source="sleeper",
+            external_id="4046",
+            confidence=0.95,
+            match_method="exact_name",
+        )
+    )
+    db_session.flush()
+    assert reject_mapping(db_session, "sleeper", "4046") is True
+    assert ("sleeper", "4046") in _open_queue(db_session)
+
+    report = apply_playerids(db_session, dp_frame)
+
+    row = db_session.get(PlayerExternalId, ("sleeper", "4046"))
+    assert row.player_id == mahomes
+    assert row.match_method == "dynastyprocess" and row.confidence == pytest.approx(1.0)
+    assert row.verified_at is None
+    assert report.blocked_by_rejection == ()
+    assert report.blocked_by_existing == ()
+    # Repoints are counted as updates, not inserts — the PK row already existed.
+    assert report.updated == 1
+    assert ("sleeper", "4046") not in _open_queue(db_session)
+    # Chase keeps his own slot for the source (his DP id), so nothing was stolen.
+    assert db_session.get(PlayerExternalId, ("sleeper", "7564")).player_id == chase
+
+
+def test_tombstone_repoint_blocked_by_a_live_id_is_bucketed_not_an_integrity_error(
+    db_session, seeded_registry, dp_frame
+):
+    """Same tombstone, but the player DP names already holds a live id for the source.
+
+    The repoint would give Mahomes two live `sleeper` ids — the partial unique index
+    forbids it. That must surface as the documented `blocked_by_existing` bucket with the
+    id back on the review queue, never as an IntegrityError that aborts the whole seed.
+    """
+    mahomes, chase = seeded_registry["00-0033873"], seeded_registry["00-0036900"]
+    db_session.add(
+        PlayerExternalId(
+            player_id=mahomes,
+            source="sleeper",
+            external_id="9999",
+            confidence=1.0,
+            match_method="manual",  # protected: never displaced by DP's 1.0 fact
+        )
+    )
+    db_session.add(
+        PlayerExternalId(
+            player_id=chase,
+            source="sleeper",
+            external_id="4046",
+            confidence=0.95,
+            match_method="exact_name",
+        )
+    )
+    db_session.flush()
+    assert reject_mapping(db_session, "sleeper", "4046") is True
+
+    report = apply_playerids(db_session, dp_frame)
+
+    assert report.blocked_by_existing == (("sleeper", "4046"),)
+    assert report.blocked_by_rejection == ()
+    assert report.displaced == ()
+    # The tombstone is untouched — still not a mapping, still pointing at the rejected player.
+    row = db_session.get(PlayerExternalId, ("sleeper", "4046"))
+    assert row.match_method == "rejected" and row.player_id == chase
+    # …the incumbent human decision survived …
+    assert db_session.get(PlayerExternalId, ("sleeper", "9999")).player_id == mahomes
+    # …and the refused id is on the gate rather than silently dropped.
+    assert ("sleeper", "4046") in _open_queue(db_session)
+    assert coverage_report(db_session).ok is False

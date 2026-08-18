@@ -28,6 +28,8 @@ from ffh.crosswalk.normalize import (
 from ffh.crosswalk.registry import iter_gsis_to_player_id
 from ffh.crosswalk.resolve import (
     CONFIDENCE_EPSILON,
+    DP_METHOD,
+    LIVE_MAPPING,
     REJECTED_METHOD,
     close_unmatched,
     is_displaceable,
@@ -65,7 +67,10 @@ DP_REQUIRED_COLUMNS: frozenset[str] = frozenset(
         *DP_ID_COLUMNS,
     }
 )
-DP_METHOD = "dynastyprocess"
+#: `DP_METHOD` is re-exported from `ffh.crosswalk.resolve`, which owns the whole
+#: `match_method` vocabulary. It is deliberately NOT re-typed here: a second literal in
+#: the module that writes 12.5k rows a week is exactly how the writer and the ladder end
+#: up disagreeing about what a DynastyProcess row looks like.
 DP_CONFIDENCE = 1.0
 
 # A DP row with no registry player yet is carried through the pipeline under a synthetic
@@ -251,6 +256,14 @@ def _load_crosswalk(session: Session) -> list[Row[Any]]:
     )
 
 
+def _is_tombstone(row: Row[Any]) -> bool:
+    """The tombstone test for a crosswalk Row tuple — the row-level twin of
+    `resolve.LIVE_MAPPING` (the SQL clause). Both derive from `REJECTED_METHOD`, so the
+    three comprehensions below cannot drift from the seven query sites or from the partial
+    unique index that encodes the same rule."""
+    return row.match_method == REJECTED_METHOD
+
+
 def _index_crosswalk(
     rows: list[Row[Any]],
 ) -> tuple[
@@ -265,8 +278,8 @@ def _index_crosswalk(
     the source (the unique index is partial on the same predicate). What they DO is veto
     re-minting the exact pairing a human rejected.
     """
-    tombstones = {(r.source, r.external_id): r for r in rows if r.match_method == REJECTED_METHOD}
-    live = [r for r in rows if r.match_method != REJECTED_METHOD]
+    tombstones = {(r.source, r.external_id): r for r in rows if _is_tombstone(r)}
+    live = [r for r in rows if not _is_tombstone(r)]
     existing = {(r.source, r.external_id): r for r in live}
     # (source, player_id) → the row already holding that slot: the DB enforces one id per
     # source per player (player_external_ids_source_player_uidx), so this map is well-defined.
@@ -289,7 +302,7 @@ def _merge_placeholder_player(
         session.scalars(
             select(PlayerExternalId.source).where(
                 PlayerExternalId.player_id == keeper_id,
-                PlayerExternalId.match_method != REJECTED_METHOD,
+                LIVE_MAPPING,
             )
         )
     )
@@ -299,17 +312,18 @@ def _merge_placeholder_player(
             PlayerExternalId.source, PlayerExternalId.external_id, PlayerExternalId.match_method
         ).where(PlayerExternalId.player_id == placeholder_id)
     ).all()
-    for source, external_id, match_method in rows:
+    for row in rows:
+        source, external_id = row.source, row.external_id
         key_filter = (
             PlayerExternalId.source == source,
             PlayerExternalId.external_id == external_id,
         )
-        if match_method != REJECTED_METHOD and source in keeper_sources:
+        if not _is_tombstone(row) and source in keeper_sources:
             # The keeper's one slot for this source is taken by a different id.
             orphaned.append((source, external_id))
             session.execute(delete(PlayerExternalId).where(*key_filter))
             continue
-        if match_method != REJECTED_METHOD:
+        if not _is_tombstone(row):
             keeper_sources.add(source)
         session.execute(update(PlayerExternalId).where(*key_filter).values(player_id=keeper_id))
     session.execute(delete(Player).where(Player.player_id == placeholder_id))
