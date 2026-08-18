@@ -45,13 +45,23 @@ Nothing works without this. No shortcuts here.
       charts, injuries, pbp). Release Parquet URLs read directly with httpx + Polars —
       **no `nflreadpy`, no `nfl_data_py`** (archived)
 - [x] `nfldata/games.csv` ingest → schedule + Vegas lines + roof state
-- [ ] Platform adapter interface + **Sleeper implementation** (no auth, no approval
-      dependency — the one that can't block us)
+- [x] Platform adapter interface + **Sleeper implementation** (no auth, no approval
+      dependency — the one that can't block us). `FantasyPlatformAdapter` Protocol +
+      normalized models, a thin in-house async client (300 req/min token bucket, tenacity
+      backoff), the `sleeper_players` lake job, `ffh.ingest.platform_sync.load_league`, and
+      `ffh league load sleeper <id>`. Ships the third mandatory crosswalk test,
+      `test_crosswalk_covers_all_rostered_players` (see [`DATABASE.md`](DATABASE.md) §3).
+      **Not yet smoke-tested against a live league** — fixtures are synthetic.
 - [ ] ADP + ECR ingest with `adp_stdev` ⚠️ required for VONA
 - [x] Engine purity test (no network/LLM imports in `ffh.engine`)
 
 **Exit criteria:** a league loads from Sleeper, every rostered player resolves through the
 crosswalk with zero unmatched, and nflverse data queries from DuckDB.
+
+*Status after ⑤:* the loader and the coverage test exist and are green against the fixture
+league; **ADP + ECR (⑥) is still open**, and with it the fourth mandatory crosswalk test
+`test_crosswalk_covers_top_300_adp`. Phase 0's exit criteria are met only once ⑥ lands and
+a real league has been loaded end to end.
 
 ---
 

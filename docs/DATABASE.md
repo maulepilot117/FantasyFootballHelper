@@ -635,13 +635,19 @@ test_crosswalk_no_duplicate_player_ids       no two external IDs from the same s
 test_crosswalk_low_confidence_reviewed       no confidence < 0.9 row is used unverified
 ```
 
-*Phase 0 status (PR ④):* `test_crosswalk_no_duplicate_player_ids` and
-`test_crosswalk_low_confidence_reviewed` ship in
+*Phase 0 status (PR ⑤ — 3 of 4 satisfied):* `test_crosswalk_no_duplicate_player_ids` and
+`test_crosswalk_low_confidence_reviewed` shipped with PR ④ in
 `backend/tests/crosswalk/test_crosswalk_invariants.py` under exactly those names.
-`test_crosswalk_covers_all_rostered_players` lands with the Sleeper adapter (PR ⑤ — it
-needs a fixture league) and `test_crosswalk_covers_top_300_adp` with ADP ingest (PR ⑥ — it
-needs an ADP snapshot). **Until both land, §3 is only half-tested**; Phase 0's exit
-criteria are not met by PR ④ alone.
+`test_crosswalk_covers_all_rostered_players` ships with the Sleeper adapter (PR ⑤) in
+`backend/tests/ingest/test_crosswalk_coverage.py`, and **certifies rungs 1–3**: the fixture
+registry was deliberately changed so that two rostered humans carry no DynastyProcess
+mapping — one must come back on `gsis`, the other on `exact_name` — rather than every human
+landing on rung 1 by construction, which is not what production looks like. Coverage is
+proved through `load_league`'s report, never by counting `player_external_ids` rows (a
+`source == "gsis"` resolution deliberately persists no row). Only
+`test_crosswalk_covers_top_300_adp` remains, and it lands with ADP ingest (PR ⑥ — it needs
+an ADP snapshot). **Until it lands, §3 is not fully tested**; Phase 0's exit criteria are
+not met by PRs ④ and ⑤ alone.
 
 ```sql
 CREATE TABLE crosswalk_unmatched (
@@ -706,11 +712,15 @@ ALTER TABLE leagues ADD CONSTRAINT leagues_my_team_fkey
 
 -- Roster snapshots. One row per player per team per week — keep the history,
 -- it's the input to "what did this manager need at the time".
+-- week 0 = a pre-season / post-draft snapshot (PR ⑤): Sleeper's /state/nfl reports a
+-- week during the preseason, so the loader uses state.week only when
+-- season_type == 'regular' and 0 otherwise. An explicit --week always wins.
 CREATE TABLE roster_slots (
     league_team_id UUID NOT NULL REFERENCES league_teams(league_team_id) ON DELETE CASCADE,
     week           SMALLINT NOT NULL,
     player_id      UUID NOT NULL REFERENCES players(player_id),
-    slot           TEXT NOT NULL,        -- QB|RB|WR|TE|FLEX|SUPER_FLEX|K|DST|BN|IR
+    slot           TEXT NOT NULL,        -- QB|RB|WR|TE|FLEX|SUPER_FLEX|REC_FLEX|
+                                         -- WRRB_FLEX|K|DST|DL|LB|DB|IDP_FLEX|BN|IR|TAXI
     is_starter     BOOLEAN NOT NULL,
     captured_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
     PRIMARY KEY (league_team_id, week, player_id)
@@ -756,6 +766,17 @@ which make the same-league invariant a database guarantee rather than an ingest
 convention. `leagues ↔ league_teams` is cyclic, so `leagues_my_team_fkey` is added by a
 separate `ALTER TABLE` after both tables exist (and dropped first on downgrade).
 `draft_picks.league_team_id` is deliberately NOT covered — see §5.
+
+***`roster_settings` has two shapes.*** The sentinel generic league (③,
+`seed_generic_league`) stores a **count map** `{"QB": 1, "RB": 2, …}`; platform-loaded
+leagues (⑤, `ffh.ingest.platform_sync`) store `RosterSettings.model_dump()` —
+`{"starters": [...], "bench": n, "ir": n, "taxi": n, "flex_composition": {...}}`.
+`is_superflex` is **not** in that JSON: it is a derived property on the model and lives in
+its own `leagues.is_superflex` column. Consumers must branch on shape (e.g.
+`"starters" in roster_settings`), never assume one. The same note sits beside the sentinel
+row in §6. `starters` uses the slot vocabulary of `roster_slots.slot` below, which in a
+real Sleeper league can include `SUPER_FLEX`, `REC_FLEX` and `WRRB_FLEX` as well as the
+plain positions; `IR` and `TAXI` are non-starter capacity, not starter slots.
 
 ---
 
@@ -897,8 +918,9 @@ All other `leagues` columns (`playoff_teams`, `playoff_start_wk`, `faab_budget`,
 *`roster_settings` has two shapes.* The sentinel row stores a **count map**
 (`GENERIC_ROSTER`: `{"QB": 1, "RB": 2, "WR": 2, "TE": 1, "FLEX": 1, "K": 1, "DST": 1,
 "BN": …}`). Platform-loaded leagues (`ffh.ingest.platform_sync`, PR ⑤) store
-`RosterSettings.model_dump()` — `{"starters": [...], "bench", "ir", "taxi",
-"flex_composition", "is_superflex"}`. Consumers must branch on shape (e.g.
+`RosterSettings.model_dump()` — `{"starters": [...], "bench": n, "ir": n, "taxi": n,
+"flex_composition": {...}}`. `is_superflex` is **not** in that JSON (it is a derived
+property, and has its own column). Consumers must branch on shape (e.g.
 `"starters" in roster_settings`), never assume one.
 
 ```sql

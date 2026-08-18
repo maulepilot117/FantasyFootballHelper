@@ -1,0 +1,17 @@
+[
+  {"roster_id": 1, "league_id": "1000000000000000001", "owner_id": "USER_ME",
+   "co_owners": null, "keepers": null, "player_map": null,
+   "starters": ["1","2","3","4","5","6","7","8","9","KC"],
+   "players": ["1","2","3","4","5","6","7","8","9","KC","10","11","12"],
+   "reserve": ["12"], "taxi": ["11"],
+   "metadata": {"record": "W", "streak": "1W"},
+   "settings": {"wins": 1, "losses": 0, "ties": 0, "fpts": 100, "fpts_decimal": 5,
+     "waiver_budget_used": 25, "waiver_position": 1, "total_moves": 2}},
+  {"roster_id": 2, "league_id": "1000000000000000001", "owner_id": "USER_OPP",
+   "co_owners": null, "keepers": null, "player_map": null,
+   "starters": ["13","14","15","16","17","18","19","0","20","SF"],
+   "players": ["13","14","15","16","17","18","19","20","SF","21"],
+   "reserve": null, "taxi": null, "metadata": null,
+   "settings": {"wins": 0, "losses": 1, "ties": 0, "fpts": 88, "fpts_decimal": 0,
+     "waiver_budget_used": 0, "waiver_position": 2, "total_moves": 0}}
+]

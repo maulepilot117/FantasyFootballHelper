@@ -1,0 +1,11 @@
+[
+  {"transaction_id": "TXN1", "type": "waiver", "status": "complete", "leg": 1,
+   "created": 1758684054016, "status_updated": 1758698028886, "creator": "USER_ME",
+   "adds": {"90": 1}, "drops": {"10": 1}, "roster_ids": [1], "consenter_ids": [1],
+   "draft_picks": [], "waiver_budget": [],
+   "settings": {"seq": 1, "waiver_bid": 25}, "metadata": {"notes": "ok"}},
+  {"transaction_id": "TXN2", "type": "free_agent", "status": "complete", "leg": 1,
+   "created": 1758684154016, "status_updated": 1758684154016, "creator": "USER_OPP",
+   "adds": null, "drops": {"21": 2}, "roster_ids": [2], "consenter_ids": [2],
+   "draft_picks": [], "waiver_budget": [], "settings": null, "metadata": null}
+]

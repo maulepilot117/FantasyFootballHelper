@@ -1,0 +1,19 @@
+{
+  "draft_id": "2000000000000000001",
+  "league_id": "1000000000000000001",
+  "type": "snake",
+  "status": "complete",
+  "season": "2026",
+  "season_type": "regular",
+  "sport": "nfl",
+  "created": 1745797560914,
+  "creators": ["USER_ME"],
+  "start_time": 1756074607722,
+  "last_picked": 1756083970192,
+  "draft_order": {"USER_ME": 1, "USER_OPP": 2},
+  "slot_to_roster_id": {"1": 1, "2": 2},
+  "metadata": {"name": "FFH Fixture League", "scoring_type": "half_ppr"},
+  "settings": {"rounds": 13, "teams": 2, "budget": 0, "pick_timer": 30,
+    "slots_qb": 1, "slots_rb": 2, "slots_wr": 2, "slots_te": 1, "slots_flex": 1,
+    "slots_super_flex": 1, "slots_k": 1, "slots_def": 1, "slots_bn": 3}
+}

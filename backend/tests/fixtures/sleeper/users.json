@@ -1,0 +1,7 @@
+[
+  {"user_id": "USER_ME", "display_name": "chris", "avatar": null, "is_bot": null,
+   "is_owner": true, "league_id": "1000000000000000001", "settings": null,
+   "metadata": {"team_name": "Fixture Me"}},
+  {"user_id": "USER_OPP", "display_name": "opponent", "avatar": null, "is_bot": null,
+   "is_owner": false, "league_id": "1000000000000000001", "settings": null, "metadata": {}}
+]

@@ -155,8 +155,11 @@ first** — it is the only one that cannot block on an external approval.
 
 ### Sleeper — primary
 
-Base `https://api.sleeper.app/v1`. **No auth, no key.** Rate limit: stay under
-**1000 req/min** or risk an IP block (IP-based; no key identifies you, so back off properly).
+Base `https://api.sleeper.app/v1`. **No auth, no key.** Sleeper's ceiling is
+**1000 req/min** and **IP-based** — no key identifies you, so a block hits the whole
+household. `ffh.adapters.sleeper.client` therefore self-imposes **≤ 300 req/min with a
+burst of 30** (`TokenBucket(rate_per_min=300, burst=30)`) and backs off on 429/5xx with
+exponential jitter, honouring `Retry-After` on a 429 up to a 60 s cap.
 Read-only by design — the API cannot write, so lineup sets and waiver claims must be done
 by hand in the app.
 
@@ -167,13 +170,64 @@ by hand in the app.
 /league/{id}  /rosters  /users  /matchups/{wk}  /transactions/{round}  /traded_picks
 /league/{id}/drafts
 /draft/{id}  /picks  /traded_picks
-/players/nfl                                 ~5MB — cache to disk, call ≤1×/day
+/players/nfl                                 14.6MB uncompressed — lake, ≤1×/day
 /players/nfl/trending/{add|drop}?lookback_hours=24&limit=25
 ```
 
 **Live draft:** poll `/draft/{id}` and watch `last_picked` (epoch ms) as a cheap change
 detector; fetch `/draft/{id}/picks` only when it advances. 1–2s polling is ~0.1% of the
-rate budget. No websocket exists.
+rate budget. No websocket exists. The shipped `draft_changed_since` cursor is
+`f"{last_picked or 0}:{status}"`, not `last_picked` alone — a draft that opens or completes
+without a pick is a change too.
+
+**Verified live 2026-08-16** (shapes recorded in
+`docs/superpowers/plans/2026-08-15-phase0-05-adapter-sleeper.md`; where this record
+disagrees with your priors, the record wins):
+
+- `/state/nfl` returns `week` **even during the preseason** (`{"week":2,"season_type":"pre"}`
+  on 2026-08-16). `week` is only a regular-season week when `season_type == "regular"`;
+  FFH uses week **0** for a pre-season roster snapshot (`roster_slots.week` is
+  `SMALLINT NOT NULL` and part of the PK, so 0 is legal and non-colliding).
+- `/players/nfl` is **14.6 MB uncompressed** (~5 MB gzipped), a **dict keyed by player id**
+  with 12,219 entries, of which **32 are team defenses keyed by team abbreviation**
+  (`"KC"`) with no `full_name` and no `gsis_id`. **8,326 entries have a null `gsis_id`.**
+- `/players/nfl` sends an `ETag` but **ignores `If-None-Match`** — a conditional GET still
+  returns 200 with the full body (verified: `status=200 size=14639113`). Freshness is
+  therefore a **sha256 of the body**, stored in `ingest_runs.source_etag` as
+  `sha256:<hex>`; the ≤1×/day partition guard is the real protection. Consequence to know:
+  when the digest matches, **no partition lands that day** and `LakePlayerCatalog` keeps
+  serving the older `scrape_date=` partition — which is correct, not stale.
+- `rosters[].starters` is ordered to match `roster_positions` minus `BN`; an unfilled slot
+  is the string **`"0"`**, which is not a player id and must be filtered before it reaches
+  the crosswalk. Pre-draft rosters are all `"0"` with `players: []`. An **empty or null**
+  `starters` is treated as "all slots empty, everyone on BN"; only a *non-empty* length
+  disagreement with `roster_positions` is a hard error.
+- `settings.type` is `0` redraft / `1` keeper / `2` dynasty. `settings.waiver_type == 2`
+  means FAAB; `waiver_budget` is present but meaningless for `0`/`1`.
+- Superflex is detected by `SUPER_FLEX` in `roster_positions` — there is no boolean.
+- `scoring_settings` is a flat `dict[str, float]` (132 keys in the verified league) with
+  **no format field**. `rec` was `0.5` in one live league and `1.0` in another — format is
+  derived, never assumed, and is `"custom"` when `rec` is absent entirely.
+- `/draft/{id}` adds `slot_to_roster_id` (keys are slot **strings**); `/league/{id}/drafts`
+  does not. `last_picked`, `start_time` and `draft_order` are **null before the draft opens**.
+- `/draft/{id}/picks` carries **no per-pick timestamp**, so `draft_picks.picked_at` is
+  always NULL from Sleeper. `metadata.amount` is the auction bid **as a string**, and `"0"`
+  in a snake draft.
+- `/league/{id}/matchups/{wk}` returns one row **per roster**; pairs are grouped by
+  `matchup_id`, which is `null` for a bye. `custom_points` (a commissioner override) wins
+  over `points` when non-null.
+- `/league/{id}/transactions/{round}` carries epoch-**ms** `created` / `status_updated`, and
+  a `commissioner` type alongside `free_agent` / `waiver` / `trade`.
+
+**Sleeper `DEF` → `DST` at the adapter boundary.** `roster_slots.slot` and the crosswalk
+both use `DST`. A defense has no `full_name` in the blob but **does** carry `first_name`
+(`"Kansas City"`) and `last_name` (`"Chiefs"`), so `PlayerRef.name` is
+`f"{first_name} {last_name}"`, falling back to the **team abbreviation** (which is also its
+Sleeper `player_id`) only when both parts are absent. `PlayerRef.team` stays the
+abbreviation. The abbreviation is *not* privileged for the crosswalk's sake: ④'s
+`normalize_dst` canonicalizes `KC`, `Kansas City`, `Chiefs` and `Kansas City Chiefs` alike
+to `kc dst`, and `canonical_dst_key` is **name-first** — so the real name costs the
+crosswalk nothing and is what an operator meets in the `crosswalk_unmatched` review queue.
 
 **Undocumented endpoints on `api.sleeper.com` (verified live, higher break risk, high value):**
 
@@ -188,10 +242,34 @@ rate budget. No websocket exists.
 The **ownership + start-rate** endpoint is the single best signal on the platform and no
 other provider exposes it. Wrap all undocumented endpoints with cached last-known-good.
 
-**License:** non-commercial use only. Self-hosted personal use is fine.
-**Library:** `sleeper-api-wrapper` 1.2.1 (dtsong fork, MIT). ⚠️ The original
-`SwapnikKatkoori/sleeper-api-wrapper` is abandoned and outranks the fork in search.
-The API is simple enough that a thin in-house client is defensible.
+**License:** non-commercial use only. Self-hosted personal use is fine — that is the whole
+justification for reading this API at all, and it is why the fixtures below exist only to
+test this personal project.
+**Library:** FFH ships a thin in-house async client (`ffh.adapters.sleeper.client`) with a
+300 req/min token bucket; **no third-party wrapper is a dependency.** (For the record:
+`sleeper-api-wrapper` 1.2.1, the dtsong fork, MIT, is the maintained one — the original
+`SwapnikKatkoori/sleeper-api-wrapper` is abandoned and outranks the fork in search. We use
+neither.)
+
+**How `/players/nfl` is consumed.** The 14.6 MB blob never touches the request path. The
+`sleeper_players` IngestJob (`ffh.ingest.sleeper_players`, run via
+`ffh ingest run sleeper_players`) lands it to `raw/sleeper/players/scrape_date=YYYY-MM-DD/`
+as Parquet at most once a day — every column Utf8, because `espn_id` / `yahoo_id` arrive as
+ints and the crosswalk joins them as text. Freshness is the sha256 described above; the
+once-a-day guarantee is the lake's refusal to overwrite today's partition. Blob entries
+with no name at all are excluded, logged and counted (they cannot be crosswalked).
+`SleeperAdapter.get_free_agents` reads the newest partition through `LakePlayerCatalog`;
+with no catalog configured it raises `PlatformError` rather than returning an empty list.
+
+**Fixture strategy.** `backend/tests/fixtures/sleeper/` is a **hand-written synthetic
+corpus** (`league_id=1000000000000000001`, `draft_id=2000000000000000001`) authored to match
+the live-verified shapes above — it is the unit-test corpus, and the tests are bound to its
+ids, counts and names. `backend/scripts/record_sleeper_fixtures.py` (marked `network`,
+excluded from CI by `addopts = "-m 'not network'"`) records a **real** league to the
+separate directory `backend/tests/fixtures/sleeper_live/`; it buffers every payload and
+refuses to write an empty list unless `--allow-empty`, so a pre-draft league cannot silently
+blank the corpus. **CI never touches the network** — every test drives `respx` mounted on
+`settings.sleeper_base_url`.
 
 ### ESPN — secondary
 

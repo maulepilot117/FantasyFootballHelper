@@ -1,0 +1,22 @@
+{
+  "league_id": "1000000000000000001",
+  "name": "FFH Fixture League",
+  "season": "2026",
+  "season_type": "regular",
+  "sport": "nfl",
+  "status": "in_season",
+  "total_rosters": 2,
+  "draft_id": "2000000000000000001",
+  "previous_league_id": null,
+  "avatar": null,
+  "shard": 1,
+  "metadata": {"auto_continue": "on"},
+  "roster_positions": ["QB","RB","RB","WR","WR","TE","FLEX","SUPER_FLEX","K","DEF","BN","BN","BN"],
+  "scoring_settings": {"pass_yd": 0.04, "pass_td": 4.0, "pass_int": -1.0, "rush_yd": 0.1,
+    "rush_td": 6.0, "rec": 0.5, "rec_yd": 0.1, "rec_td": 6.0, "fum_lost": -2.0,
+    "pass_2pt": 2.0, "rec_2pt": 2.0, "rush_2pt": 2.0, "fgm_0_19": 3.0, "fgm_30_39": 3.0,
+    "xpm": 1.0, "sack": 1.0, "int": 2.0, "pts_allow_0": 10.0, "fgm_yds_over_30": 0.0},
+  "settings": {"num_teams": 2, "playoff_teams": 2, "playoff_week_start": 15,
+    "waiver_budget": 100, "waiver_type": 2, "type": 0, "taxi_slots": 1, "reserve_slots": 1,
+    "draft_rounds": 13, "max_keepers": 1, "start_week": 1, "leg": 1, "trade_deadline": 11}
+}
