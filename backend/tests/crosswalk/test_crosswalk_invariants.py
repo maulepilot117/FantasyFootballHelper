@@ -43,10 +43,14 @@ LOW_CONFIDENCE_PARAMS = {"threshold": USABLE_CONFIDENCE - CONFIDENCE_EPSILON}
 def populated(db_session, seeded_registry):
     """Registry + DP ids + a spread of ladder outcomes (exact, fuzzy pending, unmatched)."""
     apply_playerids(db_session, read_playerids_csv(FIXTURE.read_bytes()))
-    resolve(db_session, "sleeper", "4881", "Lamarr Jackson", "QB", "BAL")  # fuzzy → pending
+    # rung 4 and rung 5 must withhold a Resolution *here*, at the moment the row is minted.
+    # Asserting it only after re-resolving (below) would miss a regression that returns the
+    # fuzzy Resolution on the first call: the second call goes through rung 1, which
+    # re-applies is_usable independently and would still return None.
+    assert resolve(db_session, "sleeper", "4881", "Lamarr Jackson", "QB", "BAL") is None  # fuzzy
     resolve(db_session, "espn", "3916387", "Lamar Jackson", "QB", "BAL")  # exact 0.95
     resolve(db_session, "sleeper", "KC", "Kansas City Chiefs", "DEF", "KC")  # rung 1 (from DP row)
-    resolve(db_session, "sleeper", "99999", "Nobody Nowhere", "QB", "FA")  # unmatched
+    assert resolve(db_session, "sleeper", "99999", "Nobody Nowhere", "QB", "FA") is None  # rung 5
     return seeded_registry
 
 
@@ -72,14 +76,47 @@ def test_crosswalk_no_duplicate_player_ids(db_session, populated):
     # migration that widened or re-keyed the PK (e.g. adding `season`, or moving to a
     # surrogate id) would let one (source, external_id) point at two players, and that
     # migration must fail this test.
-    pk_columns = {c.name for c in PlayerExternalId.__table__.primary_key.columns}
-    assert pk_columns == {"source", "external_id"}, pk_columns
+    #
+    # Read it off the LIVE database, which this fixture built with `alembic upgrade head`:
+    # a metadata-only check duplicates tests/db/test_models_reference.py and can only fail
+    # when the *model* changes, which is the one direction ruling 1 did not care about.
+    live_pk = {
+        r[0]
+        for r in db_session.execute(
+            text(
+                """
+                SELECT a.attname
+                FROM pg_index i
+                JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = ANY(i.indkey)
+                WHERE i.indrelid = 'player_external_ids'::regclass AND i.indisprimary
+                """
+            )
+        )
+    }
+    assert live_pk == {"source", "external_id"}, live_pk
+    # …and the model agrees with it, so ORM-side writes cannot drift from the constraint.
+    assert {c.name for c in PlayerExternalId.__table__.primary_key.columns} == live_pk
 
-    # ── The ladder cannot break direction A: a second sleeper id claiming an already
-    # mapped player is refused (rungs 3/4 pre-check (source, player_id)) and routed to
-    # crosswalk_unmatched rather than silently dropped.
+    # ── The ladder cannot break direction A. The gsis_id is mandatory in this call: without
+    # it the name/position rungs are the only way in, and `_exact`/`_fuzzy` already exclude
+    # players holding an id for the source (`Player.player_id.not_in(_mapped_for_source)`),
+    # so the call would fall to rung 5 and never reach the guard under test. With it, rung 2
+    # matches Mahomes directly and `resolve._persist`'s (source, player_id) pre-check is the
+    # ONLY thing that can refuse the write — which it does, routing the id to
+    # crosswalk_unmatched rather than silently dropping it.
     mahomes = populated["00-0033873"]
-    assert resolve(db_session, "sleeper", "4046-dupe", "Patrick Mahomes", "QB", "KC") is None
+    assert (
+        resolve(
+            db_session,
+            "sleeper",
+            "4046-dupe",
+            "Patrick Mahomes",
+            "QB",
+            "KC",
+            gsis_id="00-0033873",
+        )
+        is None
+    )
     assert (
         db_session.execute(
             text(
@@ -134,7 +171,9 @@ def test_crosswalk_no_duplicate_player_ids(db_session, populated):
 def test_crosswalk_low_confidence_reviewed(db_session, populated):
     """No confidence < 0.9 row is used unverified: resolve never returns one."""
     unverified = db_session.execute(text(LOW_CONFIDENCE_SQL), LOW_CONFIDENCE_PARAMS).all()
-    assert len(unverified) >= 1  # the fixture created a pending fuzzy row on purpose
+    # Exactly one: the batch mints a single rung-4 row (sleeper:4881). `>= 1` would let a
+    # regression that starts minting extra sub-threshold mappings slip through.
+    assert len(unverified) == 1, unverified
 
     for source, external_id, _pid in unverified:
         assert resolve(db_session, source, external_id) is None
