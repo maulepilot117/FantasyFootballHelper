@@ -31,8 +31,12 @@ Nothing works without this. No shortcuts here.
 - [x] Dockerfiles — `python:3.13-slim-bookworm`, **not Alpine**
 - [x] CI on `ubuntu-24.04-arm`: lint → test → build → push GHCR. **No QEMU.**
 - [x] Postgres schema + initial Alembic migration ([`DATABASE.md`](DATABASE.md))
-- [ ] **★ Player ID crosswalk ★** — DynastyProcess ingest, resolution ladder, unmatched
-      table, and the four mandatory coverage tests. **Highest-risk component; do it first.**
+- [x] **★ Player ID crosswalk ★** — DynastyProcess ingest, resolution ladder, unmatched
+      table, `ffh crosswalk report|seed|verify|resolve-unmatched`.
+      **Highest-risk component; do it first.** Two of the four mandatory coverage tests
+      ship with it; `test_crosswalk_covers_all_rostered_players` lands with the Sleeper
+      adapter and `test_crosswalk_covers_top_300_adp` with ADP ingest (see
+      [`DATABASE.md`](DATABASE.md) §3)
 - [x] nflverse ingest → Parquet lake (players, stats_player_week, snap counts, depth
       charts, injuries, pbp). Release Parquet URLs read directly with httpx + Polars —
       **no `nflreadpy`, no `nfl_data_py`** (archived)
