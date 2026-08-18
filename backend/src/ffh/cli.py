@@ -1,4 +1,5 @@
 import json
+import uuid
 from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
@@ -211,7 +212,7 @@ def crosswalk_verify(
     ),
     external_id: str = typer.Argument(...),
     reject: bool = typer.Option(
-        False, "--reject", help="Delete the mapping instead of verifying it."
+        False, "--reject", help="Tombstone the mapping instead of verifying it."
     ),
 ) -> None:
     """Human review of a crosswalk row: mark verified (default) or reject."""
@@ -223,14 +224,48 @@ def crosswalk_verify(
             if not reject:
                 # The Task-5 conflict path leaves the same key in BOTH player_external_ids
                 # and crosswalk_unmatched; accepting the mapping closes the queue entry.
-                # `--reject` deliberately leaves it OPEN: the id is now unmapped and still
-                # needs attention (reject_mapping parks it "so it is not forgotten").
+                # `--reject` deliberately leaves it OPEN: the row becomes a `rejected`
+                # tombstone (so no sync can re-mint the pairing) and the id is now
+                # unmapped, so it must stay on the gate until `ffh crosswalk map` or
+                # `ffh crosswalk resolve-unmatched` rules on it.
                 mark_unmatched_resolved(session, source, external_id)
             session.commit()
     if not ok:
-        typer.echo(f"no crosswalk row for {source}:{external_id}", err=True)
+        hint = (
+            ""
+            if reject
+            # verify_mapping also refuses a `rejected` tombstone: stamping verified_at on
+            # one would resurrect the pairing a human threw out.
+            else " — missing, or already a `rejected` tombstone (`ffh crosswalk map` re-maps it)"
+        )
+        typer.echo(f"no crosswalk row for {source}:{external_id}{hint}", err=True)
         raise typer.Exit(code=1)
     typer.echo(("rejected " if reject else "verified ") + f"{source}:{external_id}")
+
+
+@crosswalk_app.command("map")
+def crosswalk_map(
+    source: Annotated[
+        str, typer.Argument(help="sleeper|espn|yahoo|pfr|fantasypros|sportradar|rotowire")
+    ],
+    external_id: Annotated[str, typer.Argument()],
+    player_id: Annotated[uuid.UUID, typer.Argument(help="players.player_id (UUID).")],
+) -> None:
+    """Map an id to a player by hand: `manual`, confidence 1.0, verified.
+
+    The operator path from `crosswalk_unmatched` to *mapped* (`resolve-unmatched` only
+    silences a queue entry), and the only way out of a `--reject` tombstone.
+    """
+    from ffh.crosswalk.review import map_mapping
+
+    with _session_scope() as session:
+        result = map_mapping(session, source, external_id, player_id)
+        if result.ok:
+            session.commit()
+    if not result.ok:
+        typer.echo(f"{source}:{external_id} not mapped: {result.detail}", err=True)
+        raise typer.Exit(code=1)
+    typer.echo(f"mapped {source}:{external_id} -> {player_id} ({result.status})")
 
 
 @crosswalk_app.command("resolve-unmatched")

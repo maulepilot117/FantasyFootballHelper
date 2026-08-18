@@ -67,12 +67,30 @@ NAME_CASES = [
     ("Chig Okonkwo", "chig okonkwo"),
     ("Jr.", "jr"),  # a bare suffix is left alone — never return ""
     ("", ""),
+    # Non-ASCII letters are FOLDED, not destroyed: `[^a-z0-9 ]` used to run after
+    # .lower() and turn "Andrés Peña" into "andr s pe a" — an accented spelling could
+    # then never match the ASCII spelling another source publishes.
+    ("Andrés Peña", "andres pena"),
+    ("Andres Pena", "andres pena"),
+    ("ANDRÉS PEÑA", "andres pena"),
+    ("Björn Söderström", "bjorn soderstrom"),
+    ("José Ángel Muñoz", "jose angel munoz"),
+    ("Kalié Duplechain", "kalie duplechain"),
 ]
 
 
 @pytest.mark.parametrize(("raw", "expected"), NAME_CASES)
 def test_normalize_name(raw: str, expected: str) -> None:
     assert normalize_name(raw) == expected
+
+
+def test_accented_names_do_not_collapse_together() -> None:
+    """Folding must not merge two different people: the old `[^a-z0-9 ]` substitution
+    turned every accented letter into a space, so distinct names could share a key."""
+    assert normalize_name("Peña") != normalize_name("Pena Rodriguez")
+    assert len({normalize_name(n) for n in ("Andrés Peña", "Andrés Peñaloza")}) == 2
+    # …and the folded form is exactly what the ASCII spelling produces.
+    assert normalize_name("Andrés Peña") == normalize_name("Andres Pena") == "andres pena"
 
 
 def test_normalize_name_is_idempotent() -> None:
@@ -118,6 +136,11 @@ DST_CASES = [
     ("Kansas City Chiefs DST", "kc dst"),
     ("Kansas City Chiefs Defense", "kc dst"),
     ("KAN", "kc dst"),  # PFR
+    ("CRD", "ari dst"),  # PFR — the five abbreviations that look nothing like the team
+    ("RAV", "bal dst"),  # PFR
+    ("HTX", "hou dst"),  # PFR
+    ("CLT", "ind dst"),  # PFR
+    ("RAI", "lv dst"),  # PFR
     ("KCC", "kc dst"),  # MFL / DynastyProcess
     ("kc dst", "kc dst"),  # canonical form is a fixed point
     ("Los Angeles Rams", "la dst"),

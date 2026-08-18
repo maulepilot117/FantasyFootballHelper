@@ -25,7 +25,7 @@ from ffh.crosswalk.normalize import (
     normalize_team,
 )
 from ffh.crosswalk.registry import iter_gsis_to_player_id
-from ffh.crosswalk.resolve import close_unmatched
+from ffh.crosswalk.resolve import REJECTED_METHOD, close_unmatched, displaceable, upsert_unmatched
 from ffh.db.models import CrosswalkUnmatched, Player, PlayerExternalId
 from ffh.ingest.base import HttpIngestJob, IngestValidationError, register
 from ffh.ingest.lake import scrape_date
@@ -81,6 +81,10 @@ class CrosswalkConflictError(RuntimeError):
 
 @dataclass(frozen=True)
 class CrosswalkApplyReport:
+    """Every id cell in the file ends in exactly one of these buckets — the four
+    ``*ambiguous*``/``blocked*`` tuples are also **queued in ``crosswalk_unmatched``**, so a
+    known-but-unmapped id can never leave ``ffh crosswalk report`` green."""
+
     inserted: int
     updated: int
     unchanged: int
@@ -88,7 +92,16 @@ class CrosswalkApplyReport:
     skipped_no_ids: int
     skipped_position: int
     skipped_dst: int
-    ambiguous: tuple[tuple[str, str], ...]
+    skipped_no_person_key: int
+    #: DynastyProcess contradicts itself (one id on two players, or one player with two
+    #: ids for a source) — nothing was written for these keys.
+    ambiguous_in_file: tuple[tuple[str, str], ...]
+    #: A pre-existing DB row (human/DP/verified) holds the player's one slot for the source.
+    blocked_by_existing: tuple[tuple[str, str], ...]
+    #: A human rejected exactly this pairing (`match_method='rejected'` tombstone).
+    blocked_by_rejection: tuple[tuple[str, str], ...]
+    #: Unverified guesses evicted by DP's 1.0 fact; each is back on the review queue.
+    displaced: tuple[tuple[str, str], ...]
 
 
 def read_playerids_csv(raw: bytes) -> pl.DataFrame:
@@ -107,7 +120,9 @@ def read_playerids_csv(raw: bytes) -> pl.DataFrame:
     )
 
 
-def _validate(df: pl.DataFrame) -> pl.DataFrame:
+def _validate(df: pl.DataFrame) -> tuple[pl.DataFrame, int]:
+    """Type-check the id columns and drop rows with no person key. Returns
+    ``(frame, skipped_no_person_key)``."""
     missing = DP_REQUIRED_COLUMNS - set(df.columns)
     if missing:
         raise DynastyProcessError(f"DynastyProcess frame missing columns: {sorted(missing)}")
@@ -130,7 +145,18 @@ def _validate(df: pl.DataFrame) -> pl.DataFrame:
             casts.append(pl.col(c).cast(pl.Int64).cast(pl.Utf8))
         else:
             casts.append(pl.col(c).cast(pl.Utf8))
-    return df.with_columns(casts)
+    df = df.with_columns(casts)
+    # A row with neither gsis_id nor mfl_id has no person key at all: its placeholder
+    # would be the literal string "mfl:None", which every such row shares — one invented
+    # `players` row silently accumulating ids belonging to several different people. The
+    # ambiguity pass only catches the overlapping case (two rows sharing an id), never the
+    # disjoint one. Drop them: counted and logged, never silently merged.
+    has_person_key = pl.col("gsis_id").is_not_null() | pl.col("mfl_id").is_not_null()
+    kept = df.filter(has_person_key)
+    skipped = df.height - kept.height
+    if skipped:
+        log.warning("crosswalk.dynastyprocess.skipped_no_person_key", count=skipped)
+    return kept, skipped
 
 
 def _split_name(name: str) -> tuple[str | None, str | None]:
@@ -158,7 +184,7 @@ def apply_playerids(session: Session, df: pl.DataFrame) -> CrosswalkApplyReport:
     transaction; a ``CrosswalkConflictError`` is raised before any write — including
     placeholder ``players`` rows, which are only created after the conflict scan passes.
     """
-    df = _validate(df)
+    df, skipped_no_person_key = _validate(df)
     n_in = df.height
 
     # 1. positions
@@ -188,24 +214,62 @@ def apply_playerids(session: Session, df: pl.DataFrame) -> CrosswalkApplyReport:
     existing_rows = session.scalars(
         select(PlayerExternalId).where(PlayerExternalId.source.in_(sorted(DP_ID_COLUMNS.values())))
     ).all()
+    # Tombstones (`match_method='rejected'`) are NOT mappings: they must not satisfy an
+    # id lookup, must not trip the conflict scan, and must not occupy the player's one
+    # slot for the source (the unique index is partial on the same predicate). What they
+    # DO is veto re-minting the exact pairing a human rejected.
+    tombstones: dict[tuple[str, str], PlayerExternalId] = {
+        (r.source, r.external_id): r for r in existing_rows if r.match_method == REJECTED_METHOD
+    }
     existing: dict[tuple[str, str], PlayerExternalId] = {
-        (r.source, r.external_id): r for r in existing_rows
+        (r.source, r.external_id): r for r in existing_rows if r.match_method != REJECTED_METHOD
     }
-    # (source, player_id) → external_id already held: the DB enforces one id per source
-    # per player (player_external_ids_source_player_uidx), so this map is well-defined.
-    held_by_player: dict[tuple[str, uuid.UUID], str] = {
-        (r.source, r.player_id): r.external_id for r in existing_rows
+    # (source, player_id) → the row already holding that slot: the DB enforces one id per
+    # source per player (player_external_ids_source_player_uidx), so this map is well-defined.
+    held_by_player: dict[tuple[str, uuid.UUID], PlayerExternalId] = {
+        (r.source, r.player_id): r for r in existing_rows if r.match_method != REJECTED_METHOD
     }
+    # Slots claimed during THIS apply (by an insert or a displacement).
+    claimed: set[tuple[str, uuid.UUID]] = set()
 
     def _existing_id_hit(row: dict[str, object]) -> str | None:
-        """Any of the row's ids already mapped → that player (idempotent for rookies)."""
+        """Any of the row's ids already mapped → that player (idempotent for rookies).
+
+        Tombstones count *for identity only*: the rejection ruled on one id↔player
+        pairing, not on who this DP row is about. Ignoring them would send a gsis-less row
+        down the placeholder path on the next seed and mint a DUPLICATE `players` row —
+        exactly the silent wrongness the crosswalk exists to prevent. The rejected id
+        itself is still refused below (`blocked_by_rejection`); only the row's *other* ids
+        follow the identity.
+        """
         for col, source in DP_ID_COLUMNS.items():
             ext = row[col]
             if ext:
-                hit = existing.get((source, ext))
+                hit = existing.get((source, ext)) or tombstones.get((source, ext))
                 if hit is not None:
                     return str(hit.player_id)
         return None
+
+    # (source, external_id) → the DP row's raw name/position/team, for the review-queue
+    # payload of every id this apply refuses to write. First occurrence wins (CSV order).
+    raw_context: dict[tuple[str, str], tuple[str | None, str | None, str | None]] = {}
+    for row in with_ids.iter_rows(named=True):
+        for col, source in DP_ID_COLUMNS.items():
+            ext = row[col]
+            if ext:
+                raw_context.setdefault((source, ext), (row["name"], row["position"], row["team"]))
+
+    def _queue(source: str, external_id: str) -> None:
+        """Park a known-but-unmapped DynastyProcess id on the review queue.
+
+        Global Constraint / DATABASE.md §3 rung 5: every unresolved id lands in
+        `crosswalk_unmatched`. A report field and a log line are not the gate — without
+        this, `ffh crosswalk report` exits 0 while fantasy-relevant ids are unmapped.
+        """
+        name, position, team = raw_context.get((source, external_id), (None, None, None))
+        upsert_unmatched(
+            session, source, external_id, raw_name=name, raw_position=position, raw_team=team
+        )
 
     player_key: list[str | None] = []  # str(uuid) known / "gsis:…"/"mfl:…" placeholders
     skipped_dst = 0
@@ -297,12 +361,16 @@ def apply_playerids(session: Session, df: pl.DataFrame) -> CrosswalkApplyReport:
             count=len(ambiguous),
             sample=sorted(ambiguous)[:10],
         )
+        for source, ext in sorted(ambiguous):
+            _queue(source, ext)
     # Deterministic apply/report order regardless of CSV row order.
     clean = clean.sort(["source", "external_id"])
 
     # 5. conflict scan (vs the DB) — BEFORE any write, including placeholder players.
     # Placeholder rows cannot conflict: step 3 assigned them a placeholder precisely
-    # because none of their ids exist in player_external_ids.
+    # because none of their ids exist in player_external_ids. `existing` excludes
+    # tombstones, so a rejected pairing does not raise here — step 7 rules on it (and a
+    # rejection would otherwise fail every subsequent seed run with exit 2).
     conflicts: list[tuple[str, str, uuid.UUID, uuid.UUID]] = []
     for r in clean.iter_rows(named=True):
         if r["player_key"].startswith(_PLACEHOLDER_PREFIXES):
@@ -349,53 +417,99 @@ def apply_playerids(session: Session, df: pl.DataFrame) -> CrosswalkApplyReport:
     # 7. partition against existing rows, guarding (source, player_id) uniqueness.
     inserts: list[dict[str, object]] = []
     updates: list[tuple[str, str]] = []
+    repoints: list[tuple[str, str, uuid.UUID]] = []
     unchanged = 0
-    db_ambiguous: list[tuple[str, str]] = []
+    blocked_by_existing: list[tuple[str, str]] = []
+    blocked_by_rejection: list[tuple[str, str]] = []
+    displaced: list[tuple[str, str]] = []
     for r in clean.iter_rows(named=True):
+        source, ext = r["source"], r["external_id"]
         pid = created.get(r["player_key"]) or uuid.UUID(r["player_key"])
-        ex = existing.get((r["source"], r["external_id"]))
+        tomb = tombstones.get((source, ext))
+        if tomb is not None and tomb.player_id == pid:
+            # A human rejected exactly this pairing. DP re-asserting it is not new
+            # evidence — the tombstone stands and the id stays on the gate.
+            blocked_by_rejection.append((source, ext))
+            log.warning(
+                "crosswalk.dynastyprocess.blocked_by_rejection",
+                source=source,
+                external_id=ext,
+                player_id=str(pid),
+            )
+            _queue(source, ext)
+            continue
+        ex = existing.get((source, ext))
         if ex is not None:
             # ex.player_id == pid here: step 5 raised on any mismatch.
             if ex.match_method == DP_METHOD and ex.confidence == DP_CONFIDENCE:
                 unchanged += 1
             else:
-                updates.append((r["source"], r["external_id"]))
+                updates.append((source, ext))
             continue
-        held = held_by_player.get((r["source"], pid))
-        if held is not None:
+        held = held_by_player.get((source, pid))
+        if held is not None or (source, pid) in claimed:
             # The player already holds a different id from this source (unique index
-            # player_external_ids_source_player_uidx forbids a second). The holder — a
-            # pre-existing DB row — wins, because DP must never displace an existing
-            # mapping; the loser is reported, never raised. A *batch-internal* collision
-            # is defence-in-depth only and cannot currently fire: the many_ids ambiguity
-            # pass already dropped every (source, player_key) holding two ids, and two
-            # distinct player_keys never resolve to one player_id (uuid keys are the
-            # pid; placeholder keys map to freshly created, distinct players). If that
-            # ever regresses, clean's (source, external_id) sort still makes the
-            # lexicographically smallest external_id win deterministically.
-            db_ambiguous.append((r["source"], r["external_id"]))
-            log.warning(
-                "crosswalk.dynastyprocess.duplicate_source_for_player",
-                source=r["source"],
-                external_id=r["external_id"],
-                held_external_id=held,
-                player_id=str(pid),
+            # player_external_ids_source_player_uidx forbids a second).
+            if held is not None and displaceable(held):
+                # AUTHORITY RULE: DP's 1.0 fact outranks an unverified `exact_name` 0.95 /
+                # `fuzzy` 0.89 *guess* — the same ruling rung 1's upgrade path already
+                # makes. The guess is evicted and ITS id goes back on the review queue;
+                # keeping it would enshrine a low-confidence guess over a 1.0 fact.
+                log.warning(
+                    "crosswalk.dynastyprocess.incumbent_displaced",
+                    source=source,
+                    external_id=ext,
+                    displaced_external_id=held.external_id,
+                    displaced_method=held.match_method,
+                    player_id=str(pid),
+                )
+                displaced.append((source, held.external_id))
+                session.delete(held)
+                session.flush()
+                del held_by_player[(source, pid)]
+                existing.pop((source, held.external_id), None)
+                _queue(source, held.external_id)
+            else:
+                # A human/DP/verified row — or a slot this batch already claimed (defence
+                # in depth: the many_ids ambiguity pass should have removed those, and
+                # clean's (source, external_id) sort keeps the winner deterministic).
+                # The holder wins; the loser is queued, reported, never raised.
+                blocked_by_existing.append((source, ext))
+                log.warning(
+                    "crosswalk.dynastyprocess.duplicate_source_for_player",
+                    source=source,
+                    external_id=ext,
+                    held_external_id=held.external_id if held is not None else None,
+                    held_method=held.match_method if held is not None else "claimed_in_batch",
+                    player_id=str(pid),
+                )
+                _queue(source, ext)
+                continue
+        claimed.add((source, pid))
+        if tomb is not None:
+            # Same key, DIFFERENT player: the rejection was about the other player, and
+            # this is the correction it was asking for. Repoint the tombstone in place
+            # (its primary key is already taken by definition).
+            repoints.append((source, ext, pid))
+        else:
+            inserts.append(
+                {
+                    "player_id": pid,
+                    "source": source,
+                    "external_id": ext,
+                    "confidence": DP_CONFIDENCE,
+                    "match_method": DP_METHOD,
+                }
             )
-            continue
-        held_by_player[(r["source"], pid)] = r["external_id"]
-        inserts.append(
-            {
-                "player_id": pid,
-                "source": r["source"],
-                "external_id": r["external_id"],
-                "confidence": DP_CONFIDENCE,
-                "match_method": DP_METHOD,
-            }
-        )
-    assert len(inserts) + len(updates) + unchanged + len(db_ambiguous) == clean.height, (
-        "row loss in partition"
-    )
-    ambiguous_all = tuple(sorted(ambiguous | set(db_ambiguous)))
+    assert (
+        len(inserts)
+        + len(updates)
+        + len(repoints)
+        + unchanged
+        + len(blocked_by_existing)
+        + len(blocked_by_rejection)
+        == clean.height
+    ), "row loss in partition"
 
     if inserts:
         session.execute(PlayerExternalId.__table__.insert(), inserts)
@@ -421,17 +535,33 @@ def apply_playerids(session: Session, df: pl.DataFrame) -> CrosswalkApplyReport:
             .where(PlayerExternalId.source == source, PlayerExternalId.external_id == ext)
             .values(match_method=DP_METHOD, confidence=DP_CONFIDENCE)
         )
+    for source, ext, pid in repoints:
+        session.execute(
+            update(PlayerExternalId)
+            .where(PlayerExternalId.source == source, PlayerExternalId.external_id == ext)
+            .values(
+                player_id=pid,
+                match_method=DP_METHOD,
+                confidence=DP_CONFIDENCE,
+                verified_at=None,
+            )
+        )
+        close_unmatched(session, source, ext)
     session.flush()
 
     report = CrosswalkApplyReport(
         inserted=len(inserts),
-        updated=len(updates),
+        updated=len(updates) + len(repoints),
         unchanged=unchanged,
         created_players=len(created),
         skipped_no_ids=skipped_no_ids,
         skipped_position=skipped_position,
         skipped_dst=skipped_dst,
-        ambiguous=ambiguous_all,
+        skipped_no_person_key=skipped_no_person_key,
+        ambiguous_in_file=tuple(sorted(ambiguous)),
+        blocked_by_existing=tuple(sorted(blocked_by_existing)),
+        blocked_by_rejection=tuple(sorted(blocked_by_rejection)),
+        displaced=tuple(sorted(displaced)),
     )
     log.info("crosswalk.dynastyprocess.applied", **asdict(report))
     return report

@@ -8,6 +8,7 @@ the output is deterministic — not that it looks like the "real" name.
 from __future__ import annotations
 
 import re
+import unicodedata
 
 # ---------------------------------------------------------------------------
 # Person names
@@ -53,6 +54,17 @@ _DROP_CHARS_RE = re.compile(r"[.'’\-]")  # noqa: RUF001
 _NON_ALNUM_RE = re.compile(r"[^a-z0-9 ]")
 
 
+def fold_accents(raw: str) -> str:
+    """`Andres Pena` <- `Andrés Peña`: NFKD, then drop the combining marks.
+
+    MUST run before ``_NON_ALNUM_RE``/``[^a-z0-9 ]``, which would otherwise turn every
+    non-ASCII letter into a space (``andr s pe a``) — making an accented spelling
+    unmatchable against the ASCII spelling another source uses, and collapsing two
+    different accented names onto one key.
+    """
+    return "".join(c for c in unicodedata.normalize("NFKD", raw) if not unicodedata.combining(c))
+
+
 def _merge_initials(tokens: list[str]) -> list[str]:
     """['d', 'j', 'moore'] -> ['dj', 'moore'] so 'D J Moore' == 'D.J. Moore' == 'DJ Moore'."""
     out: list[str] = []
@@ -73,7 +85,7 @@ def _merge_initials(tokens: list[str]) -> list[str]:
 def normalize_name(raw: str) -> str:
     """Lowercase; drop periods/apostrophes/hyphens; collapse whitespace; merge initials;
     strip trailing suffixes (Jr, Sr, II, III, IV, V); alias the first token."""
-    s = _DROP_CHARS_RE.sub("", raw.lower().strip())
+    s = _DROP_CHARS_RE.sub("", fold_accents(raw).lower().strip())
     s = _NON_ALNUM_RE.sub(" ", s)
     tokens = _merge_initials(s.split())
     while len(tokens) > 1 and tokens[-1] in SUFFIXES:
@@ -89,11 +101,13 @@ def normalize_name(raw: str) -> str:
 
 # (nflverse abbr, city, nickname, extra aliases). Aliases cover MFL/DynastyProcess
 # (KCC TBB GBP NEP NOS SFO LVR LAR JAC SDC STL RAM OAK), PFR (KAN GNB NWE NOR TAM SFO
-# LVR SDG), ESPN (WSH LAR), Sleeper/Yahoo (LAR JAX) and common nicknames.
+# SDG RAM OTI plus the five that look nothing like the team: CRD=ARI RAV=BAL HTX=HOU
+# CLT=IND RAI=LV), ESPN (WSH LAR), Sleeper/Yahoo (LAR JAX) and common nicknames.
+# `pfr` is one of the seven crosswalk sources, so every PFR spelling must be here.
 TEAMS: tuple[tuple[str, str, str, tuple[str, ...]], ...] = (
-    ("ARI", "Arizona", "Cardinals", ("ARZ", "Cards")),
+    ("ARI", "Arizona", "Cardinals", ("ARZ", "CRD", "Cards")),
     ("ATL", "Atlanta", "Falcons", ()),
-    ("BAL", "Baltimore", "Ravens", ("BLT",)),
+    ("BAL", "Baltimore", "Ravens", ("BLT", "RAV")),
     ("BUF", "Buffalo", "Bills", ()),
     ("CAR", "Carolina", "Panthers", ()),
     ("CHI", "Chicago", "Bears", ()),
@@ -103,8 +117,8 @@ TEAMS: tuple[tuple[str, str, str, tuple[str, ...]], ...] = (
     ("DEN", "Denver", "Broncos", ()),
     ("DET", "Detroit", "Lions", ()),
     ("GB", "Green Bay", "Packers", ("GNB", "GBP")),
-    ("HOU", "Houston", "Texans", ("HST",)),
-    ("IND", "Indianapolis", "Colts", ()),
+    ("HOU", "Houston", "Texans", ("HST", "HTX")),
+    ("IND", "Indianapolis", "Colts", ("CLT",)),
     ("JAX", "Jacksonville", "Jaguars", ("JAC", "Jags")),
     ("KC", "Kansas City", "Chiefs", ("KAN", "KCC")),
     ("LA", "Los Angeles", "Rams", ("LAR", "RAM", "STL", "St. Louis Rams", "LA Rams")),
@@ -114,7 +128,7 @@ TEAMS: tuple[tuple[str, str, str, tuple[str, ...]], ...] = (
         "Chargers",
         ("SD", "SDG", "SDC", "San Diego Chargers", "LA Chargers"),
     ),
-    ("LV", "Las Vegas", "Raiders", ("LVR", "OAK", "Oakland Raiders")),
+    ("LV", "Las Vegas", "Raiders", ("LVR", "RAI", "OAK", "Oakland Raiders")),
     ("MIA", "Miami", "Dolphins", ()),
     ("MIN", "Minnesota", "Vikings", ()),
     ("NE", "New England", "Patriots", ("NWE", "NEP", "Pats")),
@@ -137,7 +151,7 @@ _DST_TOKENS: frozenset[str] = frozenset(
 
 
 def _clean(raw: str) -> str:
-    s = raw.lower().replace("/", " ").replace("&", " ")
+    s = fold_accents(raw).lower().replace("/", " ").replace("&", " ")
     s = re.sub(r"[^a-z0-9 ]", " ", s)
     return " ".join(s.split())
 

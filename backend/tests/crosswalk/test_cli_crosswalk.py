@@ -80,7 +80,7 @@ def test_report_exit_1_when_unverified_only(monkeypatch):
 def test_crosswalk_help_lists_commands():
     result = runner.invoke(cli.app, ["crosswalk", "--help"])
     assert result.exit_code == 0
-    for cmd in ("report", "seed", "verify", "resolve-unmatched"):
+    for cmd in ("report", "seed", "verify", "map", "resolve-unmatched"):
         assert cmd in result.output
 
 
@@ -173,7 +173,7 @@ def test_cli_verify_marks_queue_entry_resolved(monkeypatch, db_session, seeded_r
 
 @pytest.mark.db
 def test_cli_verify_reject_round_trip(monkeypatch, db_session, seeded_registry):
-    """`ffh crosswalk verify --reject` deletes the disputed mapping but leaves the
+    """`ffh crosswalk verify --reject` tombstones the disputed mapping and leaves the
     review-queue entry OPEN — the id is now unmapped and still needs attention
     (fix-round-1 ruling; the positive `verify` path is what closes the entry)."""
     from ffh.crosswalk.resolve import resolve, upsert_unmatched
@@ -186,7 +186,8 @@ def test_cli_verify_reject_round_trip(monkeypatch, db_session, seeded_registry):
     result = runner.invoke(cli.app, ["crosswalk", "verify", "sleeper", "4881", "--reject"])
     assert result.exit_code == 0, result.output
     assert "rejected sleeper:4881" in result.output
-    assert db_session.get(PlayerExternalId, ("sleeper", "4881")) is None
+    tomb = db_session.get(PlayerExternalId, ("sleeper", "4881"))
+    assert tomb is not None and tomb.match_method == "rejected" and tomb.confidence == 0.0
     u = db_session.scalar(
         select(CrosswalkUnmatched).where(CrosswalkUnmatched.external_id == "4881")
     )
@@ -221,3 +222,106 @@ def test_cli_resolve_unmatched_closes_queue_entry(monkeypatch, db_session):
     )
     assert u is not None and u.resolved is True
     assert coverage_report(db_session).ok is True
+
+
+# ---------------------------------------------------------------------------
+# `ffh crosswalk map` — the operator path from crosswalk_unmatched to *mapped*.
+# Without it an id in the queue could only be silenced (`resolve-unmatched`),
+# never mapped, and a `--reject` tombstone had no escape at all.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.db
+def test_cli_map_creates_a_manual_mapping_and_closes_the_queue(
+    monkeypatch, db_session, seeded_registry
+):
+    from ffh.crosswalk.report import coverage_report
+    from ffh.crosswalk.resolve import Resolution, resolve, upsert_unmatched
+    from ffh.db.models import CrosswalkUnmatched, PlayerExternalId
+
+    mahomes = seeded_registry["00-0033873"]
+    upsert_unmatched(db_session, "sleeper", "4046", raw_name="P. Mahomes")
+    assert coverage_report(db_session).ok is False
+    monkeypatch.setattr(cli, "_session_scope", _fake_scope(db_session))
+
+    result = runner.invoke(cli.app, ["crosswalk", "map", "sleeper", "4046", str(mahomes)])
+    assert result.exit_code == 0, result.output
+    assert "mapped sleeper:4046" in result.output
+    row = db_session.get(PlayerExternalId, ("sleeper", "4046"))
+    assert row.player_id == mahomes and row.match_method == "manual"
+    assert row.confidence == 1.0 and row.verified_at is not None
+    u = db_session.scalar(
+        select(CrosswalkUnmatched).where(CrosswalkUnmatched.external_id == "4046")
+    )
+    assert u.resolved is True
+    assert coverage_report(db_session).ok is True
+    assert resolve(db_session, "sleeper", "4046") == Resolution(mahomes, "manual", 1.0)
+
+
+@pytest.mark.db
+def test_cli_map_is_the_escape_from_a_rejection_tombstone(monkeypatch, db_session, seeded_registry):
+    """The rung-4 red loop from finding 4: a rejected fuzzy row is re-minted by every
+    sync unless the rejection is durable — and once it is, `map` is how green happens."""
+    from ffh.crosswalk.report import coverage_report
+    from ffh.crosswalk.resolve import resolve
+    from ffh.db.models import PlayerExternalId
+
+    lamar = seeded_registry["00-0034796"]
+    resolve(db_session, "sleeper", "4881", "Lamarr Jackson", "QB", "BAL")  # fuzzy pending
+    monkeypatch.setattr(cli, "_session_scope", _fake_scope(db_session))
+    assert (
+        runner.invoke(cli.app, ["crosswalk", "verify", "sleeper", "4881", "--reject"]).exit_code
+        == 0
+    )
+    # Re-running the same sync does NOT re-mint the rejected row, and the gate stays red.
+    assert resolve(db_session, "sleeper", "4881", "Lamarr Jackson", "QB", "BAL") is None
+    assert db_session.get(PlayerExternalId, ("sleeper", "4881")).match_method == "rejected"
+    assert coverage_report(db_session).ok is False
+
+    result = runner.invoke(cli.app, ["crosswalk", "map", "sleeper", "4881", str(lamar)])
+    assert result.exit_code == 0, result.output
+    assert "(replaced)" in result.output
+    row = db_session.get(PlayerExternalId, ("sleeper", "4881"))
+    assert row.match_method == "manual" and row.player_id == lamar
+    assert coverage_report(db_session).ok is True
+
+
+@pytest.mark.db
+def test_cli_map_refuses_an_unknown_player(monkeypatch, db_session):
+    monkeypatch.setattr(cli, "_session_scope", _fake_scope(db_session))
+    ghost = uuid.uuid4()
+    result = runner.invoke(cli.app, ["crosswalk", "map", "sleeper", "1", str(ghost)])
+    assert result.exit_code == 1
+    assert "no players row" in result.output
+
+
+@pytest.mark.db
+def test_cli_map_reports_the_source_player_clash_instead_of_raising(
+    monkeypatch, db_session, seeded_registry
+):
+    """`player_external_ids_source_player_uidx` is pre-checked, never caught as an
+    IntegrityError (DATABASE.md §2) — the operator gets a message naming the holder."""
+    from ffh.db.models import PlayerExternalId
+
+    mahomes = seeded_registry["00-0033873"]
+    db_session.add(
+        PlayerExternalId(
+            player_id=mahomes,
+            source="sleeper",
+            external_id="4046",
+            confidence=1.0,
+            match_method="dynastyprocess",
+        )
+    )
+    db_session.flush()
+    monkeypatch.setattr(cli, "_session_scope", _fake_scope(db_session))
+    result = runner.invoke(cli.app, ["crosswalk", "map", "sleeper", "9999", str(mahomes)])
+    assert result.exit_code == 1
+    assert "sleeper:4046 already maps to" in result.output
+    assert db_session.get(PlayerExternalId, ("sleeper", "9999")) is None
+
+
+def test_cli_map_rejects_a_non_uuid_player_id(monkeypatch):
+    monkeypatch.setattr(cli, "_session_scope", _fake_scope(_FakeSession()))
+    result = runner.invoke(cli.app, ["crosswalk", "map", "sleeper", "1", "not-a-uuid"])
+    assert result.exit_code != 0

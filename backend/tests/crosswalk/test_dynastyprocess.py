@@ -6,6 +6,7 @@ tests/fixtures/dynastyprocess/db_playerids_sample.csv via FIXTURE_DIR).
 """
 
 import uuid
+from datetime import UTC, datetime
 
 import polars as pl
 import pytest
@@ -19,7 +20,9 @@ from ffh.crosswalk.dynastyprocess import (
     apply_playerids,
     read_playerids_csv,
 )
-from ffh.db.models import Player, PlayerExternalId
+from ffh.crosswalk.report import coverage_report
+from ffh.crosswalk.review import reject_mapping
+from ffh.db.models import CrosswalkUnmatched, Player, PlayerExternalId
 from tests.crosswalk.conftest import DP_SAMPLE_CSV
 
 pytestmark = pytest.mark.db
@@ -66,7 +69,11 @@ def test_apply_populates_external_ids(db_session, seeded_registry, dp_frame):
         skipped_no_ids=1,
         skipped_position=1,
         skipped_dst=0,
-        ambiguous=(("rotowire", "10167"), ("rotowire", "9898")),
+        skipped_no_person_key=0,
+        ambiguous_in_file=(("rotowire", "10167"), ("rotowire", "9898")),
+        blocked_by_existing=(),
+        blocked_by_rejection=(),
+        displaced=(),
     )
     assert _count_ids(db_session) == 61
     rows = db_session.scalars(select(PlayerExternalId)).all()
@@ -109,7 +116,7 @@ def test_apply_is_idempotent(db_session, seeded_registry, dp_frame):
     second = apply_playerids(db_session, dp_frame)
     assert second.inserted == 0 and second.created_players == 0 and second.updated == 0
     assert second.unchanged == first.inserted == 61
-    assert second.ambiguous == first.ambiguous
+    assert second.ambiguous_in_file == first.ambiguous_in_file
     assert _count_ids(db_session) == 61
     assert _count_players(db_session) == 14 + 32 + 2
 
@@ -174,7 +181,10 @@ def test_apply_routes_second_id_per_source_and_player_to_ambiguous(
     )
     db_session.flush()
     report = apply_playerids(db_session, dp_frame)
-    assert ("sleeper", "4046") in report.ambiguous
+    # `blocked_by_existing`, not the file-ambiguity bucket: an operator must be able to
+    # tell "DP contradicts itself" from "a DB row blocked DP".
+    assert report.blocked_by_existing == (("sleeper", "4046"),)
+    assert ("sleeper", "4046") not in report.ambiguous_in_file
     assert report.inserted == 60
     assert db_session.get(PlayerExternalId, ("sleeper", "4046")) is None
     kept = db_session.get(PlayerExternalId, ("sleeper", "9999"))
@@ -225,3 +235,204 @@ def test_apply_rejects_non_integral_float_ids(db_session, dp_frame):
 def test_apply_rejects_frame_missing_columns(db_session, dp_frame):
     with pytest.raises(DynastyProcessError):
         apply_playerids(db_session, dp_frame.drop("position"))
+
+
+# ---------------------------------------------------------------------------
+# Fix wave: every id DP refuses to write reaches crosswalk_unmatched, the 1.0
+# authority rule, rejection tombstones, and the "mfl:None" placeholder collapse.
+# ---------------------------------------------------------------------------
+
+
+def _open_queue(session) -> list[tuple[str, str]]:
+    return [
+        (u.source, u.external_id)
+        for u in session.scalars(
+            select(CrosswalkUnmatched)
+            .where(CrosswalkUnmatched.resolved.is_(False))
+            .order_by(CrosswalkUnmatched.source, CrosswalkUnmatched.external_id)
+        )
+    ]
+
+
+def test_apply_queues_file_ambiguous_ids_with_their_raw_context(
+    db_session, seeded_registry, dp_frame
+):
+    """An ambiguity the gate cannot see is an unmapped fantasy id that leaves
+    `ffh crosswalk report` exiting 0 (Global Constraint / DATABASE.md §3 rung 5)."""
+    report = apply_playerids(db_session, dp_frame)
+    assert report.ambiguous_in_file == (("rotowire", "10167"), ("rotowire", "9898"))
+    assert _open_queue(db_session) == [("rotowire", "10167"), ("rotowire", "9898")]
+    u = db_session.scalar(
+        select(CrosswalkUnmatched).where(CrosswalkUnmatched.external_id == "9898")
+    )
+    assert (u.raw_name, u.raw_position) == ("Fred Williams", "WR")
+    assert coverage_report(db_session).ok is False
+
+
+def test_apply_queues_ids_blocked_by_an_existing_row(db_session, seeded_registry, dp_frame):
+    """The DB-blocked bucket is queued too — and is reported separately from the
+    file-ambiguity bucket so an operator can tell the two causes apart."""
+    db_session.add(
+        PlayerExternalId(
+            player_id=seeded_registry["00-0033873"],
+            source="sleeper",
+            external_id="9999",
+            confidence=1.0,
+            match_method="manual",
+        )
+    )
+    db_session.flush()
+    report = apply_playerids(db_session, dp_frame)
+    assert report.blocked_by_existing == (("sleeper", "4046"),)
+    assert ("sleeper", "4046") in _open_queue(db_session)
+    u = db_session.scalar(
+        select(CrosswalkUnmatched).where(CrosswalkUnmatched.external_id == "4046")
+    )
+    assert (u.raw_name, u.raw_team) == ("Patrick Mahomes", "KCC")
+    assert coverage_report(db_session).ok is False
+
+
+def test_apply_displaces_an_unverified_guess_but_not_a_human_row(
+    db_session, seeded_registry, dp_frame
+):
+    """Authority rule: DP's 1.0 fact beats an unverified `exact_name` 0.95 incumbent
+    (which used to win merely by occupying the slot); the displaced id goes on the gate."""
+    mahomes = seeded_registry["00-0033873"]
+    db_session.add(
+        PlayerExternalId(
+            player_id=mahomes,
+            source="sleeper",
+            external_id="GUESS",
+            confidence=0.95,
+            match_method="exact_name",
+        )
+    )
+    db_session.flush()
+    report = apply_playerids(db_session, dp_frame)
+    assert report.displaced == (("sleeper", "GUESS"),)
+    assert report.blocked_by_existing == ()
+    assert db_session.get(PlayerExternalId, ("sleeper", "GUESS")) is None
+    assert db_session.get(PlayerExternalId, ("sleeper", "4046")).player_id == mahomes
+    assert ("sleeper", "GUESS") in _open_queue(db_session)
+
+
+def test_apply_does_not_displace_a_verified_low_confidence_row(
+    db_session, seeded_registry, dp_frame
+):
+    mahomes = seeded_registry["00-0033873"]
+    db_session.add(
+        PlayerExternalId(
+            player_id=mahomes,
+            source="sleeper",
+            external_id="GUESS",
+            confidence=0.89,
+            match_method="fuzzy",
+            verified_at=datetime.now(UTC),
+        )
+    )
+    db_session.flush()
+    report = apply_playerids(db_session, dp_frame)
+    assert report.displaced == ()
+    assert report.blocked_by_existing == (("sleeper", "4046"),)
+    assert db_session.get(PlayerExternalId, ("sleeper", "GUESS")) is not None
+
+
+def test_apply_never_remints_a_rejected_pairing(db_session, seeded_registry, dp_frame):
+    """The DP path must honour the tombstone too — otherwise the next
+    `ffh crosswalk seed` silently re-creates the mapping a human rejected."""
+    apply_playerids(db_session, dp_frame)
+    assert reject_mapping(db_session, "sleeper", "4046") is True
+
+    report = apply_playerids(db_session, dp_frame)
+    assert report.blocked_by_rejection == (("sleeper", "4046"),)
+    row = db_session.get(PlayerExternalId, ("sleeper", "4046"))
+    assert row.match_method == "rejected" and row.confidence == 0.0
+    assert ("sleeper", "4046") in _open_queue(db_session)
+    assert coverage_report(db_session).ok is False
+
+
+def test_apply_rejects_rows_with_neither_gsis_nor_mfl_id(db_session, seeded_registry, dp_frame):
+    """`mfl:None` was a real placeholder key: every gsis-less, mfl-less row collapsed onto
+    it, so ONE invented `players` row accumulated ids from several different people. The
+    ambiguity pass catches the overlapping case, never this disjoint one."""
+    ghosts = pl.DataFrame(
+        [
+            {
+                "mfl_id": None,
+                "sportradar_id": None,
+                "fantasypros_id": None,
+                "gsis_id": None,
+                "sleeper_id": "G1",
+                "espn_id": None,
+                "yahoo_id": None,
+                "pfr_id": None,
+                "rotowire_id": None,
+                "name": "Ghost One",
+                "merge_name": "ghost one",
+                "position": "WR",
+                "team": "FA",
+                "birthdate": "1999-01-01",
+                "draft_year": 2024,
+                "college": "Nowhere",
+            },
+            {
+                "mfl_id": None,
+                "sportradar_id": None,
+                "fantasypros_id": None,
+                "gsis_id": None,
+                "sleeper_id": None,
+                "espn_id": "G2",
+                "yahoo_id": None,
+                "pfr_id": None,
+                "rotowire_id": None,
+                "name": "Ghost Two",
+                "merge_name": "ghost two",
+                "position": "RB",
+                "team": "FA",
+                "birthdate": "1998-01-01",
+                "draft_year": 2023,
+                "college": "Elsewhere",
+            },
+        ],
+        schema=dp_frame.schema,
+    )
+    report = apply_playerids(db_session, pl.concat([dp_frame, ghosts]))
+    assert report.skipped_no_person_key == 2
+    # Same counts as the clean frame: the two disjoint ghosts never became one player.
+    assert report.inserted == 61 and report.created_players == 2
+    assert db_session.get(PlayerExternalId, ("sleeper", "G1")) is None
+    assert db_session.get(PlayerExternalId, ("espn", "G2")) is None
+    assert (
+        db_session.scalar(
+            select(func.count())
+            .select_from(Player)
+            .where(Player.full_name.in_(["Ghost One", "Ghost Two"]))
+        )
+        == 0
+    )
+
+
+def test_rejecting_a_rookie_id_does_not_mint_a_duplicate_player_on_the_next_seed(
+    db_session, seeded_registry, dp_frame
+):
+    """Diego Pavia has no gsis_id: his `players` row exists only because DP created it,
+    and the next seed re-finds him through his already-mapped ids. A tombstone must keep
+    supplying that identity — otherwise the row takes the placeholder path again and mints
+    a SECOND Diego Pavia (silent duplicate players), which is worse than the wrong id."""
+    apply_playerids(db_session, dp_frame)
+    pavia = db_session.scalar(select(Player).where(Player.normalized_name == "diego pavia"))
+    assert reject_mapping(db_session, "sleeper", "13427") is True
+
+    report = apply_playerids(db_session, dp_frame)
+    assert report.created_players == 0
+    assert (
+        db_session.scalar(
+            select(func.count()).select_from(Player).where(Player.normalized_name == "diego pavia")
+        )
+        == 1
+    )
+    # The rejected id stays rejected and on the gate; his other ids still point at him.
+    assert report.blocked_by_rejection == (("sleeper", "13427"),)
+    assert db_session.get(PlayerExternalId, ("sleeper", "13427")).match_method == "rejected"
+    assert db_session.get(PlayerExternalId, ("espn", "5084180")).player_id == pavia.player_id
+    assert ("sleeper", "13427") in _open_queue(db_session)

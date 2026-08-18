@@ -43,19 +43,24 @@ def test_report_counts_and_flags(db_session, seeded_registry):
         ("sleeper", "4881", "Lamar Jackson")
     ]
     assert rep.unverified_low_confidence[0].confidence == pytest.approx(0.89)
+    # The two ids DynastyProcess contradicts itself on are queued too (fix wave: an
+    # ambiguity the operator cannot see is an unmapped fantasy id that leaves the gate
+    # green), each carrying the raw context from its DP row.
     assert [(r.source, r.external_id, r.raw_name) for r in rep.unmatched] == [
-        ("sleeper", "99999", "Nobody Nowhere")
+        ("rotowire", "10167", "Kevin Smith"),
+        ("rotowire", "9898", "Fred Williams"),
+        ("sleeper", "99999", "Nobody Nowhere"),
     ]
     assert rep.ok is False
     d = rep.to_dict()
-    assert d["ok"] is False and d["unmatched"][0]["external_id"] == "99999"
+    assert d["ok"] is False and d["unmatched"][-1]["external_id"] == "99999"
     # `--json` determinism: the count maps are key-sorted, not in SQL GROUP BY order
     assert list(d["players_by_position"]) == sorted(d["players_by_position"])
     assert list(d["ids_by_source"]) == sorted(d["ids_by_source"])
     assert list(d["ids_by_source_method"]) == sorted(d["ids_by_source_method"])
     assert all(list(m) == sorted(m) for m in d["ids_by_source_method"].values())
     text = rep.render()
-    assert "unverified low-confidence: 1" in text and "unmatched: 1" in text
+    assert "unverified low-confidence: 1" in text and "unmatched: 3" in text
     assert "Nobody Nowhere" in text
 
 
@@ -70,12 +75,25 @@ def test_verify_and_reject(db_session, seeded_registry):
     assert verify_mapping(db_session, "sleeper", "nope") is False
 
     assert reject_mapping(db_session, "sleeper", "4881") is True
-    assert db_session.get(PlayerExternalId, ("sleeper", "4881")) is None
+    # The row survives as a TOMBSTONE (not a deletion): confidence 0.0, the rejected
+    # player_id preserved, `verified_at` cleared even though a human had verified it.
+    tomb = db_session.get(PlayerExternalId, ("sleeper", "4881"))
+    assert tomb is not None and tomb.match_method == "rejected"
+    assert tomb.confidence == 0.0 and tomb.verified_at is None
+    assert tomb.player_id == seeded_registry["00-0034796"]
+    assert resolve(db_session, "sleeper", "4881", "Lamarr Jackson", "QB", "BAL") is None
     u = db_session.scalar(
         select(CrosswalkUnmatched).where(CrosswalkUnmatched.external_id == "4881")
     )
     assert u is not None and u.source == "sleeper" and u.resolved is False
-    assert reject_mapping(db_session, "sleeper", "4881") is False
+    assert coverage_report(db_session).ok is False
+    # The tombstone is not a review-queue row: the open unmatched entry is the gate
+    # signal, and counting it twice would latch the report red forever.
+    assert coverage_report(db_session).unverified_low_confidence == ()
+    # Rejecting again is a no-op, and a verify can never resurrect the pairing.
+    assert reject_mapping(db_session, "sleeper", "4881") is True
+    assert verify_mapping(db_session, "sleeper", "4881") is False
+    assert db_session.get(PlayerExternalId, ("sleeper", "4881")).verified_at is None
 
 
 def test_reject_preserves_queue_raw_fields(db_session, seeded_registry):
@@ -128,7 +146,13 @@ def test_apply_playerids_closes_queued_ids(db_session, seeded_registry):
     )
     assert mapped is not None and mapped.resolved is True
     rep = coverage_report(db_session)
-    assert [(r.source, r.external_id) for r in rep.unmatched] == [("sleeper", "55555")]
+    # 55555 stays open, and the file-ambiguous rotowire ids join it — apply_playerids
+    # queues every id it refuses to map.
+    assert [(r.source, r.external_id) for r in rep.unmatched] == [
+        ("rotowire", "10167"),
+        ("rotowire", "9898"),
+        ("sleeper", "55555"),
+    ]
 
 
 def test_upgrade_conflict_state_stays_on_report(db_session, seeded_registry):

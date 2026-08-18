@@ -140,7 +140,11 @@ def _runs(session) -> list[IngestRun]:
         session.scalars(
             select(IngestRun)
             .where(IngestRun.source == "dynastyprocess")
-            .order_by(IngestRun.started_at)
+            # started_at is transaction_timestamp(): identical for BOTH rows under the
+            # db_session fixture (one transaction), so ordering by it alone left the
+            # ["success", "skipped_not_modified"] assertion resting on heap order.
+            # Same tie-break tests/ingest/test_base.py already uses.
+            .order_by(IngestRun.started_at, IngestRun.finished_at.nulls_last())
         )
     )
 

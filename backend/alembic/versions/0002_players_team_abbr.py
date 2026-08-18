@@ -20,6 +20,12 @@ Two changes, landed together because both close gaps in the crosswalk (DATABASE.
    makes the invariant real. Those writers MUST pre-check `(source, player_id)` before
    insert and route the loser to `crosswalk_unmatched` / the ambiguity report — they must
    not rely on catching the resulting IntegrityError as their conflict policy.
+
+   The index is PARTIAL (`WHERE match_method <> 'rejected'`). `ffh crosswalk verify
+   --reject` keeps the row as a tombstone (`match_method='rejected'`, confidence 0.0)
+   recording the pairing a human threw out, so no sync can re-mint it. A tombstone is not
+   a mapping and must not occupy the player's single slot for that source: without the
+   predicate, rejecting a wrong id would keep the *correct* id unmappable forever.
 """
 
 from collections.abc import Sequence
@@ -40,6 +46,7 @@ def upgrade() -> None:
         "player_external_ids",
         ["source", "player_id"],
         unique=True,
+        postgresql_where=sa.text("match_method <> 'rejected'"),
     )
 
 

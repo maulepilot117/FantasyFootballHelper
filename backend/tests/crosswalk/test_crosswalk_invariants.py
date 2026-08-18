@@ -184,11 +184,16 @@ def test_crosswalk_low_confidence_reviewed(db_session, populated):
 
     # Every Resolution the ladder hands out passes the consumer filter rule.
     all_rows = db_session.execute(
-        text("SELECT source, external_id, confidence, verified_at FROM player_external_ids")
+        text(
+            "SELECT source, external_id, confidence, verified_at, match_method "
+            "FROM player_external_ids"
+        )
     ).all()
-    for source, external_id, confidence, verified_at in all_rows:
+    for source, external_id, confidence, verified_at, match_method in all_rows:
         res = resolve(db_session, source, external_id)
-        assert (res is not None) == is_usable(confidence, verified_at)
+        # match_method is part of the rule: a `rejected` tombstone is never usable, even
+        # if something stamped verified_at on it.
+        assert (res is not None) == is_usable(confidence, verified_at, match_method)
 
     # The report surfaces them and refuses to say "ok".
     report = coverage_report(db_session)

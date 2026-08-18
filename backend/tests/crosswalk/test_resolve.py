@@ -501,3 +501,282 @@ def test_resolve_many_processes_gsis_bearing_inputs_first(db_session, seeded_reg
     row = db_session.get(PlayerExternalId, ("sleeper", "B1"))
     assert row.player_id == allen and row.match_method == "gsis"
     assert db_session.get(PlayerExternalId, ("sleeper", "A1")) is None
+
+
+# ---------------------------------------------------------------------------
+# Fix wave: authority (a 1.0 fact beats an unverified incumbent), rejection
+# tombstones, and diagnosable rung-5 reasons.
+# ---------------------------------------------------------------------------
+
+
+def test_rung2_gsis_fact_displaces_an_unverified_guess(db_session, seeded_registry):
+    """A 1.0 gsis fact outranks an unverified 0.95 `exact_name` guess holding the slot.
+
+    Before the fix the guess won by squatting: the gsis-certain id was routed to
+    crosswalk_unmatched and the wrong guess stayed in use — the exact inversion of rung 1's
+    upgrade path, which rules that a gsis fact beats a stale 0.95 row.
+    """
+    mahomes = seeded_registry["00-0033873"]
+    db_session.add(
+        PlayerExternalId(
+            player_id=mahomes,
+            source="sleeper",
+            external_id="GUESS",
+            confidence=0.95,
+            match_method="exact_name",
+        )
+    )
+    db_session.flush()
+    with structlog.testing.capture_logs() as logs:
+        res = resolve(
+            db_session, "sleeper", "4046", "Patrick Mahomes", "QB", "KC", gsis_id="00-0033873"
+        )
+    assert res == Resolution(mahomes, "gsis", 1.0)
+    assert db_session.get(PlayerExternalId, ("sleeper", "GUESS")) is None
+    row = db_session.get(PlayerExternalId, ("sleeper", "4046"))
+    assert row.player_id == mahomes and row.match_method == "gsis"
+    # The displaced id is genuinely unmapped now → it MUST be on the gate, not just in a log.
+    assert [(u.source, u.external_id) for u in _unmatched(db_session)] == [("sleeper", "GUESS")]
+    assert any(e["event"] == "crosswalk.resolve.incumbent_displaced" for e in logs)
+
+
+@pytest.mark.parametrize(
+    ("method", "confidence", "verified"),
+    [("dynastyprocess", 1.0, False), ("manual", 1.0, False), ("fuzzy", 0.89, True)],
+)
+def test_rung2_gsis_fact_never_displaces_a_protected_incumbent(
+    db_session, seeded_registry, method, confidence, verified
+):
+    """The other direction: human / DynastyProcess / verified rows hold their slot."""
+    mahomes = seeded_registry["00-0033873"]
+    db_session.add(
+        PlayerExternalId(
+            player_id=mahomes,
+            source="sleeper",
+            external_id="HOLDER",
+            confidence=confidence,
+            match_method=method,
+            verified_at=datetime.now(UTC) if verified else None,
+        )
+    )
+    db_session.flush()
+    with structlog.testing.capture_logs() as logs:
+        res = resolve(
+            db_session, "sleeper", "4046", "Patrick Mahomes", "QB", "KC", gsis_id="00-0033873"
+        )
+    assert res is None
+    holder = db_session.get(PlayerExternalId, ("sleeper", "HOLDER"))
+    assert holder is not None and holder.match_method == method
+    assert db_session.get(PlayerExternalId, ("sleeper", "4046")) is None
+    assert [(u.source, u.external_id) for u in _unmatched(db_session)] == [("sleeper", "4046")]
+    assert any(e["event"] == "crosswalk.resolve.duplicate_for_source" for e in logs)
+
+
+def test_rung1_upgrade_displaces_an_unverified_incumbent(db_session, seeded_registry):
+    """Same authority rule inside the rung-1 upgrade path: the correction proceeds by
+    evicting the unverified guess instead of parking the corrected id as unmatched."""
+    mahomes, chase = seeded_registry["00-0033873"], seeded_registry["00-0036900"]
+    db_session.add(
+        PlayerExternalId(
+            player_id=mahomes,
+            source="sleeper",
+            external_id="E1",
+            confidence=0.95,
+            match_method="exact_name",
+        )
+    )
+    db_session.add(
+        PlayerExternalId(
+            player_id=chase,
+            source="sleeper",
+            external_id="E2",
+            confidence=0.89,
+            match_method="fuzzy",
+        )
+    )
+    db_session.flush()
+    res = resolve(db_session, "sleeper", "E1", gsis_id="00-0036900")
+    assert res == Resolution(chase, "gsis", 1.0)
+    assert db_session.get(PlayerExternalId, ("sleeper", "E2")) is None
+    assert db_session.get(PlayerExternalId, ("sleeper", "E1")).player_id == chase
+    assert [(u.source, u.external_id) for u in _unmatched(db_session)] == [("sleeper", "E2")]
+
+
+def test_human_decision_conflict_lands_on_the_gate(db_session, seeded_registry):
+    """The lock stands (a sync never overwrites a human decision) — but the dispute is
+    no longer log-only: the key is queued so `ffh crosswalk report` exits 1 on it."""
+    from ffh.crosswalk.report import coverage_report
+
+    mahomes, chase = seeded_registry["00-0033873"], seeded_registry["00-0036900"]
+    db_session.add(
+        PlayerExternalId(
+            player_id=chase,
+            source="sleeper",
+            external_id="4046",
+            confidence=0.95,
+            match_method="manual",
+        )
+    )
+    db_session.flush()
+    with structlog.testing.capture_logs() as logs:
+        res = resolve(db_session, "sleeper", "4046", gsis_id="00-0033873")
+    assert res is not None and res.player_id == chase  # the human decision still stands
+    assert db_session.get(PlayerExternalId, ("sleeper", "4046")).player_id == chase
+    assert any(e["event"] == "crosswalk.resolve.human_decision_conflict" for e in logs)
+    (u,) = _unmatched(db_session)
+    assert (u.source, u.external_id) == ("sleeper", "4046") and u.resolved is False
+    assert coverage_report(db_session).ok is False
+    assert mahomes != chase
+
+
+def test_confirming_gsis_on_a_human_row_is_not_a_conflict(db_session, seeded_registry):
+    """A gsis id that AGREES with the human decision must not put it on the gate."""
+    mahomes = seeded_registry["00-0033873"]
+    db_session.add(
+        PlayerExternalId(
+            player_id=mahomes,
+            source="sleeper",
+            external_id="4046",
+            confidence=0.95,
+            match_method="manual",
+        )
+    )
+    db_session.flush()
+    res = resolve(db_session, "sleeper", "4046", gsis_id="00-0033873")
+    assert res is not None and res.player_id == mahomes
+    assert _unmatched(db_session) == []
+
+
+def test_rejected_pairing_is_never_reminted_and_stays_on_the_gate(db_session, seeded_registry):
+    """Finding 4, the full cycle: mint → reject → re-run the SAME resolve.
+
+    Rung 3 would otherwise re-match the same wrong player at 0.95 and `close_unmatched`
+    would turn the gate GREEN on a mapping a human explicitly rejected.
+    """
+    from ffh.crosswalk.report import coverage_report
+    from ffh.crosswalk.review import reject_mapping
+
+    # A wrong-but-exact guess: this sleeper id is minted against the elder Marvin Harrison.
+    sr = seeded_registry["00-0007024"]
+    minted = resolve(db_session, "sleeper", "MH", "Marvin Harrison", "WR", "IND")
+    assert minted is not None and minted.player_id == sr and minted.method == "exact_name"
+
+    assert reject_mapping(db_session, "sleeper", "MH") is True
+    tomb = db_session.get(PlayerExternalId, ("sleeper", "MH"))
+    assert tomb.match_method == "rejected" and tomb.player_id == sr
+
+    with structlog.testing.capture_logs() as logs:
+        again = resolve(db_session, "sleeper", "MH", "Marvin Harrison", "WR", "IND")
+    assert again is None  # never re-minted, never returned
+    row = db_session.get(PlayerExternalId, ("sleeper", "MH"))
+    assert row.match_method == "rejected" and row.confidence == 0.0
+    assert any(e.get("reason") == "rejected" for e in logs)
+    (u,) = _unmatched(db_session)
+    assert (u.source, u.external_id) == ("sleeper", "MH") and u.resolved is False
+    assert coverage_report(db_session).ok is False
+
+
+def test_tombstone_is_never_usable_even_if_verified(db_session, seeded_registry):
+    """`is_usable` keys on the method first: a stamped `verified_at` must not resurrect
+    a rejected pairing (and `verify_mapping` refuses to stamp one in the first place)."""
+    from ffh.crosswalk.review import reject_mapping, verify_mapping
+
+    assert is_usable(0.0, None, "rejected") is False
+    assert is_usable(1.0, datetime.now(UTC), "rejected") is False
+    assert is_usable(0.89, datetime.now(UTC), "fuzzy") is True
+
+    resolve(db_session, "sleeper", "4046", "Patrick Mahomes", "QB", "KC")
+    reject_mapping(db_session, "sleeper", "4046")
+    assert verify_mapping(db_session, "sleeper", "4046") is False
+    row = db_session.get(PlayerExternalId, ("sleeper", "4046"))
+    row.verified_at = datetime.now(UTC)  # force the state verify_mapping refuses to create
+    db_session.flush()
+    assert resolve(db_session, "sleeper", "4046", "Patrick Mahomes", "QB", "KC") is None
+
+
+def test_tombstone_does_not_block_the_correct_id_for_that_player(db_session, seeded_registry):
+    """A tombstone is not a mapping: it must not squat the player's one slot for the
+    source, or rejecting a wrong id would keep the RIGHT id unmappable forever."""
+    from ffh.crosswalk.review import reject_mapping
+
+    mahomes = seeded_registry["00-0033873"]
+    resolve(db_session, "sleeper", "WRONG", "Patrick Mahomes", "QB", "KC")
+    assert reject_mapping(db_session, "sleeper", "WRONG") is True
+    res = resolve(db_session, "sleeper", "4046", "Patrick Mahomes", "QB", "KC")
+    assert res is not None and res.player_id == mahomes and res.method == "exact_name"
+
+
+def test_persist_refuses_to_remint_a_rejected_pairing_directly(db_session, seeded_registry):
+    """Defence in depth for `_persist` itself (rung 1 already refuses tombstoned keys):
+    the same pairing is refused, a DIFFERENT player is the correction we want."""
+    from ffh.crosswalk.resolve import _persist
+    from ffh.crosswalk.review import reject_mapping
+
+    mahomes, chase = seeded_registry["00-0033873"], seeded_registry["00-0036900"]
+    resolve(db_session, "sleeper", "X", "Patrick Mahomes", "QB", "KC")
+    reject_mapping(db_session, "sleeper", "X")
+    inp = ResolveInput("sleeper", "X", "Patrick Mahomes", "QB", "KC")
+    assert _persist(db_session, inp, mahomes, "gsis", 1.0) is False
+    assert db_session.get(PlayerExternalId, ("sleeper", "X")).match_method == "rejected"
+    assert _persist(db_session, inp, chase, "gsis", 1.0) is True
+    row = db_session.get(PlayerExternalId, ("sleeper", "X"))
+    assert row.player_id == chase and row.match_method == "gsis" and row.verified_at is None
+
+
+def test_college_elimination_is_symmetric(db_session, seeded_registry):
+    """`"Ohio St."` vs stored `"Ohio State"` is agreement, not contradiction — the old
+    asymmetric `needle in stored` test eliminated the correct candidate."""
+    _add_fake_player(db_session, "Marvon Harrison", "WR", "ARI", "FAKE-MH")
+    res = resolve(db_session, "sleeper", "11628", "Marvin Harrisom", "WR", None, college="Ohio St.")
+    assert res is None  # rung-4 pending review …
+    row = db_session.get(PlayerExternalId, ("sleeper", "11628"))
+    assert row is not None and row.match_method == "fuzzy"
+    assert row.player_id == seeded_registry["00-0039849"]  # … pointed at the Ohio State one
+
+
+def test_college_agreement_rule_is_symmetric_but_not_permissive():
+    """The symmetric rule must not become "everything agrees": two different schools
+    sharing only a generic token still disagree."""
+    from ffh.crosswalk.resolve import colleges_agree
+
+    assert colleges_agree("Ohio St.", "Ohio State") is True
+    assert colleges_agree("Ohio State", "Ohio St.") is True
+    assert colleges_agree("Michigan State", "Michigan State; Wake Forest") is True
+    assert colleges_agree("Michigan State", "Ohio State") is False
+    assert colleges_agree("Louisville", "Ohio State") is False
+
+
+def test_rung5_reasons_distinguish_elimination_from_no_match(db_session, seeded_registry):
+    """A crosswalk miss caused by a contradicting birth date logged the same
+    `reason="no_candidate"` as "no name matched at all" — undiagnosable."""
+    with structlog.testing.capture_logs() as logs:
+        assert resolve(db_session, "sleeper", "99999", "Nobody Nowhere", "QB", "FA") is None
+    assert [e["reason"] for e in logs if e["event"] == "crosswalk.resolve.unmatched"] == [
+        "no_candidate"
+    ]
+    with structlog.testing.capture_logs() as logs:
+        assert (
+            resolve(
+                db_session,
+                "sleeper",
+                "4881",
+                "Lamarr Jackson",
+                "QB",
+                "BAL",
+                birth_date=date(1994, 1, 1),
+            )
+            is None
+        )
+    assert [e["reason"] for e in logs if e["event"] == "crosswalk.resolve.unmatched"] == [
+        "fuzzy_eliminated"
+    ]
+    assert any(
+        e["event"] == "crosswalk.resolve.fuzzy_eliminated" and e["eliminated_by"] == ["birth_date"]
+        for e in logs
+    )
+    _add_fake_player(db_session, "Jaylon Waddle", "WR", "DEN", "FAKE-JW")
+    with structlog.testing.capture_logs() as logs:
+        assert resolve(db_session, "sleeper", "7526", "Jaylin Waddle", "WR", "DEN") is None
+    assert [e["reason"] for e in logs if e["event"] == "crosswalk.resolve.unmatched"] == [
+        "fuzzy_tie"
+    ]

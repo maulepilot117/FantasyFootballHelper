@@ -69,3 +69,40 @@ def test_different_source_same_player_succeeds(db_session):
         ]
     )
     db_session.flush()
+
+
+def test_rejected_tombstone_does_not_consume_the_source_player_slot(db_session):
+    """The index is PARTIAL (`WHERE match_method <> 'rejected'`). A tombstone records a
+    pairing a human threw out; it is not a mapping, so it must leave the player's one
+    slot for that source free — otherwise rejecting a wrong id would make the *correct*
+    id unmappable forever."""
+    p = _player("Test Player Two")
+    db_session.add(p)
+    db_session.flush()
+    db_session.add(
+        PlayerExternalId(
+            player_id=p.player_id,
+            source="sleeper",
+            external_id="wrong",
+            match_method="rejected",
+            confidence=0.0,
+        )
+    )
+    db_session.flush()
+    db_session.add(
+        PlayerExternalId(
+            player_id=p.player_id, source="sleeper", external_id="right", match_method="manual"
+        )
+    )
+    db_session.flush()  # no IntegrityError
+    # …and two tombstones for the same player/source coexist as well.
+    db_session.add(
+        PlayerExternalId(
+            player_id=p.player_id,
+            source="sleeper",
+            external_id="wrong2",
+            match_method="rejected",
+            confidence=0.0,
+        )
+    )
+    db_session.flush()

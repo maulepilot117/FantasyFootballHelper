@@ -79,7 +79,16 @@ class PlayerExternalId(Base):
         # see migration 0002 docstring: resolve._persist / apply_playerids must pre-check
         # (source, player_id) and route the loser to crosswalk_unmatched / the ambiguity
         # report rather than relying on an IntegrityError).
-        Index("player_external_ids_source_player_uidx", "source", "player_id", unique=True),
+        # PARTIAL: `match_method = 'rejected'` rows are tombstones, not mappings (review.
+        # reject_mapping). A tombstone must not squat the player's one slot for the source
+        # — that would keep the *correct* id permanently unmapped after a rejection.
+        Index(
+            "player_external_ids_source_player_uidx",
+            "source",
+            "player_id",
+            unique=True,
+            postgresql_where=text("match_method <> 'rejected'"),
+        ),
     )
 
 
