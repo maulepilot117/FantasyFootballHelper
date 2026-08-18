@@ -8,6 +8,7 @@ tests/ingest/test_platform_sync.py and tests/ingest/test_crosswalk_coverage.py.
 import uuid
 
 import pytest
+from polars.exceptions import ComputeError
 from sqlalchemy.exc import OperationalError
 from typer.testing import CliRunner
 
@@ -169,6 +170,10 @@ def test_load_rejects_an_unknown_platform():
         OperationalError("SELECT 1", {}, Exception("connection refused")),
         ValueError("league L1 is season 2025, asked for 2026"),
         OSError("no Sleeper player partition"),
+        # LakePlayerCatalog reads the players partition with pl.read_parquet INSIDE
+        # load_league; a truncated partition raises this, and it is neither an OSError nor
+        # a ValueError, so before it was listed it escaped to Click and exited 1.
+        ComputeError("parquet: File out of specification: The file must end with PAR1"),
     ],
 )
 def test_an_operational_failure_exits_three_never_one(harness, exc):
@@ -206,3 +211,20 @@ def test_the_adapter_carries_the_lake_catalog_and_my_user_id(harness, monkeypatc
     adapter = harness.calls[0]["adapter"]
     assert adapter._my_user_id == "USER_ME"
     assert isinstance(adapter._catalog, LakePlayerCatalog)
+
+
+def test_a_failing_client_close_never_replaces_the_result(harness, monkeypatch):
+    """A raise inside `finally` REPLACES the exception on its way out — it would swallow
+    the operational error and its exit code, or the typer.Exit carrying the gate verdict.
+    The close is therefore guarded, and its failure is a warning on stderr."""
+
+    class _AngryClient(_FakeClient):
+        async def aclose(self):
+            raise RuntimeError("event loop is closed")
+
+    monkeypatch.setattr("ffh.cli.SleeperClient", lambda *a, **k: _AngryClient())
+    harness.result = _report(unmatched=[UnmatchedPlayer("9999", "Mystery Person", "WR", "KC")])
+    result = runner.invoke(app, ["league", "load", "sleeper", "L1"])
+    assert result.exit_code == 1  # the gate verdict survived the failed close
+    assert "UNMATCHED 9999 Mystery Person" in result.stdout
+    assert "closing the Sleeper client failed" in result.stderr

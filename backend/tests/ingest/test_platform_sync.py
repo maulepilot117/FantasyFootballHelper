@@ -5,10 +5,9 @@ import httpx
 import pytest
 from sqlalchemy import delete, func, select
 
-from ffh.adapters.base import PlatformError, PlayerRef
-from ffh.adapters.sleeper.adapter import SleeperAdapter, player_ref
+from ffh.adapters.base import PlatformError
+from ffh.adapters.sleeper.adapter import SleeperAdapter
 from ffh.adapters.sleeper.client import SleeperClient
-from ffh.adapters.sleeper.models import RawPlayer
 from ffh.config import get_settings
 from ffh.crosswalk.resolve import GSIS_METHOD, LIVE_MAPPING
 from ffh.crosswalk.review import reject_mapping
@@ -18,38 +17,15 @@ from ffh.db.models import (
     DraftPick,
     League,
     LeagueTeam,
-    Player,
     PlayerExternalId,
     RosterSlot,
 )
 from ffh.ingest.platform_sync import fetch_snapshot, load_league, persist_snapshot
-from tests.conftest import load_sleeper_fixture
-from tests.ingest._sleeper_seed import SEEDED_PLAYERS, seed_fixture_players
 
 pytestmark = pytest.mark.db
 
 LEAGUE = "1000000000000000001"
 DRAFT = "2000000000000000001"
-
-
-class FixtureCatalog:
-    """The Sleeper blob slice as a PlayerCatalog — what LakePlayerCatalog serves in prod."""
-
-    async def all_players(self) -> dict[str, PlayerRef]:
-        blob = load_sleeper_fixture("players_slice")
-        return {pid: player_ref(RawPlayer.model_validate(raw)) for pid, raw in blob.items()}
-
-
-@pytest.fixture
-def adapter(sleeper_mock):
-    """A SYNC fixture on purpose: every test here drives the sync `load_league`, which owns
-    the one `asyncio.run`. An async fixture would need an async test to hold the loop open.
-    The client is closed in its own short-lived loop so no httpx.AsyncClient leaks."""
-    client = SleeperClient(base_url=get_settings().sleeper_base_url)
-    try:
-        yield SleeperAdapter(client, my_user_id="USER_ME")
-    finally:
-        asyncio.run(client.aclose())
 
 
 @pytest.fixture
@@ -74,28 +50,6 @@ def adapter_factory(sleeper_mock):
 async def _aclose_all(clients: list[SleeperClient]) -> None:
     for client in clients:
         await client.aclose()
-
-
-@pytest.fixture
-def catalog_adapter(sleeper_mock):
-    """Same, with the player blob wired in — the production shape, where a rostered id
-    reaches the crosswalk with a name, a position, a team AND a gsis_id."""
-    client = SleeperClient(base_url=get_settings().sleeper_base_url)
-    try:
-        yield SleeperAdapter(client, my_user_id="USER_ME", catalog=FixtureCatalog())
-    finally:
-        asyncio.run(client.aclose())
-
-
-@pytest.fixture
-def seeded(db_session):
-    """db_session with the registry seeded the way `ffh crosswalk seed` would: a players
-    row + sleeper id per fixture human (④ apply_playerids) and the 32 DSTs (④
-    seed_dst_players). Tests that assert roster_slots / rostered counts take THIS instead
-    of db_session; tests about unmatched reporting stay unseeded."""
-    seed_fixture_players(db_session)
-    assert db_session.scalar(select(func.count()).select_from(Player)) == SEEDED_PLAYERS
-    return db_session
 
 
 def test_load_league_persists_settings_verbatim(db_session, sleeper_fixture, adapter):

@@ -7,6 +7,7 @@ fixture human (its rookie path: a gsis_id not yet in the registry becomes a new 
 """
 
 import json
+from collections.abc import Collection
 from pathlib import Path
 from typing import Any
 
@@ -46,22 +47,39 @@ def _text(value: Any) -> str | None:
     return None if value is None else str(value)
 
 
-def playerids_frame() -> pl.DataFrame:
+def playerids_frame(
+    *, drop_sleeper_ids: Collection[str] = (), drop_gsis_ids: Collection[str] = ()
+) -> pl.DataFrame:
     """A DynastyProcess `db_playerids` slice covering every human in the fixture league.
 
     `mfl_id` must be non-null and UNIQUE per row: ④ keys gsis-less rows on `mfl:<mfl_id>`,
     so a null column would collapse every rookie into one placeholder. The Sleeper id doubles
     as the mfl id here. `pfr_id`, `fantasypros_id` and `draft_year` are required columns
     that may be null.
+
+    `drop_sleeper_ids` / `drop_gsis_ids` null those columns for the named Sleeper ids
+    WITHOUT dropping the row, so the player still exists in the registry but the file no
+    longer carries the fact. That is the production shape this fixture otherwise cannot
+    reach: DynastyProcess lags rookies and mid-season signings (a rostered id with no
+    `sleeper_id` row), and 8,326 of Sleeper's 12,219 players have a null `gsis_id`
+    (plan header, live-verified). Without them every fixture human resolves at rung 1 by
+    construction and rungs 2-4 are never exercised.
     """
     blob = json.loads((FIXTURES / "players_slice.json").read_text(encoding="utf-8"))
     humans = [p for p in blob.values() if p.get("position") != "DEF"]
     n = len(humans)
+    known = {p["player_id"] for p in humans}
+    unknown = (set(drop_sleeper_ids) | set(drop_gsis_ids)) - known
+    assert not unknown, f"not fixture humans: {sorted(unknown)}"
     frame = pl.DataFrame(
         {
             "mfl_id": [p["player_id"] for p in humans],
-            "gsis_id": [p.get("gsis_id") for p in humans],
-            "sleeper_id": [p["player_id"] for p in humans],
+            "gsis_id": [
+                None if p["player_id"] in drop_gsis_ids else p.get("gsis_id") for p in humans
+            ],
+            "sleeper_id": [
+                None if p["player_id"] in drop_sleeper_ids else p["player_id"] for p in humans
+            ],
             "espn_id": [_text(p.get("espn_id")) for p in humans],
             "yahoo_id": [_text(p.get("yahoo_id")) for p in humans],
             "pfr_id": [None] * n,
@@ -84,12 +102,25 @@ def playerids_frame() -> pl.DataFrame:
     return frame
 
 
-def seed_fixture_players(session: Session) -> None:
+def seed_fixture_players(
+    session: Session,
+    *,
+    drop_sleeper_ids: Collection[str] = (),
+    drop_gsis_ids: Collection[str] = (),
+) -> None:
     """32 DST rows + one player (and its sleeper id) per fixture human. Flushes only —
-    the caller's transaction owns the commit/rollback."""
+    the caller's transaction owns the commit/rollback.
+
+    The two `drop_*` arguments are forwarded to `playerids_frame`: the player row is still
+    created (so `created_players` is always FIXTURE_HUMANS), it just lacks the named id
+    fact — which is what forces the crosswalk down a lower rung for that player.
+    """
     created_dst = seed_dst_players(session)
     assert created_dst == DST_ROWS, created_dst
-    report = apply_playerids(session, playerids_frame())
+    report = apply_playerids(
+        session,
+        playerids_frame(drop_sleeper_ids=drop_sleeper_ids, drop_gsis_ids=drop_gsis_ids),
+    )
     assert report.created_players == FIXTURE_HUMANS, report
     # PR ④'s final review wave replaced `ambiguous` with four buckets; every one of them
     # also queues the id in crosswalk_unmatched, so a non-empty bucket here would make

@@ -192,6 +192,7 @@ def league_load(
 
     Exit 2 = usage error (unknown platform, missing argument), Click's own code.
     """
+    from polars.exceptions import PolarsError
     from sqlalchemy.exc import SQLAlchemyError
 
     from ffh.adapters.base import PlatformError
@@ -201,17 +202,20 @@ def league_load(
             f"platform {platform!r} is not implemented; only 'sleeper' is available",
             param_hint="PLATFORM",
         )
-    settings = get_settings()
-    # Built HERE, per invocation, and closed below: `load_league` runs and closes its own
-    # event loop (see its "adapter lifetime contract"), and an httpx.AsyncClient keep-alive
-    # connection belongs to the loop that opened it. A module-level client would hand the
-    # second invocation a pool bound to a dead loop.
-    client = SleeperClient()
+    client: SleeperClient | None = None
     try:
+        # Everything that can fail on the way in is inside the guarded region, so it exits
+        # 3 rather than escaping to Click and exiting 1 — including get_settings(), whose
+        # pydantic ValidationError on a bad FFH_* env var is a ValueError.
+        settings = get_settings()
+        # Built HERE, per invocation, and closed in the `finally`: `load_league` runs and
+        # closes its own event loop (its "adapter lifetime contract"), and an
+        # httpx.AsyncClient keep-alive connection belongs to the loop that opened it. A
+        # module-level client would hand the second invocation a pool bound to a dead loop.
+        client = SleeperClient()
         # The catalog is ALWAYS attached: with no lake partition it raises with the
         # `ffh ingest run sleeper_players` remedy rather than quietly degrading to id-only
         # refs, which would push every human down the crosswalk ladder into fuzzy matching.
-        # Inside the try so the client above is released even if this raises.
         adapter = SleeperAdapter(
             client,
             my_user_id=settings.sleeper_user_id,
@@ -228,12 +232,24 @@ def league_load(
             # this run's `crosswalk_unmatched` entries, and rolling them back would empty
             # the review queue the exit code is telling the operator to work through.
             session.commit()
-    except (PlatformError, SQLAlchemyError, OSError, ValueError) as exc:
+    # PolarsError belongs here for the same reason it is in `crosswalk_seed`: the catalog
+    # reads the players partition with `pl.read_parquet` INSIDE load_league, and a
+    # truncated or corrupt partition raises a PolarsError, which is none of the others.
+    # Uncaught it reaches Click, which exits 1 — "the crosswalk has a gap" for a run that
+    # never happened, the one confusion these codes exist to prevent.
+    except (PlatformError, SQLAlchemyError, OSError, PolarsError, ValueError) as exc:
         typer.echo(f"league load failed: {type(exc).__name__}: {exc}", err=True)
         raise typer.Exit(code=EXIT_OPERATIONAL) from exc
     finally:
-        # One more short-lived loop; the pool the fetch opened is released before exit.
-        asyncio.run(client.aclose())
+        if client is not None:
+            try:
+                # One more short-lived loop; the pool the fetch opened is released here.
+                asyncio.run(client.aclose())
+            except Exception as close_exc:  # deliberately broad: see below
+                # A raise in a `finally` REPLACES the exception on its way out: a failed
+                # close would swallow the operational error (and its exit code), or the
+                # typer.Exit carrying the report's verdict.
+                typer.echo(f"warning: closing the Sleeper client failed: {close_exc}", err=True)
 
     typer.echo(
         f"league {report.league_id} teams={report.teams} rostered={report.rostered} "

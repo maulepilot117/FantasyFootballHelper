@@ -3,6 +3,7 @@ from datetime import UTC, datetime
 import httpx
 import polars as pl
 import pytest
+from polars.exceptions import PolarsError
 
 from ffh.adapters.base import FantasyPlatformAdapter, PlatformError, PlayerRef
 from ffh.adapters.sleeper.adapter import SleeperAdapter, player_ref
@@ -534,6 +535,21 @@ async def test_lake_player_catalog_translates_a_null_name_row_into_platform_erro
         }
     ).write_parquet(part / "players.parquet")
     with pytest.raises(PlatformError, match="scrape_date=2026-08-15"):
+        await LakePlayerCatalog(tmp_path).all_players()
+
+
+async def test_lake_player_catalog_lets_a_corrupt_partition_raise_a_polars_error(tmp_path):
+    """A truncated or corrupt partition surfaces as a PolarsError, NOT a PlatformError.
+
+    Pinned because the exception class is a contract: `pl.read_parquet` runs inside
+    `load_league`, and `ffh league load` lists PolarsError among the operational failures
+    it maps to exit 3. Were it absent there, this exception would reach Click and exit 1 —
+    the code reserved for "the crosswalk has a gap".
+    """
+    part = tmp_path / "raw" / "sleeper" / "players" / "scrape_date=2026-08-15"
+    part.mkdir(parents=True)
+    (part / "players.parquet").write_bytes(b"PAR1 truncated mid-write")
+    with pytest.raises(PolarsError):
         await LakePlayerCatalog(tmp_path).all_players()
 
 
